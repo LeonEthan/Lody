@@ -175,6 +175,7 @@ type LifecycleCancelSubscriber = {
 
 /** A user turn pushed over Machine RPC ahead of history CRDT sync. */
 export type SessionRpcTurnOffer = {
+  inputOrigin?: 'human' | 'agent';
   sessionId: SessionId;
   userTurnId: string;
   userId: string;
@@ -388,9 +389,9 @@ export class SessionDispatchWatcher {
   private readonly cancelCheckChains = new Map<SessionId, Promise<void>>();
 
   /**
-   * Tracks the last `meta.lastCanceledTurn` value we have already processed per session.
-   * Used to deduplicate cancel requests — the same `lastCanceledTurn` value should
-   * only trigger one cancel call.
+   * Tracks the last assistant-turn and Stop-request identity processed per session.
+   * RPC and durable metadata share one request; a new Stop for the same execution
+   * has a new request identity.
    */
   private readonly cancelSeenTurn = new Map<SessionId, string>();
 
@@ -736,6 +737,15 @@ export class SessionDispatchWatcher {
       });
       if (!pendingEntry) {
         return finish('error');
+      }
+
+      if (offer.inputOrigin === 'human') {
+        await this.deps.executionService.acceptInboxHumanInput?.({
+          sessionId,
+          inputId: userTurnId,
+          userId: offer.userId,
+          config: offer.inputConfig,
+        });
       }
 
       // Sweep expired entries across all sessions on every accept. A turn that
@@ -1280,7 +1290,8 @@ export class SessionDispatchWatcher {
       hasUnprocessedCancelRequest: Boolean(
         typeof meta.lastCanceledTurn === 'string' &&
         meta.lastCanceledTurn.length > 0 &&
-        meta.lastCanceledTurn !== this.cancelSeenTurn.get(meta.id)
+        JSON.stringify([meta.lastCanceledTurn, meta.lastCancelRequestId ?? 'legacy']) !==
+          this.cancelSeenTurn.get(meta.id)
       ),
       hasRpcTurnOffer: (this.rpcTurnStash.get(meta.id)?.size ?? 0) > 0,
       hasAccessRetry: this.accessFibers.has(meta.id),
@@ -1890,7 +1901,10 @@ export class SessionDispatchWatcher {
 
     const action = resolveSessionCancelAction(
       meta ?? undefined,
-      this.cancelSeenTurn.get(sessionId),
+      this.cancelSeenTurn.get(sessionId) ===
+        JSON.stringify([meta?.lastCanceledTurn, meta?.lastCancelRequestId ?? 'legacy'])
+        ? meta?.lastCanceledTurn
+        : undefined,
       this.deps.machineId
     );
 
@@ -1901,7 +1915,10 @@ export class SessionDispatchWatcher {
     if (!isActive()) {
       return;
     }
-    this.cancelSeenTurn.set(sessionId, action.turnId);
+    this.cancelSeenTurn.set(
+      sessionId,
+      JSON.stringify([action.turnId, meta?.lastCancelRequestId ?? 'legacy'])
+    );
     await this.deps.executionService.cancelSession(
       {
         type: 'session/cancel',
@@ -1909,8 +1926,9 @@ export class SessionDispatchWatcher {
         machineId: this.deps.machineId,
         workspaceId: this.deps.workspaceId,
         turnId: action.turnId,
+        cancelId: meta?.lastCancelRequestId,
       },
-      { pendingInput: 'promote', prePromptSession: 'discard' }
+      { pendingInput: 'preserve', prePromptSession: 'discard' }
     );
     if (!isActive()) {
       return;
@@ -2290,6 +2308,17 @@ export class SessionDispatchWatcher {
       }
 
       const queuedTurnId = queuedItem.userTurnId?.trim() || `queued-${queuedItem.$cid}`;
+      if (this.deps.executionService.isInboxInputCanceled?.(meta.id, queuedTurnId)) {
+        const canceled = this.buildQueuedMessageEntry(queuedItem, meta, queuedTurnId);
+        if (canceled) {
+          await backend.applyHistoryAction({
+            kind: 'upsert-turn',
+            turn: { ...canceled, status: 'canceled', read: true },
+          });
+          await backend.removeMessageQueueItem(queuedItem.$cid);
+        }
+        return null;
+      }
       const operationId = backend.getQueueOperationId(queuedItem);
       const existing = findLastHistoryEntry(history, queuedTurnId);
       if (existing) {
@@ -2922,7 +2951,43 @@ export class SessionDispatchWatcher {
       if (!isActive()) {
         return { turn: null, history };
       }
-      const turn = findNextDispatchableUserTurn(history, meta);
+      for (const entry of history) {
+        if (
+          entry.role === 'user' &&
+          ['pending', 'seen', 'prepared', 'pending_apply'].includes(entry.status ?? '') &&
+          this.deps.executionService.isInboxInputCanceled?.(meta.id, entry.id)
+        ) {
+          await backend.applyHistoryAction({
+            kind: 'user-status',
+            turnId: entry.id,
+            status: 'canceled',
+          });
+          entry.status = 'canceled';
+        }
+      }
+      let preferred = this.deps.executionService.getPreferredInboxHumanInput?.(meta.id);
+      if (
+        preferred &&
+        (meta.lastMissingHistoryUserMsgId === preferred ||
+          meta.lastHandledUserMsgId === preferred ||
+          history.some(
+            (e) =>
+              e.id === preferred &&
+              ['handled', 'failed', 'canceled', 'delivery_unknown'].includes(e.status ?? '')
+          ))
+      ) {
+        this.deps.executionService.abandonInboxInput?.(meta.id, preferred);
+        preferred = this.deps.executionService.getPreferredInboxHumanInput?.(meta.id);
+      }
+      const turn = preferred
+        ? (history.find(
+            (e) =>
+              e.id === preferred &&
+              e.role === 'user' &&
+              ['pending', 'seen', 'prepared'].includes(e.status ?? '')
+          ) ?? this.peekStashedRpcTurn(meta.id, meta, history))
+        : findNextDispatchableUserTurn(history, meta);
+      if (preferred && !turn) return { turn: null, history };
       if (turn) {
         if (repairedTurnIds.has(turn.id)) {
           this.deps.logger.warn(

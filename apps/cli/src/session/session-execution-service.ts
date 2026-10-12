@@ -1,3 +1,13 @@
+import { inboxFailureDiagnostic } from '@/orchestration/inbox/model';
+import { findProgressMessageId } from '@lody/shared/session-data';
+import type { OperationInboxLegacy } from '@/orchestration/inbox/legacy';
+import {
+  batchPreview,
+  batchHistoryMembers,
+  type InboxBatch,
+  type InboxInput,
+} from '@/orchestration/inbox/model';
+import type { InboxSqlite } from '@/orchestration/inbox/sqlite';
 import { isSessionCollaborationStopped } from '@lody/shared';
 import {
   acpOwnsSessionTitleGeneration,
@@ -291,6 +301,12 @@ type TurnRuntimeState = {
   prePromptFailureRecorded: boolean;
   cancelRequested: boolean;
   pendingInputOnCancel: PendingInputCancellationPolicy;
+  releaseFailure?: unknown;
+  rawPromptCompletion?: Promise<void>;
+  disconnectedTransport?: boolean;
+  inboxBatch?: InboxBatch;
+  inboxInput?: InboxInput;
+  inboxExecutionId?: string;
   cancelFinalized: boolean;
   /** One drain deadline shared by Stop and the cancellation finalizer. */
   cancellationDrain?: Promise<void>;
@@ -385,6 +401,7 @@ type VisibleSessionTurnUnhandledErrorContext = {
 };
 
 type VisibleSessionTurnOptions = {
+  inboxBatch?: InboxBatch;
   sessionId: SessionId;
   sessionDoc: SessionDocument;
   session?: ISession;
@@ -420,6 +437,7 @@ type VisibleSessionTurnPlan = {
 export type SessionDispatchSource = 'rpc' | 'crdt' | 'queue' | 'delivery' | 'goal';
 
 type SessionDispatchOptions = {
+  inboxBatch?: InboxBatch;
   dispatchSource?: SessionDispatchSource;
   /** Goal action this turn exists to run; travels to the agent as prompt metadata. */
   goalControl?: GoalPromptControl;
@@ -795,6 +813,117 @@ type TurnAnalyticsState = {
 };
 
 export class SessionExecutionService {
+  private readonly inboxVisibleExecutions = new Set<Promise<string>>();
+  async drainInboxExecutions(): Promise<void> {
+    await Promise.allSettled([...this.inboxVisibleExecutions]);
+    const failures = [...this.turnRuntimeBySession.values()].flatMap((runtime) =>
+      runtime.releaseFailure ? [runtime.releaseFailure] : []
+    );
+    if (failures.length) throw new AggregateError(failures, 'Execution resources remain owned');
+  }
+  async recoverUnreleasedInboxExecutions(): Promise<void> {
+    for (const runtime of this.turnRuntimeBySession.values())
+      if (runtime.releaseFailure) await this.recoverInboxExecution(runtime.sessionId);
+  }
+  private operationInbox: OperationInboxLegacy | undefined;
+  private inboxSql: InboxSqlite | undefined;
+  private onInboxReleased: ((sessionId: SessionId) => void) | undefined;
+  setOperationInbox(
+    inbox: OperationInboxLegacy | undefined,
+    sql: InboxSqlite | undefined,
+    onReleased?: (sessionId: SessionId) => void
+  ): void {
+    this.operationInbox = inbox;
+    this.inboxSql = sql;
+    this.onInboxReleased = onReleased;
+  }
+  async acceptInboxHumanInput(args: {
+    sessionId: SessionId;
+    inputId: string;
+    userId: string;
+    config: SessionTurnInputConfig;
+  }): Promise<void> {
+    if (this.operationInbox) {
+      const doc = await this.deps.workspaceDocument.getOrCreateSessionDoc(args.sessionId);
+      const meta = await doc.getMetaState();
+      const read = await (await createSessionBackend(doc)).readTurn(args.inputId);
+      if (
+        meta?.lastHandledUserMsgId === args.inputId ||
+        meta?.lastMissingHistoryUserMsgId === args.inputId ||
+        (read.state === 'ready' &&
+          (read.turn.role !== 'user' ||
+            ['handled', 'failed', 'canceled', 'delivery_unknown'].includes(read.turn.status ?? '')))
+      ) {
+        this.abandonInboxInput(args.sessionId, args.inputId);
+        return;
+      }
+    }
+    await this.operationInbox?.accept({
+      workspaceId: this.deps.workspaceId,
+      sessionId: args.sessionId,
+      userId: args.userId,
+      inputId: args.inputId,
+      kind: 'human',
+      config: args.config,
+    });
+    if (this.turnRuntimeBySession.get(args.sessionId)?.releaseFailure) {
+      await this.recoverInboxExecution(args.sessionId).catch((cause) =>
+        this.deps.logger.warn(`Inbox resources remain unreleased: ${formatErrorMessage(cause)}`)
+      );
+    }
+  }
+  abandonInboxInput(sessionId: SessionId, inputId: string): void {
+    this.inboxSql?.abandonInput(this.deps.workspaceId, sessionId, inputId);
+  }
+  getPreferredInboxHumanInput(sessionId: SessionId): string | undefined {
+    return this.inboxSql?.preferredHumanInput(this.deps.workspaceId, sessionId);
+  }
+  isInboxInputCanceled(sessionId: SessionId, inputId: string): boolean {
+    return this.inboxSql?.inputCanceled(this.deps.workspaceId, sessionId, inputId) ?? false;
+  }
+  quiesceInboxExecutions(): void {
+    for (const runtime of this.turnRuntimeBySession.values()) {
+      runtime.cancelRequested = true;
+      runtime.pendingInputOnCancel = 'preserve';
+      runtime.terminateSessionOnCancel = true;
+      runtime.steerWaitController?.abort();
+      this.markTurnCancelled(runtime.sessionId, runtime.turnId);
+      this.requestAgentCancelInBackground(runtime, 'active');
+      this.requestTurnInterrupt(runtime);
+    }
+  }
+
+  async recoverInboxExecution(sessionId: SessionId): Promise<void> {
+    const runtime = this.turnRuntimeBySession.get(sessionId);
+    if (!runtime?.releaseFailure) return;
+    if (runtime.session)
+      await withTimeout(
+        runtime.session.terminate(true),
+        5_000,
+        'Execution recovery termination timed out'
+      );
+    await withTimeout(
+      Promise.allSettled([runtime.yieldedFinalization, ...(runtime.pendingSteerConfig ?? [])]).then(
+        () => undefined
+      ),
+      5_000,
+      'Execution finalization remains owned'
+    );
+    runtime.releaseFailure = undefined;
+    if (runtime.invocation?.requesterUserId)
+      this.inboxSql?.confirmReleased(
+        {
+          workspaceId: this.deps.workspaceId,
+          sessionId,
+          userId: runtime.invocation.requesterUserId,
+        },
+        runtime.inboxExecutionId ?? runtime.turnId
+      );
+    this.releaseTurnRuntime(sessionId, runtime.turnId);
+    await this.operationInbox?.wake();
+    this.onInboxReleased?.(sessionId);
+  }
+
   private readonly canceledTurnBySession = new Map<SessionId, string>();
   private readonly currentTurnBySession = new Map<SessionId, string>();
   private readonly turnRuntimeBySession = new Map<SessionId, TurnRuntimeState>();
@@ -1829,8 +1958,21 @@ export class SessionExecutionService {
       if (postStatusRejection !== null) {
         return await resolveProviderSubmissionRejection(postStatusRejection);
       }
-      providerSubmissionStarted = true;
-      const steerRun = agentClient.steerPrompt(acpSessionId, promptBlocks);
+      const startSteer = () => {
+        providerSubmissionStarted = true;
+        return agentClient.steerPrompt(acpSessionId, promptBlocks);
+      };
+      const steerRun =
+        runtime.inboxInput && this.operationInbox
+          ? (
+              await this.operationInbox.submit(
+                undefined,
+                runtime.inboxInput,
+                runtime.inboxExecutionId ?? runtime.turnId,
+                startSteer
+              )
+            ).value
+          : startSteer();
       if (steerCapability.upstreamTurn === 'handoff') {
         const pendingOutcome = steerRun.outcome;
         runtime.pendingHandoffSteerOutcome = pendingOutcome;
@@ -1939,11 +2081,48 @@ export class SessionExecutionService {
 
         // The provider has accepted this steer and may execute tools before
         // history/finalization catches up. Switch causal identity first.
-        runtime.invocation = {
-          sourceTurnId: options.userTurnId,
-          requesterUserId: options.userId,
-          inputConfig: options.inputConfig,
+        const switchInvocation = () => {
+          runtime.invocation = {
+            sourceTurnId: options.userTurnId,
+            requesterUserId: options.userId,
+            inputConfig: options.inputConfig,
+          };
         };
+        if (runtime.inboxInput && this.operationInbox) {
+          const next: InboxInput = {
+            ...runtime.inboxInput,
+            userId: options.userId,
+            inputId: options.userTurnId,
+            kind:
+              this.inboxSql?.inputKind(
+                {
+                  workspaceId: this.deps.workspaceId,
+                  sessionId: options.sessionId,
+                  userId: options.userId,
+                },
+                options.userTurnId
+              ) ?? 'task',
+            config: options.inputConfig,
+          };
+          try {
+            await this.operationInbox.adopt(
+              runtime.inboxInput,
+              next,
+              runtime.inboxExecutionId!,
+              () => {
+                switchInvocation();
+                runtime.inboxInput = next;
+              }
+            );
+          } catch (cause) {
+            switchInvocation();
+            runtime.releaseFailure = cause;
+            runtime.cancelRequested = true;
+            this.requestAgentCancelInBackground(runtime, 'active');
+            this.requestTurnInterrupt(runtime);
+            throw cause;
+          }
+        } else switchInvocation();
         // Provider acceptance hands the original dispatch forward. A later
         // user-owned steer turn must not cancel or reopen that responsibility.
         await this.settleVisibleTurn(runtime, 'handled', { force: true });
@@ -2733,9 +2912,11 @@ export class SessionExecutionService {
   private drainCancelledPrompt(session: ISession, runtime?: TurnRuntimeState): Promise<void> {
     if (runtime?.cancellationDrain) return runtime.cancellationDrain;
     const requests = () =>
-      [session.agentClient?.pendingPromptCompletion, ...(runtime?.pendingSteerConfig ?? [])].filter(
-        (work): work is Promise<void> => !!work
-      );
+      [
+        runtime?.rawPromptCompletion,
+        session.agentClient?.pendingPromptCompletion,
+        ...(runtime?.pendingSteerConfig ?? []),
+      ].filter((work): work is Promise<void> => !!work);
     const pending = requests();
     if (pending.length === 0) return Promise.resolve();
     const pendingPrompt = Promise.allSettled(pending).then(() => undefined);
@@ -2755,7 +2936,8 @@ export class SessionExecutionService {
             `[${session.sessionId}] Failed to terminate cancelled session; waiting for ACP completion: ${formatErrorMessage(error)}`
           );
           // Failed termination is not permission to reuse a busy agent.
-          await pendingPrompt;
+          if (runtime) runtime.releaseFailure = error;
+          throw error;
         }
       }
     );
@@ -3704,6 +3886,19 @@ export class SessionExecutionService {
     options: VisibleSessionTurnOptions,
     body: (ctx: VisibleSessionTurnContext) => Effect.Effect<void, unknown, Scope.Scope>
   ): Promise<string> {
+    const owned = this.runVisibleSessionTurnOwned(options, body);
+    this.inboxVisibleExecutions.add(owned);
+    try {
+      return await owned;
+    } finally {
+      this.inboxVisibleExecutions.delete(owned);
+    }
+  }
+
+  private async runVisibleSessionTurnOwned(
+    options: VisibleSessionTurnOptions,
+    body: (ctx: VisibleSessionTurnContext) => Effect.Effect<void, unknown, Scope.Scope>
+  ): Promise<string> {
     const { sessionId, sessionDoc, userTurnId } = options;
     const assistantEntryParentTurnId = options.assistantEntryParentTurnId ?? userTurnId;
     const span = startTraceSpan(this.deps.logger, 'execution.visible_turn', {
@@ -3731,6 +3926,40 @@ export class SessionExecutionService {
       return 'duplicate';
     }
 
+    const inbox = this.operationInbox;
+    const invocation = options.invocation;
+    const inboxInput: InboxInput | undefined =
+      inbox && invocation?.requesterUserId
+        ? options.inboxBatch
+          ? { ...options.inboxBatch, config: invocation.inputConfig }
+          : {
+              workspaceId: this.deps.workspaceId,
+              sessionId,
+              userId: invocation.requesterUserId,
+              inputId: invocation.sourceTurnId,
+              kind:
+                this.inboxSql?.inputKind(
+                  {
+                    workspaceId: this.deps.workspaceId,
+                    sessionId,
+                    userId: invocation.requesterUserId,
+                  },
+                  invocation.sourceTurnId
+                ) ?? 'task',
+              config: invocation.inputConfig,
+            }
+        : undefined;
+    try {
+      if (inboxInput && inboxInput.kind !== 'automatic' && !(await inbox!.accept(inboxInput))) {
+        releaseConflict();
+        span.end({ outcome: 'inbox-paused' });
+        return 'inbox-paused';
+      }
+    } catch (cause) {
+      releaseConflict();
+      span.end({ outcome: 'inbox-accept-failed' });
+      throw cause;
+    }
     let turnId!: string;
     let runtime!: TurnRuntimeState;
     try {
@@ -3745,6 +3974,31 @@ export class SessionExecutionService {
     } finally {
       releaseConflict();
     }
+    let inboxBatch = options.inboxBatch;
+    runtime.inboxInput = inboxInput;
+    runtime.inboxExecutionId = turnId;
+    try {
+      if (inboxInput && !(await inbox!.begin(inboxInput, turnId))) {
+        this.releaseTurnRuntime(sessionId, turnId);
+        span.end({ outcome: 'inbox-blocked' });
+        return 'inbox-blocked';
+      }
+      if (inboxInput && !inboxBatch) inboxBatch = await inbox!.prepare(inboxInput);
+      runtime.inboxBatch = inboxBatch;
+    } catch (cause) {
+      try {
+        if (inboxInput)
+          await inbox!.release({ ...inboxInput, executionId: turnId, outcome: 'failed' });
+        this.releaseTurnRuntime(sessionId, turnId);
+      } catch (releaseCause) {
+        runtime.releaseFailure = new AggregateError(
+          [cause, releaseCause],
+          'Inbox preparation and release failed'
+        );
+      }
+      span.end({ outcome: 'inbox-prepare-failed' });
+      throw cause;
+    }
     const self = this;
     let assistantEntryOpened = false;
     let effectiveErrorContext: VisibleSessionTurnUnhandledErrorContext = {
@@ -3756,7 +4010,22 @@ export class SessionExecutionService {
     const program = Effect.scoped(
       Effect.acquireRelease(Effect.succeed(runtime), (turnRuntime, exit) =>
         Effect.gen(function* () {
-          yield* Effect.promise(() => turnRuntime.yieldedFinalization);
+          yield* self
+            .tryPromise(() =>
+              withTimeout(
+                turnRuntime.yieldedFinalization,
+                5_000,
+                'Turn finalization release timed out'
+              )
+            )
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.sync(() => {
+                  turnRuntime.releaseFailure = cause;
+                }).pipe(Effect.andThen(Effect.failCause(cause)))
+              ),
+              Effect.orDie
+            );
           const wasInterrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause);
           const wasCancelled =
             turnRuntime.cancelRequested ||
@@ -3776,7 +4045,26 @@ export class SessionExecutionService {
               reportTurnError: self.shouldReportCancelledTurnError(turnRuntime),
             });
           }
-          self.releaseTurnRuntime(sessionId, turnRuntime.turnId);
+          if (turnRuntime.disconnectedTransport && turnRuntime.session) {
+            yield* self
+              .tryPromise(() =>
+                withTimeout(
+                  turnRuntime.session!.terminate(true),
+                  5_000,
+                  'Disconnected execution release timed out'
+                )
+              )
+              .pipe(
+                Effect.catchCause((cause) =>
+                  Effect.sync(() => {
+                    turnRuntime.releaseFailure = cause;
+                  }).pipe(Effect.andThen(Effect.failCause(cause)))
+                ),
+                Effect.orDie
+              );
+          }
+          if (!turnRuntime.releaseFailure && !inboxInput)
+            self.releaseTurnRuntime(sessionId, turnRuntime.turnId);
         })
       ).pipe(
         Effect.flatMap(() =>
@@ -3941,6 +4229,15 @@ export class SessionExecutionService {
                   yield* Effect.fail(new Error('Agent session was not ready'));
                   return undefined;
                 }
+                if (
+                  yield* self.tryPromise(() =>
+                    isSessionCollaborationStopped(self.deps.workspaceDocument.repo, sessionId)
+                  )
+                ) {
+                  runtime.cancelRequested = true;
+                  runtime.pendingInputOnCancel = 'preserve';
+                }
+                yield* abortIfCancelled();
                 if (!runtime.promptStarted && options.onTurnStarted) {
                   const started = yield* self.tryPromise(options.onTurnStarted).pipe(
                     Effect.mapError(
@@ -3970,18 +4267,80 @@ export class SessionExecutionService {
                     return undefined;
                   }
                 }
-                if (
+
+                if (inboxBatch && !runtime.promptStarted) {
+                  const members = self.inboxSql!.members(inboxBatch, 0, 50);
+                  const historyMembers = batchHistoryMembers(inboxBatch, members);
+                  const backend = yield* self.tryPromise(() => createSessionBackend(sessionDoc));
+                  for (const member of historyMembers) {
+                    const progressId = `operation-progress:${inboxBatch.sessionId}:${member.operationId}`;
+                    const progress = yield* self.tryPromise(async () =>
+                      backend.readTurn(progressId)
+                    );
+                    if (progress.state === 'ready') {
+                      const completion = member.completion;
+                      const items =
+                        completion.type === 'result'
+                          ? completion.value.items
+                          : completion.type === 'cancelled'
+                            ? (completion.partial?.items ?? [])
+                            : [];
+                      const linked = findProgressMessageId([progress.turn], {
+                        requesterSessionId: inboxBatch.sessionId as SessionId,
+                        operationId: member.operationId,
+                        kind: member.operationKind,
+                        items,
+                        completion,
+                      });
+                      if (linked) member.progressMessageId = linked;
+                    }
+                  }
+
                   yield* self.tryPromise(() =>
-                    isSessionCollaborationStopped(self.deps.workspaceDocument.repo, sessionId)
-                  )
-                ) {
-                  runtime.cancelRequested = true;
-                  runtime.pendingInputOnCancel = 'preserve';
+                    backend.applyHistoryAction({
+                      kind: 'upsert-turn',
+                      turn: {
+                        id:
+                          inboxBatch!.kind === 'automatic'
+                            ? inboxBatch!.inputId
+                            : `operation-batch:${inboxBatch!.batchId}`,
+                        role: 'system',
+                        author: { v: 1, kind: 'system' },
+                        userId: inboxBatch!.userId,
+                        timestamp: new Date(getServerNow()).toISOString(),
+                        finished: true,
+                        fileDiff: [],
+                        items: [
+                          {
+                            type: 'operation_completion_batch',
+                            batchId: inboxBatch!.batchId,
+                            memberCount: inboxBatch!.memberCount,
+                            members: historyMembers,
+                            deliveryStatus: 'prepared',
+                          },
+                        ],
+                      },
+                    })
+                  );
+                  promptBlocks = [
+                    ...promptBlocks,
+                    { type: 'text', text: batchPreview(inboxBatch, members) },
+                  ];
                 }
-                yield* abortIfCancelled();
+                if (inboxInput && !runtime.promptStarted) {
+                  const roots = activeSession.getInboxRecoveryRoots
+                    ? yield* self
+                        .tryPromise(() => activeSession.getInboxRecoveryRoots!())
+                        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    : undefined;
+                  self.inboxSql!.registerResources(
+                    inboxInput,
+                    runtime.turnId,
+                    roots ? { platform: process.platform, roots } : undefined
+                  );
+                }
                 runtime.terminateSessionOnCancel = false;
                 self.deps.activateConversationTurnForACPUpdates(sessionId, runtime.turnId);
-                runtime.promptStarted = true;
 
                 yield* Effect.acquireUseRelease(
                   Effect.sync(() => {
@@ -4001,15 +4360,54 @@ export class SessionExecutionService {
                             promptBlocks: promptBlocks.length,
                           },
                           async () => {
-                            const initialRun = self.createPromptHandoffRun({
-                              turnId: runtime.turnId,
-                              promptPromise: agentClient.prompt(acpSessionId, promptBlocks, {
+                            const start = () => {
+                              runtime.promptStarted = true;
+                              const raw = agentClient.prompt(acpSessionId, promptBlocks, {
                                 signal,
                                 ...(runtime.goalControl
                                   ? { goalControl: runtime.goalControl }
                                   : {}),
-                              }),
+                              });
+                              runtime.rawPromptCompletion = raw.then(
+                                () => undefined,
+                                (cause) => {
+                                  runtime.disconnectedTransport = isAgentDisconnectedError(cause);
+                                }
+                              );
+                              return raw;
+                            };
+                            const submitted = inboxInput
+                              ? await inbox!.submit(
+                                  inboxBatch,
+                                  runtime.inboxInput ?? inboxInput,
+                                  runtime.inboxExecutionId ?? runtime.turnId,
+                                  start
+                                )
+                              : { value: start() };
+                            const initialRun = self.createPromptHandoffRun({
+                              turnId: runtime.turnId,
+                              promptPromise: submitted.value,
                             });
+                            if (inboxBatch) {
+                              await inbox!.settle(inboxBatch, 'submitted');
+                              await (
+                                await createSessionBackend(sessionDoc)
+                              )
+                                .applyHistoryAction({
+                                  kind: 'operation-batch-status',
+                                  batchId: inboxBatch.batchId,
+                                  turnId:
+                                    inboxBatch.kind === 'automatic'
+                                      ? inboxBatch.inputId
+                                      : `operation-batch:${inboxBatch.batchId}`,
+                                  status: 'submitted',
+                                })
+                                .catch((cause) =>
+                                  self.deps.logger.warn(
+                                    `Inbox history status projection failed: ${formatErrorMessage(cause)}`
+                                  )
+                                );
+                            }
                             await self.awaitPromptHandoffTail(runtime, initialRun);
                           }
                         )
@@ -4125,6 +4523,60 @@ export class SessionExecutionService {
     }
     if (settlement) {
       await this.settleVisibleTurn(runtime, settlement);
+    }
+    if (inboxInput) {
+      if (inboxBatch && runtime.promptStarted)
+        await inbox!.settle(
+          inboxBatch,
+          outcome === 'completed' && !runtime.promptFailed ? 'settled' : 'unknown',
+          runtime.releaseFailure ? inboxFailureDiagnostic(runtime.releaseFailure) : undefined
+        );
+      if (inboxBatch)
+        await (
+          await createSessionBackend(sessionDoc)
+        )
+          .applyHistoryAction({
+            kind: 'operation-batch-status',
+            batchId: inboxBatch.batchId,
+            turnId:
+              inboxBatch.kind === 'automatic'
+                ? inboxBatch.inputId
+                : `operation-batch:${inboxBatch.batchId}`,
+            status: !runtime.promptStarted
+              ? 'not_submitted'
+              : outcome === 'completed' && !runtime.promptFailed
+                ? 'settled'
+                : 'unknown',
+          })
+          .catch((cause) =>
+            this.deps.logger.warn(
+              `Inbox history status projection failed: ${formatErrorMessage(cause)}`
+            )
+          );
+      try {
+        await inbox!.release({
+          ...(runtime.inboxInput ?? inboxInput),
+          executionId: runtime.inboxExecutionId ?? runtime.turnId,
+          cause: runtime.releaseFailure
+            ? inboxFailureDiagnostic(runtime.releaseFailure)
+            : undefined,
+          outcome: runtime.releaseFailure
+            ? 'unreleased'
+            : runtime.cancelRequested || outcome === 'cancelled'
+              ? 'user_stop'
+              : outcome === 'completed' && !runtime.promptFailed && runtime.promptStarted
+                ? 'normal'
+                : 'failed',
+        });
+      } catch (cause) {
+        runtime.releaseFailure = cause;
+        throw cause;
+      }
+    }
+    if (inboxInput && !runtime.releaseFailure) {
+      this.releaseTurnRuntime(sessionId, runtime.turnId);
+      await inbox!.wake();
+      this.onInboxReleased?.(sessionId);
     }
     return outcome;
   }
@@ -4264,7 +4716,12 @@ export class SessionExecutionService {
       }
     | undefined {
     const runtime = this.turnRuntimeBySession.get(sessionId);
-    if (!runtime) {
+    if (
+      !runtime ||
+      runtime.cancelRequested ||
+      runtime.releaseFailure ||
+      (runtime.inboxInput && this.isInboxInputCanceled(sessionId, runtime.inboxInput.inputId))
+    ) {
       return undefined;
     }
     const { invocation } = runtime;
@@ -5233,6 +5690,8 @@ export class SessionExecutionService {
                   self.deps.hasPromptOutputForTurn?.(sessionId, runtime.turnId) ?? false;
                 if (
                   dispatchOptions?.dispatchSource === 'delivery' ||
+                  Boolean(dispatchOptions?.inboxBatch) ||
+                  Boolean(ctx.runtime.inboxBatch) ||
                   runtime.turnId !== turnId ||
                   !shouldRecoverStaleACPConnectionPrompt({
                     error,
@@ -5365,6 +5824,7 @@ export class SessionExecutionService {
         yield* abortIfCancelled();
 
         if (!producedOutput) {
+          runtime.promptFailed = true;
           yield* self.tryPromise(() =>
             traceAsync(
               self.deps.logger,
@@ -5426,6 +5886,7 @@ export class SessionExecutionService {
       options: {
         sessionId,
         sessionDoc,
+        ...(dispatchOptions?.inboxBatch ? { inboxBatch: dispatchOptions.inboxBatch } : {}),
         ...(session ? { session } : {}),
         userTurnId: executionUserTurnId,
         invocation: {
@@ -6077,6 +6538,7 @@ export class SessionExecutionService {
           yield* abortIfCancelled();
 
           if (!producedOutput) {
+            runtime.promptFailed = true;
             yield* self.tryPromise(() =>
               traceAsync(
                 self.deps.logger,
@@ -6140,10 +6602,26 @@ export class SessionExecutionService {
             machineId: this.deps.machineId,
             workspaceId: this.deps.workspaceId,
           },
-          { pendingInput: 'preserve', prePromptSession: 'discard' }
+          { pendingInput: 'preserve', prePromptSession: 'discard', pauseInbox: false }
         );
       }
     }
+  }
+
+  private async pendingInboxInputIds(sessionId: SessionId): Promise<string[]> {
+    const doc = await this.deps.workspaceDocument.getOrCreateSessionDoc(sessionId);
+    const backend = await createSessionBackend(doc);
+    const [history, queued] = await Promise.all([backend.readHistory(), backend.getMessageQueue()]);
+    return [
+      ...history
+        .filter(
+          (e) =>
+            e.role === 'user' &&
+            ['pending', 'seen', 'prepared', 'pending_apply'].includes(e.status ?? '')
+        )
+        .map((e) => e.id),
+      ...queued.map((e) => e.userTurnId?.trim() || `queued-${e.$cid}`),
+    ];
   }
 
   async cancelSession(
@@ -6151,6 +6629,7 @@ export class SessionExecutionService {
     options: {
       pendingInput?: PendingInputCancellationPolicy;
       prePromptSession?: 'discard' | 'keep';
+      pauseInbox?: boolean;
     } = {}
   ): Promise<{
     success: boolean;
@@ -6185,6 +6664,27 @@ export class SessionExecutionService {
     const currentTurnId = activeTurnId ?? executionTurnId ?? runtimeTurnId;
     // Cancel is exact-match only: a stale stop request must not interrupt a newer assistant turn.
     if (!isPrompting && !isCurrentExecutionTurn) {
+      const target = this.inboxSql?.pauseTarget(this.deps.workspaceId, sessionId, turnId);
+      if (
+        this.operationInbox &&
+        target &&
+        options.pauseInbox !== false &&
+        message.pauseInbox !== false
+      ) {
+        const pendingIds = await this.pendingInboxInputIds(sessionId);
+        const paused = await this.operationInbox.pause(
+          target,
+          target.executionId,
+          pendingIds,
+          message.cancelId
+        );
+        if (paused) {
+          const successor = this.turnRuntimeBySession.get(sessionId);
+          if (successor?.inboxInput?.inputId === `inbox:${target.executionId}`)
+            return this.cancelSession({ ...message, turnId: successor.turnId }, options);
+          return { success: true };
+        }
+      }
       // Stale repair mutates session-wide presence and history, so it must not
       // overlap a newer turn or another durable rewrite. Hold the conflict lease
       // across the awaited history read and recheck live ownership before
@@ -6256,6 +6756,55 @@ export class SessionExecutionService {
       return { success: true };
     }
 
+    const stoppedRuntime = this.turnRuntimeBySession.get(sessionId);
+    if (
+      this.operationInbox &&
+      stoppedRuntime?.invocation?.requesterUserId &&
+      options.pauseInbox !== false &&
+      message.pauseInbox !== false
+    ) {
+      const scope = {
+        workspaceId: this.deps.workspaceId,
+        sessionId,
+        userId: stoppedRuntime.invocation.requesterUserId,
+      };
+      const pendingIds = await this.pendingInboxInputIds(sessionId);
+      try {
+        const paused = await this.operationInbox.pause(
+          scope,
+          stoppedRuntime.inboxExecutionId ?? turnId,
+          pendingIds,
+          message.cancelId
+        );
+        if (!paused) return { success: false, error: 'Execution changed before Stop.' };
+        const successor = this.turnRuntimeBySession.get(sessionId);
+        if (
+          successor &&
+          successor !== stoppedRuntime &&
+          successor.inboxInput?.inputId === `inbox:${stoppedRuntime.inboxExecutionId ?? turnId}`
+        )
+          return this.cancelSession({ ...message, turnId: successor.turnId }, options);
+      } catch (error) {
+        stoppedRuntime.cancelRequested = true;
+        this.markTurnCancelled(sessionId, turnId);
+        this.requestAgentCancelInBackground(stoppedRuntime, 'active');
+        this.requestTurnInterrupt(stoppedRuntime);
+        return { success: false, error: `Stop could not be saved: ${formatErrorMessage(error)}` };
+      }
+    }
+    if (
+      this.operationInbox &&
+      stoppedRuntime?.inboxInput &&
+      (options.pauseInbox === false || message.pauseInbox === false)
+    ) {
+      if (
+        !(await this.operationInbox.cancelExecution(
+          stoppedRuntime.inboxInput,
+          stoppedRuntime.inboxExecutionId ?? turnId
+        ))
+      )
+        return { success: false, error: 'Execution changed before cancellation.' };
+    }
     this.pendingGoalTurnBySession.delete(sessionId);
     this.markTurnCancelled(sessionId, turnId);
     const runtime = this.getTurnRuntime(sessionId, turnId);

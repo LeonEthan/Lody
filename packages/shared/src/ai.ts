@@ -1816,6 +1816,13 @@ export type MessageContent =
         meta?: SystemNoticeMeta[Name];
       };
     }[SystemNoticeName]
+  | {
+      type: 'operation_completion_batch';
+      batchId: string;
+      memberCount: number;
+      members?: OperationCompletionContent[];
+      deliveryStatus?: 'prepared' | 'submitted' | 'unknown' | 'settled' | 'not_submitted';
+    }
   | OperationCompletionContent
   | OperationProgressContent
   | {

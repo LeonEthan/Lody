@@ -124,6 +124,8 @@ function createAbortPromise(signal?: AbortSignal):
 }
 
 export class Session extends EventEmitter<SessionEvents> implements ISession {
+  private sandboxCleanupFailed = false;
+
   readonly sessionId: SessionId;
   private readonly config: SessionConfig;
   private readonly logger: Logger;
@@ -231,6 +233,11 @@ export class Session extends EventEmitter<SessionEvents> implements ISession {
     await this.sandbox.applyLimits(limits);
   }
 
+  getInboxRecoveryRoots(): Promise<readonly number[]> {
+    if (!this.sandbox.recoveryRoots)
+      return Promise.reject(new Error('Session resource identity is unavailable'));
+    return this.sandbox.recoveryRoots();
+  }
   async getMonitorRuntimeInfo(): Promise<SessionMonitorRuntimeInfo> {
     let accounting: SessionMonitorRuntimeInfo['accounting'];
     try {
@@ -270,8 +277,9 @@ export class Session extends EventEmitter<SessionEvents> implements ISession {
    * processes since, and a failed attempt deserves a retry rather than its
    * stale rejection. Each process tree gets a bounded SIGTERM grace (none when
    * forced) and a bounded wait after SIGKILL. A tree that survives both still
-   * ends the Session's bookkeeping, but the returned promise rejects with the
-   * `TerminationFailed`: a caller must not treat that agent as idle and reuse it.
+   * retains process handles, sandbox and credentials, and rejects with an
+   * AggregateError containing the original failures. Callers must not reuse
+   * that agent; independent recovery retries physical termination first.
    */
   terminate(force: boolean = false): Promise<void> {
     const current = this.termination;
@@ -365,12 +373,22 @@ export class Session extends EventEmitter<SessionEvents> implements ISession {
       );
     }
 
+    if (failures.length > 0) {
+      this.status = 'failed';
+      // Keep the sandbox registry, process handles and credentials for explicit recovery.
+      // An exited waiter is not a release receipt, and closing its Scope cannot retry cleanup.
+      throw new AggregateError(failures, `Session ${this.sessionId} resources were not released`);
+    }
+
     try {
-      await this.sandbox.cleanup();
+      if (this.sandboxCleanupFailed && this.sandbox.recoverCleanup)
+        await this.sandbox.recoverCleanup();
+      else await this.sandbox.cleanup();
+      this.sandboxCleanupFailed = false;
     } catch (error) {
-      this.logger.debug(
-        `[${this.sessionId}] Failed to clean up sandbox state: ${formatErrorMessage(error)}`
-      );
+      this.sandboxCleanupFailed = true;
+      this.status = 'failed';
+      throw new Error(`Session ${this.sessionId} sandbox cleanup is unresolved`, { cause: error });
     }
 
     await this.credentials.release();

@@ -35,7 +35,7 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   subprocesses may accept Operations but never schedule completion Turns.
 - Reconciliation is level-checked. Loro subscriptions and SQLite directory
   watch events are hints; startup/lease acquisition scans active Operations and
-  pending Deliveries and unsettled progress once. The watcher never carries result data.
+  durable Inbox intents and unsettled progress once. The watcher never carries result data.
 - The coordinator holds ONE store connection from start to stop. Watch wakes are
   leading-edge coalesced; never do store work per raw fs event.
 - The MCP server holds ONE lazy store connection with `maintenance: false`.
@@ -49,23 +49,24 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   paths must not add blocking waits on top of the driver's `busy_timeout`.
 - `operation-model.ts` is the reduced executable race model. Update its bounded
   exploration and concrete traces whenever scheduling semantics change.
-- Delivery never writes user dispatch pointers; pending users win idle boundaries. Completion owns
-  one stable system Turn under the Session mutex and Assistant `assistant:<systemTurnId>`;
-  `finished`/`endedAt` is not evidence because teardown writes it too. Host lease, Worker boot id,
-  and attempt token fence execution. Fields remain in `delivery_execution_state` because stable
-  binaries parse `SELECT * FROM deliveries`; its insert trigger atomically covers current and legacy
-  writers, migration backfills older rows, and app writers do not dual-write. Claims are exclusive;
-  contention has no history/ACP effects, and release/consume match both ids. Terminal/no-execution
-  paths claim, write history before consume, retain failed finalization for settlement-only retry,
-  recheck after awaits, and never rewrite durable history. `claimed` becomes `prepared` after history
-  and spends one attempt; `started` precedes the provider; Delivery prompts never retry after submission.
-  Failed start fencing finalizes the Assistant, restores idle under Session ownership, and settles
-  `not_started`; only confirmed pre-provider interruption releases prepared work. Cancellation or
-  accepted steer consumes. Missing post-start settlement becomes `uncertain`, never replays, emits
-  `DELIVERY_EXECUTION_UNCERTAIN`, and preserves output. Claim-bound outcomes survive store failures.
-  Startup recovers older boots without resetting attempts; stop abandons only its Worker. Both make
-  claimed/prepared work runnable and started work uncertain. After two prepared attempts, consume
-  with `DELIVERY_ATTEMPTS_EXHAUSTED` without ACP. Pre-claim migration is uncertain.
+- Inbox result arrival only persists. Automatic dispatch requires a unique normal-release
+  boundary with fixed watermark and nonempty eligible members; empty and duplicate boundaries
+  never resnapshot or wake. Late results wait for fresh input or another normal boundary.
+- `inbox/service.ts` is native Effect v4. Scope owns its signal/fibers and repository connection;
+  one per-Session admission covers Stop, trusted human acceptance and actual transport start.
+  Only `inbox/legacy.ts` creates the registered host runtime; the kernel never imports consumers.
+- Stop persists pause and cancels pre-Stop queued input eligibility while retaining history.
+  Only trusted fresh human receipts clear pause; role/userId/author are insufficient. New human
+  acceptance cannot revive a canceled execution or discard an already prepared human input.
+- Fixed batch claims and submission fence precede synchronous transport initiation under the
+  same gate, without an await between them. Post-fence uncertainty never replays, including
+  human-plus-batch stale-ACP recovery. Retry failed settlement only, never the request.
+- Physical request/resource release differs from waiter exit and Scope close. Keep immutable
+  execution IDs, shared close receipts, full Cause and retained recovery owners. Unknown
+  release blocks successors. Independent recovery must prove release before clearing that slot.
+- Upgrade drains old reconciliation chains and actual requests before activating Inbox mode.
+  Old `stop()` alone is insufficient. Existing backlogs are passive; legacy submitted/unknown
+  results cannot be granted a new submission. Only Inbox v1-compatible writers may downgrade.
 - Create Operations may also maintain one stable `role: system` `operation_progress`
   Turn in the requester Session, written only by the Host-lease Worker, never by MCP
   replicas. It is durable UI state, never agent input/dispatch. Merge duplicate rows through
@@ -85,10 +86,6 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   absence. Keep the item/Delivery pending until positive evidence or deadline.
 - Deadlines finish the root with item `TARGET_TIMEOUT` results but never cancel
   target Turns. Operation cancel is the only best-effort remote-cancel path.
-- A pending Delivery still undeliverable 8h after its Operation's deadline is
-  consumed as `expired_stale` without a continuation turn: waking a Session
-  with a completion for work that ended long ago (stranded store, multi-day
-  downtime) surprises the user and spends tokens on a stale result.
 - Store paths are keyed strictly by an explicit machineId
   (`getLodyOperationStorePath` has no default): the MCP server resolves it from
   the session context, never from its own process environment. The former

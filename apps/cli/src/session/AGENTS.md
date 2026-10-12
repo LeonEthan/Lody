@@ -43,28 +43,28 @@ Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
 
 ## Turn execution
 
-- Gate turn-scoped LIST writes on user-entry sync (`turn-history-gate.ts`, 20s), never status/meta.
+- Gate LIST writes on user-entry sync (`turn-history-gate.ts`, 20s), never status/meta.
 - Goals obey [this contract](../../../../specs/session-goal-control.md).
 - Stop ends local steer waits, not the owner fiber. Drain raw prompt/steer/config work before
-  reuse, or confirm termination. Assistant ids use `userTurnId`.
-  `invocation` owns source Turn, requester and config atomically; steer replaces it before tools.
+  reuse. Follow [Inbox admission](../orchestration/AGENTS.md); execution IDs stay immutable.
+  `invocation` owns source/requester/config; steer replaces it before tools.
 - Publish `latestUserMsgId` in the SAME write as the history append (`appendUserTurn`). Only
-  dispatch producers publish it. Renderer sends and queue promotion retain the missing-history
+  dispatch producers publish it. Renderer and queue promotion retain the missing-history
   tombstone; CLI dispatch producers keep their own marker policy.
-- Ordinary turn execution writes only `processingUserMsgId` and `lastHandledUserMsgId`; no start
+- Turn execution writes only `processingUserMsgId` and `lastHandledUserMsgId`; no start
   or terminal path may read-await-rewrite the other slots.
 - Never steer after cancellation or infer delivery from it. Stop uses
-  `pendingInput: promote` / `prePromptSession: discard`; Edit & Resend uses preserve/keep,
+  preserve/discard and cancels pre-Stop queued eligibility; Edit & Resend uses preserve/keep,
   access revocation preserve/discard. Limit create/restore fences to initialization.
 - Promote only proven non-delivery via `steerTurnStatuses`, never producer pointers.
   Unknown never replays; RPC ACKs never revive history. Surface recovery errors.
-- Foreground/steer config uses its owner signal; fence mutations after interrupt.
+- Config uses its owner signal; fence mutations after interrupt.
 - Resume must REOPEN the in-progress assistant entry, clearing
   `finished`/`endedAt`/`permissionWaitMs` there only; never write `finished=false` from teardown.
 - Keep JSON-RPC/transport matching in `acp-error-classification.ts`: disposed/stale `-32603` is
   `agent_disconnected`, Harness compression mismatch is `acp_session_storage_incompatible`.
 - User turns may restore stale ACP and retry once before output. Delivery never retries after
-  provider submission.
+  submission; this includes human-plus-batch inputs.
 - A turn with no ACP updates takes `recordSilentTurnFailure`, not `setDispatchHandled`.
   Read `turnProducedVisibleOutput` before `finalizeTurn` clears it; still finalize, advance
   the pointer, and fail open.

@@ -1,0 +1,361 @@
+import { Context, Effect, Layer, Queue, Semaphore } from 'effect';
+import type { InboxSqlite } from './sqlite';
+import {
+  inboxScopeKey,
+  InboxAdmissionRejected,
+  type InboxBatch,
+  type InboxInput,
+  type InboxRelease,
+  type InboxScope,
+} from './model';
+
+type Repository = {
+  deactivate(workspaceId: string, owner: string): Effect.Effect<void, unknown>;
+  cancelExecution(scope: InboxScope, id: string): Effect.Effect<boolean, unknown>;
+  adopt(previous: InboxInput, next: InboxInput, id: string): Effect.Effect<boolean, unknown>;
+  canSubmit(scope: InboxScope, executionId: string, owner: string): Effect.Effect<boolean, unknown>;
+  accept(input: InboxInput): Effect.Effect<boolean, unknown>;
+  begin(scope: InboxScope, executionId: string, owner?: string): Effect.Effect<boolean, unknown>;
+  pause(
+    scope: InboxScope,
+    executionId: string,
+    pendingIds?: readonly string[],
+    cancelId?: string
+  ): Effect.Effect<boolean, unknown>;
+  release(event: InboxRelease): Effect.Effect<void, unknown>;
+  prepare(
+    input: InboxInput,
+    owner: string,
+    intentId?: string
+  ): Effect.Effect<InboxBatch | undefined, unknown>;
+  fence(batch: InboxBatch, executionId: string): Effect.Effect<boolean, unknown>;
+  pending(
+    workspaceId: string
+  ): Effect.Effect<Array<{ intentId: string; input: InboxInput }>, unknown>;
+  settle(
+    batch: InboxBatch,
+    outcome: 'submitted' | 'unknown' | 'settled',
+    cause?: string
+  ): Effect.Effect<void, unknown>;
+};
+export class InboxRepository extends Context.Service<InboxRepository, Repository>()(
+  'lody/orchestration/InboxRepository'
+) {}
+export const inboxRepositoryLayer = (sql: InboxSqlite, ownedConnection = false) => {
+  const io = <A>(f: () => A) => Effect.try({ try: f, catch: (cause) => cause });
+  const repository: Repository = {
+    deactivate: (w, o) => io(() => sql.deactivate(w, o)),
+    cancelExecution: (scope, id) => io(() => sql.cancelExecution(scope, id)),
+    adopt: (p, n, id) => io(() => sql.adoptExecution(p, n, id)),
+    canSubmit: (s, id, o) => io(() => sql.canSubmit(s, id, o)),
+    accept: (i) => io(() => sql.accept(i)),
+    begin: (s, id, owner) => io(() => sql.begin(s, id, owner)),
+    pause: (s, id, ids, cancelId) => io(() => sql.pause(s, id, ids, cancelId)),
+    release: (e) => io(() => sql.release(e)),
+    prepare: (i, o, id) => io(() => sql.prepare(i, o, id)),
+    fence: (b, id) => io(() => sql.fence(b, id)),
+    pending: (w) => io(() => sql.pending(w)),
+    settle: (b, o, c) => io(() => sql.settle(b, o, c)),
+  };
+  return ownedConnection
+    ? Layer.effect(
+        InboxRepository,
+        Effect.acquireRelease(Effect.succeed(repository), () =>
+          io(() => sql.closeConnection()).pipe(Effect.orDie)
+        )
+      )
+    : Layer.succeed(InboxRepository, repository);
+};
+
+/** Registered temporary adapter for the unfinished Session/ACP owner. */
+export class InboxExecution extends Context.Service<
+  InboxExecution,
+  {
+    ready(batch: InboxBatch): boolean;
+    admit(batch: InboxBatch): boolean;
+    launch(batch: InboxBatch): Effect.Effect<void, unknown>;
+    report(cause: unknown): Effect.Effect<void>;
+    quiesce?(): void;
+  }
+>()('lody/orchestration/InboxExecution') {}
+
+export class OperationInbox extends Context.Service<
+  OperationInbox,
+  {
+    adopt(
+      previous: InboxInput,
+      next: InboxInput,
+      id: string,
+      update: () => void
+    ): Effect.Effect<void, unknown>;
+    wake: Effect.Effect<void>;
+    quiesce: Effect.Effect<void, unknown>;
+    cancelExecution(scope: InboxScope, id: string): Effect.Effect<boolean, unknown>;
+    accept(input: InboxInput): Effect.Effect<boolean, unknown>;
+    begin(scope: InboxScope, executionId: string): Effect.Effect<boolean, unknown>;
+    pause(
+      scope: InboxScope,
+      executionId: string,
+      pendingIds?: readonly string[],
+      cancelId?: string
+    ): Effect.Effect<boolean, unknown>;
+    release(event: InboxRelease): Effect.Effect<void, unknown>;
+    prepare(input: InboxInput): Effect.Effect<InboxBatch | undefined, unknown>;
+    submit<A>(
+      batch: InboxBatch | undefined,
+      scope: InboxScope,
+      executionId: string,
+      start: () => A
+    ): Effect.Effect<{ value: A }, unknown>;
+    recoverSettlements(
+      settle: Repository['settle'],
+      release?: Repository['release'],
+      pause?: Repository['pause']
+    ): Effect.Effect<void, unknown>;
+    settle(
+      batch: InboxBatch,
+      outcome: 'submitted' | 'unknown' | 'settled',
+      cause?: string
+    ): Effect.Effect<void, unknown>;
+  }
+>()('lody/orchestration/OperationInbox') {
+  static layer(workspaceId: string, owner: string) {
+    return Layer.effect(
+      OperationInbox,
+      Effect.gen(function* () {
+        const repo = yield* InboxRepository;
+        const execution = yield* InboxExecution;
+        const scope = yield* Effect.scope;
+        const submissionGate = Semaphore.makeUnsafe(1);
+        let quiesced = false;
+        const gates = new Map<string, Semaphore.Semaphore>();
+        const running = new Set<string>();
+        const vetoed = new Set<string>();
+        const signal = yield* Queue.dropping<void>(1);
+        const releases = new Map<string, InboxRelease>();
+        const pauses = new Map<
+          string,
+          { scope: InboxScope; id: string; ids?: readonly string[]; cancelId?: string }
+        >();
+        const settlements = new Map<
+          string,
+          {
+            batch: InboxBatch;
+            outcome: 'submitted' | 'unknown' | 'settled';
+            cause?: string;
+          }
+        >();
+        const retrySettlements = Effect.fn('OperationInbox.retrySettlements')(function* (
+          settle: Repository['settle'] = repo.settle,
+          release: Repository['release'] = repo.release,
+          pause: Repository['pause'] = repo.pause
+        ) {
+          for (const [key, receipt] of pauses) {
+            yield* gate(receipt.scope).withPermit(
+              pause(receipt.scope, receipt.id, receipt.ids, receipt.cancelId)
+            );
+            if (pauses.get(key) === receipt) pauses.delete(key);
+          }
+          for (const [id, receipt] of releases) {
+            yield* release(receipt);
+            if (releases.get(id) === receipt) releases.delete(id);
+          }
+          for (const [id, receipt] of settlements) {
+            yield* settle(receipt.batch, receipt.outcome, receipt.cause);
+            if (settlements.get(id) === receipt) settlements.delete(id);
+          }
+        });
+        yield* Effect.addFinalizer(() => retrySettlements().pipe(Effect.orDie));
+        const gate = (s: InboxScope) => {
+          const key = inboxScopeKey(s);
+          let semaphore = gates.get(key);
+          if (!semaphore) {
+            semaphore = Semaphore.makeUnsafe(1);
+            gates.set(key, semaphore);
+          }
+          return semaphore;
+        };
+        const wake = Queue.offer(signal, undefined).pipe(Effect.asVoid);
+        const prepare = Effect.fn('OperationInbox.prepare')(function* (input: InboxInput) {
+          return yield* gate(input).withPermit(repo.prepare(input, owner));
+        });
+        const submit = <A>(
+          batch: InboxBatch | undefined,
+          s: InboxScope,
+          id: string,
+          start: () => A
+        ) =>
+          submissionGate.withPermit(
+            gate(s).withPermit(
+              Effect.uninterruptible(
+                Effect.gen(function* () {
+                  if (
+                    quiesced ||
+                    vetoed.has(inboxScopeKey(s)) ||
+                    !(yield* repo.canSubmit(s, id, owner)) ||
+                    (batch && (!execution.admit(batch) || !(yield* repo.fence(batch, id))))
+                  )
+                    return yield* Effect.fail(new InboxAdmissionRejected());
+                  // Return a container: do not assimilate the raw Promise into gate ownership.
+                  return yield* Effect.try({
+                    try: () => ({ value: start() }),
+                    catch: (cause) => cause,
+                  });
+                })
+              )
+            )
+          );
+        const scan = Effect.fn('OperationInbox.scan')(function* () {
+          yield* retrySettlements();
+          if (quiesced) return;
+          const pending = yield* repo.pending(workspaceId);
+          for (const item of pending) {
+            const key = inboxScopeKey(item.input);
+            if (running.has(key)) continue;
+            const batch = yield* gate(item.input).withPermit(
+              repo.prepare(item.input, owner, item.intentId)
+            );
+            if (!batch || !execution.ready(batch)) continue;
+            running.add(key);
+            yield* execution.launch(batch).pipe(
+              Effect.catchCause((cause) => execution.report(cause)),
+              Effect.ensuring(
+                Effect.sync(() => running.delete(key)).pipe(
+                  Effect.andThen(repo.pending(workspaceId)),
+                  Effect.flatMap((items) =>
+                    items.some(
+                      (candidate) =>
+                        inboxScopeKey(candidate.input) === key &&
+                        candidate.input.inputId !== batch.inputId
+                    )
+                      ? wake
+                      : Effect.void
+                  ),
+                  Effect.catchCause((cause) => execution.report(cause))
+                )
+              ),
+              Effect.forkIn(scope)
+            );
+          }
+        });
+        yield* Effect.forever(
+          Queue.take(signal).pipe(
+            Effect.flatMap(() => scan()),
+            Effect.catchCause((cause) => execution.report(cause))
+          )
+        ).pipe(Effect.forkScoped);
+        yield* wake;
+        return OperationInbox.of({
+          adopt: Effect.fn('OperationInbox.adopt')(function* (
+            previous: InboxInput,
+            next: InboxInput,
+            id: string,
+            update: () => void
+          ) {
+            yield* gate(previous).withPermit(
+              Effect.uninterruptible(
+                Effect.gen(function* () {
+                  if (!(yield* repo.adopt(previous, next, id)))
+                    yield* Effect.fail(new Error('INBOX_HANDOFF_REJECTED'));
+                  yield* Effect.sync(update);
+                })
+              )
+            );
+          }),
+          wake,
+          quiesce: submissionGate.withPermit(
+            Effect.uninterruptible(
+              Effect.gen(function* () {
+                quiesced = true;
+                yield* Effect.sync(() => execution.quiesce?.());
+                yield* repo.deactivate(workspaceId, owner);
+              })
+            )
+          ),
+          cancelExecution: (s, id) => gate(s).withPermit(repo.cancelExecution(s, id)),
+          prepare,
+          submit,
+          accept: Effect.fn('OperationInbox.accept')(function* (i: InboxInput) {
+            return yield* gate(i).withPermit(
+              Effect.gen(function* () {
+                for (const [key, receipt] of pauses) {
+                  if (inboxScopeKey(receipt.scope) !== inboxScopeKey(i)) continue;
+                  yield* repo.pause(receipt.scope, receipt.id, receipt.ids, receipt.cancelId);
+                  if (pauses.get(key) === receipt) pauses.delete(key);
+                }
+                return yield* repo.accept(i);
+              }).pipe(
+                Effect.tap((accepted) =>
+                  Effect.sync(() => {
+                    if (accepted && i.kind === 'human') vetoed.delete(inboxScopeKey(i));
+                  })
+                ),
+                Effect.uninterruptible
+              )
+            );
+          }),
+          begin: Effect.fn('OperationInbox.begin')(function* (s: InboxScope, id: string) {
+            return yield* gate(s).withPermit(repo.begin(s, id, owner));
+          }),
+          pause: Effect.fn('OperationInbox.pause')(function* (
+            s: InboxScope,
+            id: string,
+            ids?: readonly string[],
+            cancelId?: string
+          ) {
+            return yield* gate(s).withPermit(
+              Effect.gen(function* () {
+                const key = JSON.stringify([inboxScopeKey(s), cancelId ?? `legacy:${id}`]);
+                const receipt = { scope: s, id, ids, cancelId };
+                pauses.set(key, receipt);
+                const paused = yield* repo
+                  .pause(s, id, ids, cancelId)
+                  .pipe(Effect.tapError(() => Effect.sync(() => vetoed.add(inboxScopeKey(s)))));
+                if (pauses.get(key) === receipt) pauses.delete(key);
+                return paused;
+              }).pipe(Effect.uninterruptible)
+            );
+          }),
+          release: Effect.fn('OperationInbox.release')(function* (e: InboxRelease) {
+            const key = JSON.stringify([e.workspaceId, e.sessionId, e.executionId]);
+            releases.set(key, e);
+            yield* gate(e).withPermit(
+              repo.release(e).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    if (releases.get(key) === e) releases.delete(key);
+                  })
+                ),
+                Effect.tapError(() =>
+                  Effect.sync(() => {
+                    if (e.releaseWatermark === undefined) e.outcome = 'failed';
+                  })
+                )
+              )
+            );
+            yield* wake;
+          }),
+          recoverSettlements: retrySettlements,
+          settle: Effect.fn('OperationInbox.settle')(function* (
+            batch: InboxBatch,
+            outcome: 'submitted' | 'unknown' | 'settled',
+            cause?: string
+          ) {
+            const receipt = { batch, outcome, cause };
+            settlements.set(batch.batchId, receipt);
+            // A failed local write must not abandon the actual provider request.
+            // Retry only the observed settlement, never transport submission.
+            yield* repo.settle(batch, outcome, cause).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  if (settlements.get(batch.batchId) === receipt) settlements.delete(batch.batchId);
+                })
+              ),
+              Effect.catchCause((failure) => execution.report(failure).pipe(Effect.andThen(wake)))
+            );
+          }),
+        });
+      })
+    );
+  }
+}

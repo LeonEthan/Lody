@@ -1,3 +1,5 @@
+import { createSessionBackend } from '@/session/session-backend';
+import { operationInboxLegacy } from '../src/orchestration/inbox/legacy';
 import { withHistoryPort } from './history-port-fixture';
 import { describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
@@ -7740,7 +7742,9 @@ describe('SessionExecutionService', () => {
     const running = service.continueSession(message, { onTurnSettled });
     try {
       await promptStarted.promise;
-      const sourceInvocation = service.getActiveInvocationContext(message.sessionId);
+      expect(service.getActiveInvocationContext(message.sessionId)?.sourceTurnId).toBe(
+        message.userTurnId
+      );
       if (lateApplied || completion === 'stalled-steer-request') {
         history.push({
           id: 'steer-user-turn',
@@ -7781,7 +7785,8 @@ describe('SessionExecutionService', () => {
         });
         await steerReleased.promise;
         expect(onTurnSettled).not.toHaveBeenCalled();
-        expect(service.getActiveInvocationContext(message.sessionId)).toEqual(sourceInvocation);
+        // Physical ownership remains, but canceled model work no longer has delegation authority.
+        expect(service.getActiveInvocationContext(message.sessionId)).toBeUndefined();
         expect(service.getActiveUserTurnId(message.sessionId)).toBe(message.userTurnId);
         expect(meta.processingUserMsgId).toBe(message.userTurnId);
         expect(meta.latestUserMsgId).not.toBe('steer-user-turn');
@@ -7873,6 +7878,13 @@ describe('SessionExecutionService', () => {
     }
 
     expect(agentClient.pendingPromptCompletion).toBeNull();
+    if (completion === 'termination-failed') {
+      expect(service.getExecutionSnapshot(message.sessionId)).toMatchObject({
+        hasActiveTurn: true,
+      });
+      session.terminate.mockImplementationOnce(async () => {});
+      await service.recoverInboxExecution(message.sessionId);
+    }
     expect(service.getExecutionSnapshot(message.sessionId)).toMatchObject({ hasActiveTurn: false });
     expect(deps.processMessageQueue).not.toHaveBeenCalled();
     expect(sessionDoc.setStatus).toHaveBeenCalledWith(SessionStatusFactory.idle());
@@ -8164,8 +8176,15 @@ describe('SessionExecutionService', () => {
           await running;
           expect(terminated).toBe(false);
         }
+        if (completion === 'termination-failed') {
+          expect(service.getExecutionSnapshot(sessionId)).toMatchObject({ hasActiveTurn: true });
+          session.terminate = async () => {
+            terminated = true;
+          };
+          await service.recoverInboxExecution(sessionId);
+        }
         expect(service.getExecutionSnapshot(sessionId)).toMatchObject({ hasActiveTurn: false });
-        expect(deps.turnFinalization.finalizeACPState).toHaveBeenCalledTimes(2);
+
         expect(history[1]).toMatchObject({
           id: `assistant:${userTurnId}`,
           finished: true,
@@ -8176,7 +8195,7 @@ describe('SessionExecutionService', () => {
             }),
           ],
         });
-        if (completion !== 'timeout') {
+        if (completion !== 'timeout' && completion !== 'termination-failed') {
           await service.continueSession(nextMessage);
           expect(delivered).toEqual([
             [{ type: 'text', text: 'old request' }],
@@ -10448,6 +10467,372 @@ describe('SessionExecutionService initialization deadline', () => {
       });
     } finally {
       vi.useRealTimers();
+    }
+  });
+});
+
+describe('Operation Inbox execution boundary', () => {
+  function inboxExecutionFixture(
+    prompt: (blocks: ContentBlock[]) => Promise<unknown>,
+    build?: (blocks: SessionInputBlock[]) => Promise<ContentBlock[]>,
+    automaticFinished?: () => void
+  ) {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lody-inbox-execution-'));
+    const store = new LodyOperationStore(path.join(root, 'operations.sqlite3'), () =>
+      Date.parse('2026-10-12T00:00:00Z')
+    );
+    const sessionId = 'inbox-session' as SessionId;
+    let meta: Partial<SessionMeta> = {
+      id: sessionId,
+      machineId: 'machine-1',
+      userId: 'user-1',
+      cliType: 'builtin',
+      agentType: 'codex',
+      agentConfigId: capabilityConfigId,
+      isArchived: false,
+    };
+    const repo = {
+      getDocMeta: async () => ({ meta }),
+      upsertDocMeta: async (_id: string, patch: Partial<SessionMeta>) => {
+        meta = { ...meta, ...patch };
+      },
+    };
+    const doc = new SessionDocument(repo as never, sessionId, async () => {}, createSilentLogger());
+    const config = {
+      prompt: 'CURRENT_REQUEST',
+      cliType: 'builtin' as const,
+      agentType: 'codex',
+      chainDepth: 0,
+    };
+    composeTestSessionDoc(doc, {
+      history: [
+        {
+          id: 'human-input',
+          role: 'user',
+          userId: 'user-1',
+          timestamp: '2026-10-12T00:00:00Z',
+          status: 'pending',
+          read: false,
+          items: [{ type: 'text', text: 'CURRENT_REQUEST' }],
+          inputConfig: config,
+          finished: true,
+          fileDiff: [],
+        },
+      ],
+    });
+    doc.waitUntilSynced = async () => {};
+    let created = true;
+    const client = {
+      isCreated: () => created,
+      cancel: async () => {},
+      prompt: async (_id: unknown, blocks: ContentBlock[]) => prompt(blocks),
+      currentModel: undefined,
+    };
+    const session = {
+      sessionId,
+      acpSessionId: 'acp-inbox' as ACPSessionId,
+      agentClient: client,
+      terminalManager: {},
+      getWorkdir: () => '/tmp',
+      getHostWorkdir: () => '/tmp',
+      getParentSessionId: () => undefined,
+      getInboxRecoveryRoots: async () => [],
+      exec: async () => '',
+      terminate: async () => {
+        created = false;
+      },
+      updateGitIdentity: () => false,
+      createAgent: async () => 'acp-inbox',
+      applyExecutionPlaneLimits: async () => {},
+      getAcpCapabilities: () => ({ modes: [], models: [] }),
+    };
+    const deps = createBaseDeps({
+      sessionManager: {
+        getSession: () => session,
+        getPendingSession: () => null,
+        createSession: vi.fn(),
+        setSessionError: vi.fn(),
+        terminateSession: vi.fn(),
+        validateSessionCredentials: async () => {},
+      } as never,
+      workspaceDocument: {
+        repo,
+        getOrCreateSessionDoc: async () => doc,
+        getOrOpenSessionCode: async () => null,
+        updateAcpCapabilities: async () => {},
+      } as never,
+      beginConversationTurn: (_sid, id) => `assistant:${id}`,
+      buildAcpPromptBlocks: async (args) =>
+        build ? build(args.inputBlocks) : (args.inputBlocks as ContentBlock[]),
+      createAssistantEntryForTurn: async (_sid, _doc, turnId, _model, parentId) => {
+        await doc.sessionData.commands.applyHistoryAction({
+          kind: 'upsert-turn',
+          turn: {
+            id: turnId,
+            role: 'assistant',
+            userTurnId: parentId,
+            timestamp: '2026-10-12T00:00:00Z',
+            items: [{ type: 'text', text: 'response' }],
+            fileDiff: [],
+            finished: false,
+          },
+        });
+      },
+    });
+    const service = new SessionExecutionService(deps);
+    store.inbox.activate('workspace-1', 'owner');
+    const bridge = operationInboxLegacy({
+      workspaceId: 'workspace-1',
+      owner: 'owner',
+      sql: store.inbox,
+      ready: () => !!automaticFinished && !service.getExecutionSnapshot(sessionId).hasActiveTurn,
+      admit: () => true,
+      launch: async (batch) => {
+        await service.continueSession(
+          {
+            ...message,
+            userTurnId: batch.inputId,
+            acpSessionConfig: {
+              ...config,
+              prompt: 'Review attached completed results',
+              chainDepth: batch.chainDepth,
+            },
+          },
+          { dispatchSource: 'delivery', inboxBatch: batch }
+        );
+        automaticFinished?.();
+      },
+      report: () => {},
+    });
+    service.setOperationInbox(bridge, store.inbox);
+    const message = {
+      type: 'session/chat' as const,
+      sessionId,
+      machineId: 'machine-1',
+      workspaceId: 'workspace-1' as WorkspaceId,
+      acpSessionConfig: config,
+      userTurnId: 'human-input',
+      userId: 'user-1',
+      userName: 'User',
+      userEmail: 'user@example.com',
+    };
+    const add = (id: string, depth = 0) => {
+      store.accept({
+        workspaceId: 'workspace-1' as WorkspaceId,
+        ownerMachineId: 'machine-1' as MachineId,
+        requesterSessionId: sessionId,
+        requesterUserId: 'user-1',
+        operationId: id,
+        kind: 'session_chat',
+        canonicalCommand: { id },
+        frozenContinuationConfig: {
+          inputConfig: { prompt: 'OBSOLETE_REQUEST' },
+          sourceTurnId: 'older-source',
+        },
+        initiatorChainDepth: depth,
+        createdAt: '2026-10-11T00:00:00Z',
+        deadlineAt: '2026-10-13T00:00:00Z',
+        items: [],
+      });
+      store.finish(sessionId, id, { type: 'result', value: { items: [] } });
+    };
+    const accept = () =>
+      service.acceptInboxHumanInput({
+        sessionId,
+        inputId: 'human-input',
+        userId: 'user-1',
+        config,
+      });
+    const close = async () => {
+      await bridge.close();
+      store.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    };
+    return {
+      service,
+      store,
+      doc,
+      session,
+      client,
+      deps,
+      message,
+      add,
+      accept,
+      close,
+      storePath: path.join(root, 'operations.sqlite3'),
+    };
+  }
+
+  it('submits one intact human input with eight results through the actual prompt boundary', async () => {
+    const received: ContentBlock[][] = [];
+    const f = inboxExecutionFixture(async (blocks) => {
+      received.push(structuredClone(blocks));
+      return { stopReason: 'end_turn' };
+    });
+    try {
+      for (let i = 0; i < 8; i++) f.add(`saved-${i}`, i === 0 ? 15 : 0);
+      await f.accept();
+      await f.service.continueSession(f.message);
+      expect(received).toHaveLength(1);
+      expect(received[0][0]).toEqual({ type: 'text', text: 'CURRENT_REQUEST' });
+      const results = received[0]
+        .filter((b): b is Extract<ContentBlock, { type: 'text' }> => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n');
+      for (let i = 0; i < 8; i++) expect(results).toContain(`saved-${i}`);
+      expect(results).not.toContain('OBSOLETE_REQUEST');
+      const history = await (await createSessionBackend(f.doc)).readHistory();
+      const input = history.find((e) => e.id === 'human-input')!;
+      expect(input.inputConfig?.chainDepth).toBe(0);
+      expect(input.items).toEqual([{ type: 'text', text: 'CURRENT_REQUEST' }]);
+      const item = history
+        .flatMap((e) => e.items ?? [])
+        .find((i) => i.type === 'operation_completion_batch')!;
+      expect(item).toMatchObject({ memberCount: 8 });
+      const batch = f.store.inbox.getBatch(
+        (item as Extract<typeof item, { type: 'operation_completion_batch' }>).batchId,
+        { workspaceId: 'workspace-1', sessionId: f.message.sessionId, userId: 'user-1' }
+      )!;
+      expect(batch.state).toBe('settled');
+      expect(batch.chainDepth).toBe(0);
+      expect(f.store.inbox.pending('workspace-1')).toEqual([]);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it('naturally releases into one actual automatic input containing all eight busy arrivals', async () => {
+    const started = createDeferred<void>();
+    const complete = createDeferred<void>();
+    const automatic = createDeferred<void>();
+    const received: ContentBlock[][] = [];
+    const f = inboxExecutionFixture(
+      async (blocks) => {
+        received.push(structuredClone(blocks));
+        if (received.length === 1) {
+          started.resolve();
+          await complete.promise;
+        }
+        return { stopReason: 'end_turn' };
+      },
+      undefined,
+      () => automatic.resolve()
+    );
+    try {
+      await f.accept();
+      const running = f.service.continueSession(f.message);
+      await started.promise;
+      for (let n = 0; n < 8; n++) f.add(`busy-${n}`);
+      expect(received).toHaveLength(1);
+      complete.resolve();
+      await running;
+      await automatic.promise;
+      expect(received).toHaveLength(2);
+      const result = received[1]!
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n');
+      for (let n = 0; n < 8; n++) expect(result).toContain(`busy-${n}`);
+      const history = await (await createSessionBackend(f.doc)).readHistory();
+      const batches = history
+        .flatMap((e) => e.items ?? [])
+        .filter((i) => i.type === 'operation_completion_batch');
+      expect(batches).toMatchObject([{ memberCount: 8, deliveryStatus: 'settled' }]);
+      expect(f.store.inbox.pending('workspace-1')).toEqual([]);
+      f.add('late-nine');
+      expect(f.store.inbox.pending('workspace-1')).toEqual([]);
+    } finally {
+      complete.resolve();
+      await f.close();
+    }
+  });
+
+  it('Stop accepted while input is being built submits nothing and retains all eight results', async () => {
+    const building = createDeferred();
+    const release = createDeferred();
+    const received: ContentBlock[][] = [];
+    const f = inboxExecutionFixture(
+      async (blocks) => {
+        received.push(blocks);
+        return {};
+      },
+      async (blocks) => {
+        building.resolve();
+        await release.promise;
+        return blocks as ContentBlock[];
+      }
+    );
+    try {
+      for (let i = 0; i < 8; i++) f.add(`saved-${i}`);
+      await f.accept();
+      const running = f.service.continueSession(f.message);
+      await building.promise;
+      const turnId = f.service.getExecutionSnapshot(f.message.sessionId).activeTurnId!;
+      await f.service.cancelSession({
+        type: 'session/cancel',
+        sessionId: f.message.sessionId,
+        turnId,
+        machineId: 'machine-1',
+        workspaceId: 'workspace-1' as WorkspaceId,
+      });
+      release.resolve();
+      await running;
+      expect(received).toEqual([]);
+      expect(f.store.listPendingDeliveries('workspace-1' as WorkspaceId)).toHaveLength(8);
+      expect(f.store.inbox.pending('workspace-1')).toEqual([]);
+      expect(
+        f.store.inbox.accept({
+          workspaceId: 'workspace-1',
+          sessionId: f.message.sessionId,
+          userId: 'user-1',
+          inputId: 'agent-note',
+          kind: 'task',
+          config: { prompt: 'pretend user' },
+        })
+      ).toBe(false);
+    } finally {
+      release.resolve();
+      await f.close();
+    }
+  });
+
+  it('received user-plus-batch input is unknown after disconnection and cannot replay on reopen', async () => {
+    const received: ContentBlock[][] = [];
+    const f = inboxExecutionFixture(async (blocks) => {
+      received.push(structuredClone(blocks));
+      throw new RequestError(-32603, 'connection disposed');
+    });
+    try {
+      f.add('saved');
+      await f.accept();
+      await f.service.continueSession(f.message);
+      expect(received).toHaveLength(1);
+      const item = (await (await createSessionBackend(f.doc)).readHistory())
+        .flatMap((e) => e.items ?? [])
+        .find((i) => i.type === 'operation_completion_batch')!;
+      const scope = {
+        workspaceId: 'workspace-1',
+        sessionId: f.message.sessionId,
+        userId: 'user-1',
+      };
+      const id = (item as Extract<typeof item, { type: 'operation_completion_batch' }>).batchId;
+      expect(f.store.inbox.getBatch(id, scope)?.state).toBe('unknown');
+      const other = new LodyOperationStore(f.storePath);
+      try {
+        other.inbox.activate('workspace-1', 'replacement');
+        expect(other.inbox.getBatch(id, scope)?.state).toBe('unknown');
+        expect(
+          other.inbox.prepare(
+            { ...scope, inputId: 'human-input', kind: 'human', config: f.message.acpSessionConfig },
+            'replacement'
+          )
+        ).toBeUndefined();
+      } finally {
+        other.close();
+      }
+      expect(received).toHaveLength(1);
+    } finally {
+      await f.close();
     }
   });
 });

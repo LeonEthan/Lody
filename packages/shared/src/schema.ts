@@ -402,6 +402,13 @@ const historyMessageItemSchema = schema
               )
               ? true
               : 'Missing operation progress metadata';
+          case 'operation_completion_batch':
+            return typeof v.batchId === 'string' &&
+              typeof v.memberCount === 'number' &&
+              Number.isInteger(v.memberCount) &&
+              v.memberCount > 0
+              ? true
+              : 'Missing operation batch metadata';
           case 'operation_completion':
             return typeof v.deliveryId === 'string' &&
               typeof v.operationId === 'string' &&
@@ -1096,6 +1103,8 @@ export type SessionMeta = {
   queuePromotionLedger?: Record<string, SessionQueuePromotionRecord>;
   /** Assistant turn id the client wants to stop; cancel is ignored unless it matches the machine's in-memory active turn. */
   lastCanceledTurn?: string;
+  /** Same Stop id on fast RPC and durable fallback; duplicates cannot cancel a later human input. */
+  lastCancelRequestId?: string;
   /** Latest user history entry id that the machine has fully handled. */
   lastHandledUserMsgId?: string;
   /** User history entry id currently being processed by the machine. */

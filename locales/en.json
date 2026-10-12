@@ -4892,5 +4892,7 @@
   "sessions.messageAuthor.source": "Open source conversation",
   "sessions.messageAuthor.on": "On",
   "sessions.messageAuthor.off": "Off",
-  "settings.memory.rolePromptHint": "Memory providers may inject role definitions into the prompt. Check for duplication or conflicts with your Lody configuration."
+  "settings.memory.rolePromptHint": "Memory providers may inject role definitions into the prompt. Check for duplication or conflicts with your Lody configuration.",
+  "orchestration.batchResults": "{{count}} completed task results",
+  "orchestration.batchResultsUnknown": "{{count}} task results saved; model delivery is uncertain"
 }

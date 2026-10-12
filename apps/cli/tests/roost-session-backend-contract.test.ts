@@ -245,8 +245,8 @@ describe('Production Roost history semantics', () => {
         kind === 'read'
           ? await rpc.readSessionHistoryForRpc(fixture.doc.sessionId, { kind: 'readAll' })
           : await rpc.writeSessionHistoryForRpc(fixture.doc.sessionId, 'append', {
-            entry: nativeUser('rpc-failed-user'),
-          });
+              entry: nativeUser('rpc-failed-user'),
+            });
       const parsed =
         kind === 'read'
           ? SessionHistoryReadResponseSchema.parse(response)
@@ -1129,4 +1129,68 @@ describe('Production Roost history semantics', () => {
       })
     ).rejects.toThrow('identity conflict');
   });
+});
+
+it('persists one targeted Inbox batch receipt through native Roost reopen without changing user input', async () => {
+  const fixture = await nativeFixture();
+  const one = '00000000-0000-4000-8000-000000000001';
+  const two = '00000000-0000-4000-8000-000000000002';
+  await fixture.backend.appendHistoryTurn(nativeUser('request'));
+  for (const [id, batchId] of [
+    ['one', one],
+    ['two', two],
+  ] as const)
+    await fixture.backend.appendHistoryTurn({
+      id,
+      role: 'system',
+      timestamp: '2026-10-12T00:00:00Z',
+      finished: true,
+      fileDiff: [],
+      items: [
+        {
+          type: 'operation_completion_batch',
+          batchId,
+          memberCount: 8,
+          members: [],
+          deliveryStatus: 'prepared',
+        },
+      ],
+    });
+  const original = await fixture.backend.readHistory();
+  expect(
+    await fixture.backend.applyHistoryAction({
+      kind: 'operation-batch-status',
+      turnId: 'one',
+      batchId: 'foreign',
+      status: 'unknown',
+    })
+  ).toMatchObject({ matched: false });
+  await fixture.backend.applyHistoryAction({
+    kind: 'operation-batch-status',
+    turnId: 'one',
+    batchId: one,
+    status: 'unknown',
+  });
+  expect(
+    await fixture.backend.applyHistoryAction({
+      kind: 'operation-batch-status',
+      turnId: 'one',
+      batchId: one,
+      status: 'unknown',
+    })
+  ).toMatchObject({ matched: false });
+  const id = fixture.doc.sessionId;
+  await fixture.close();
+  const reopened = await nativeFixture(id);
+  const history = await reopened.backend.readHistory();
+  expect(history).toHaveLength(3);
+  expect(history[0]).toEqual(original[0]);
+  expect(history[1]?.items?.[0]).toMatchObject({
+    type: 'operation_completion_batch',
+    batchId: one,
+    deliveryStatus: 'unknown',
+    memberCount: 8,
+  });
+  expect(history[2]).toEqual(original[2]);
+  await reopened.close();
 });

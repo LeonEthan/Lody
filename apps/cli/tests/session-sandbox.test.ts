@@ -947,3 +947,32 @@ describe('cgroup failure ownership', () => {
     );
   }
 });
+
+it('shares a failed cleanup receipt and retries retained resources only through recoverCleanup', async () => {
+  const table = new FakeProcessTable('darwin');
+  let denied = true;
+  const sandbox = await createSessionSandboxFactory({
+    logger: createSilentLogger(),
+    deps: {
+      platform: 'darwin',
+      spawnProcess: table.api.spawn,
+      killPid: (pid, signal) => {
+        if (signal !== 0 && denied)
+          throw Object.assign(new Error('signal failed'), { code: 'EIO' });
+        table.api.kill(pid, signal ?? 'SIGTERM');
+      },
+      configureExecutionProcess: async () => {},
+    },
+  })('shared-cleanup' as SessionId);
+  const child = await sandbox.spawn('agent', [], {});
+  const first = sandbox.cleanup();
+  const second = sandbox.cleanup();
+  expect(second).toBe(first);
+  await expect(first).rejects.toBeInstanceOf(ProcessReleaseFailed);
+  expect(table.isAlive(child.child.pid!)).toBe(true);
+  denied = false;
+  expect(sandbox.cleanup()).toBe(first);
+  await expect(sandbox.cleanup()).rejects.toBeInstanceOf(ProcessReleaseFailed);
+  await sandbox.recoverCleanup!();
+  expect(table.isAlive(child.child.pid!)).toBe(false);
+});

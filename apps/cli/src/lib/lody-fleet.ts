@@ -125,6 +125,10 @@ type WorkspaceRuntimeState = {
   unsubscribeTerminalCleanup: () => void;
   prPollerWorkspace: PrPollerWorkspaceHandle;
   schedules: ScheduleWorkspaceHandle;
+  cleanupStage?: number;
+  cleanupReceipt?: Promise<void>;
+  cleanupFailure?: unknown;
+  cleanupCauses?: unknown[];
 };
 
 export class LodyFleet {
@@ -159,6 +163,15 @@ export class LodyFleet {
 
   private unsubscribeWorkspaces: (() => void) | null = null;
   private stopped = false;
+  private shutdownReceipt: Promise<void> | undefined;
+  private shutdownRecovery: Promise<void> | undefined;
+  private localServiceReleaseFailure: unknown;
+  private globalShutdownReceipt: Promise<void> | undefined;
+  private readonly cleanupOwners = new Map<string, WorkspaceRuntimeState>();
+  private readonly startupCleanupOwners = new Map<
+    string,
+    { run(): Promise<void>; retry(): Promise<void> }
+  >();
   private runtimeStateTimer: NodeJS.Timeout | null = null;
   private hasWorkspaceRetryIssue = false;
   private hasControlOfflineIssue = false;
@@ -548,8 +561,35 @@ export class LodyFleet {
     });
   }
 
-  async shutdown(): Promise<void> {
-    if (this.stopped) return;
+  shutdown(): Promise<void> {
+    return (this.shutdownReceipt ??= this.shutdownOnce());
+  }
+
+  recoverShutdown(): Promise<void> {
+    if (!this.shutdownReceipt) return this.shutdown();
+    if (this.shutdownRecovery) return this.shutdownRecovery;
+    const original = this.shutdownReceipt;
+    const attempt = (async () => {
+      try {
+        await original;
+        return;
+      } catch {
+        /* retained workspace owners below */
+      }
+      for (const id of [...this.cleanupOwners.keys(), ...this.startupCleanupOwners.keys()])
+        await this.retryWorkspaceCleanup(id);
+      // Workspace recovery cannot prove release of a failed global service owner.
+      if (this.localServiceReleaseFailure) throw this.localServiceReleaseFailure;
+      await this.finishGlobalShutdown();
+    })();
+    this.shutdownRecovery = attempt;
+    void attempt.catch(() => {
+      if (this.shutdownRecovery === attempt) this.shutdownRecovery = undefined;
+    });
+    return attempt;
+  }
+
+  private async shutdownOnce(): Promise<void> {
     this.stopped = true;
     this.stopRuntimeStateLoop();
     this.memoryPressure.stop();
@@ -576,33 +616,44 @@ export class LodyFleet {
     this.unsubscribeWorkspaces?.();
     this.unsubscribeWorkspaces = null;
 
-    const runtimes = Array.from(this.runtimes.values());
-    this.runtimes.clear();
-    for (const runtime of runtimes) {
+    const failures: unknown[] = [];
+    for (const runtime of this.runtimes.values()) {
       try {
-        await runtime.schedules.dispose();
-        await runtime.lody.cleanup();
-        runtime.unsubscribeTerminalCleanup();
-        await runtime.prPollerWorkspace.dispose();
-      } catch (error) {
-        runtime.unsubscribeTerminalCleanup();
-        this.logger.debug(
-          `[fleet] Failed to cleanup workspace runtime ${runtime.workspace.id}: ${formatErrorMessage(
-            error
-          )}`
-        );
+        await this.cleanupWorkspaceRuntime(runtime);
+      } catch (cause) {
+        failures.push(cause);
       }
     }
+    for (const owner of this.startupCleanupOwners.values()) {
+      try {
+        await owner.run();
+      } catch (cause) {
+        failures.push(cause);
+      }
+    }
+    const localFailures = (await localServicesStopped).flatMap((result) =>
+      result.status === 'rejected' ? [result.reason] : []
+    );
+    if (localFailures.length) {
+      this.localServiceReleaseFailure = new AggregateError(
+        localFailures,
+        'Local service release remains unproven'
+      );
+      failures.push(this.localServiceReleaseFailure);
+    }
+    if (failures.length)
+      throw new AggregateError(failures, 'Fleet shutdown retains unresolved workspace resources');
+    await this.finishGlobalShutdown();
+  }
+
+  private finishGlobalShutdown(): Promise<void> {
+    return (this.globalShutdownReceipt ??= this.finishGlobalShutdownOnce());
+  }
+
+  private async finishGlobalShutdownOnce(): Promise<void> {
     await this.workspaceWatchCoordinator.dispose();
     await this.cloudPort.dispose();
 
-    for (const result of await localServicesStopped) {
-      if (result.status === 'rejected') {
-        this.logger.debug(
-          `[fleet] Failed to stop a local service: ${formatErrorMessage(result.reason)}`
-        );
-      }
-    }
     this.terminalPtyService.closeAll();
   }
 
@@ -734,7 +785,7 @@ export class LodyFleet {
   private async startWorkspace(workspace: WorkspaceListItem): Promise<void> {
     if (this.stopped) return;
     if (!this.desiredWorkspaces.has(workspace.id)) return;
-    if (this.runtimes.has(workspace.id)) return;
+    if (this.runtimes.has(workspace.id) || this.startupCleanupOwners.has(workspace.id)) return;
 
     const retryTimer = this.retryTimers.get(workspace.id);
     if (retryTimer) {
@@ -760,6 +811,8 @@ export class LodyFleet {
 
       let lody: Lody | null = null;
       let stopSchedules: (() => Promise<void>) | undefined;
+      let partialPoller: PrPollerWorkspaceHandle | undefined;
+      let detachTerminals: (() => void) | undefined;
       const workspaceStartAt = Date.now();
       try {
         lody = await Lody.create({
@@ -811,7 +864,8 @@ export class LodyFleet {
         const unsubscribeTerminalCleanup = startedLody.onSessionTerminated((sessionId) => {
           this.terminalPtyService.closeSession(sessionId);
         });
-        const prPollerWorkspace = createLodyPrPollerWorkspace({
+        detachTerminals = unsubscribeTerminalCleanup;
+        const prPollerWorkspace = (partialPoller = createLodyPrPollerWorkspace({
           documentManager: startedLody.documentManager,
           workspaceId: workspace.id,
           userId: this.userId,
@@ -819,7 +873,7 @@ export class LodyFleet {
           githubTokens: this.cloudPort.githubTokens,
           prAssociation: this.cloudPort.prAssociation,
           logger: workspaceLogger,
-        });
+        }));
         // Scheduled automation: this machine runs the schedules it owns, so
         // entrusted work continues while nobody is looking.
         const executionSlots = new AgentExecutionSlots();
@@ -858,15 +912,55 @@ export class LodyFleet {
         this.runtimeStateReporter.clearIssue(`workspace_start_failed:${workspace.id}`);
         this.refreshRuntimeState();
       } catch (error) {
-        await stopSchedules?.();
         if (lody) {
-          await lody.cleanup().catch((cleanupError: unknown) => {
-            this.logger.debug(
-              `[fleet] Failed to cleanup failed workspace runtime ${workspace.id}: ${formatErrorMessage(
-                cleanupError
-              )}`
+          const retained = lody;
+          let stage = 0;
+          let receipt: Promise<void> | undefined;
+          let failure: unknown;
+          const causes: unknown[] = [];
+          const run = () =>
+            (receipt ??= (async () => {
+              if (stage === 0) {
+                await stopSchedules?.();
+                stage = 1;
+              }
+              if (stage === 1) {
+                await retained.cleanup();
+                stage = 2;
+              }
+              if (stage === 2) {
+                await partialPoller?.dispose();
+                detachTerminals?.();
+                stage = 3;
+              }
+              this.startupCleanupOwners.delete(workspace.id);
+            })().catch((cause) => {
+              failure = cause;
+              causes.push(cause);
+              throw cause;
+            }));
+          const owner = {
+            causes,
+            run,
+            retry: () => {
+              if (failure) {
+                receipt = undefined;
+                failure = undefined;
+              }
+              return run();
+            },
+          };
+          this.startupCleanupOwners.set(workspace.id, owner);
+          try {
+            await run();
+          } catch (cleanupCause) {
+            const releaseFailure = new AggregateError(
+              [error, cleanupCause],
+              'Failed startup retains workspace resources',
+              { cause: cleanupCause }
             );
-          });
+            throw releaseFailure;
+          }
         }
         throw error;
       }
@@ -922,23 +1016,53 @@ export class LodyFleet {
 
     const state = this.runtimes.get(workspaceId);
     if (!state) return;
-    this.runtimes.delete(workspaceId);
-    // Keyed by workspace, so it would otherwise outlive every workspace this
-    // process ever connected to.
-    this.prStatusPoller.unregisterWorkspace(workspaceId);
-
-    try {
-      await state.schedules.dispose();
-      await state.lody.cleanup();
-      state.unsubscribeTerminalCleanup();
-      await state.prPollerWorkspace.dispose();
-    } catch (error) {
-      state.unsubscribeTerminalCleanup();
-      this.logger.debug(
-        `[fleet] Failed to cleanup workspace runtime ${workspaceId}: ${formatErrorMessage(error)}`
-      );
-    }
+    await this.cleanupWorkspaceRuntime(state);
     this.refreshRuntimeState();
+  }
+
+  private cleanupWorkspaceRuntime(state: WorkspaceRuntimeState): Promise<void> {
+    if (state.cleanupReceipt) return state.cleanupReceipt;
+    this.cleanupOwners.set(state.workspace.id, state);
+    const receipt = (async () => {
+      if (!state.cleanupStage) {
+        await state.schedules.dispose();
+        state.cleanupStage = 1;
+      }
+      if (state.cleanupStage === 1) {
+        await state.lody.cleanup();
+        state.cleanupStage = 2;
+        state.unsubscribeTerminalCleanup();
+      }
+      if (state.cleanupStage === 2) {
+        await state.prPollerWorkspace.dispose();
+        state.cleanupStage = 3;
+      }
+      if (this.runtimes.get(state.workspace.id) === state) this.runtimes.delete(state.workspace.id);
+      this.cleanupOwners.delete(state.workspace.id);
+      this.prStatusPoller.unregisterWorkspace(state.workspace.id);
+      state.cleanupFailure = undefined;
+    })();
+    state.cleanupReceipt = receipt;
+    void receipt.catch((cause) => {
+      state.cleanupFailure = cause;
+      (state.cleanupCauses ??= []).push(cause);
+    });
+    return receipt;
+  }
+
+  /** Independent retry retains the original failure and starts at the unresolved owner. */
+  async retryWorkspaceCleanup(workspaceId: string): Promise<void> {
+    const startup = this.startupCleanupOwners.get(workspaceId);
+    if (startup) {
+      await startup.retry();
+      return;
+    }
+    const state = this.cleanupOwners.get(workspaceId);
+    if (!state) return;
+    if (!state.cleanupFailure) return state.cleanupReceipt;
+    state.cleanupReceipt = undefined;
+    state.cleanupFailure = undefined;
+    await this.cleanupWorkspaceRuntime(state);
   }
 
   private startRuntimeStateLoop(): void {

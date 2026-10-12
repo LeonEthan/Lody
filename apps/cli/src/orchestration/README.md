@@ -23,12 +23,23 @@ The real-Mirror regression is in
 
 ## Completion consumption
 
-SQLite claims fence the fixed completion Turn and the provider submission. A
-Delivery connection failure after submission settles as uncertain and does not
-enter ordinary user-turn stale-ACP recovery. An absence of received output is
-insufficient evidence of non-consumption. Settlement retries and Worker recovery
-use the existing claim protocol; see the
-[consumption contract](../../../../specs/session-orchestration.md#idempotent-message-consumption).
+`inbox/sqlite.ts` indexes results in the existing completion transaction, fixes release
+watermarks and persists input/batch/resource receipts. `inbox/service.ts` owns coalesced
+signals, scoped workers and the shared admission gate. `inbox/legacy.ts` registers the
+single host runtime and the unfinished Session adapter. `inbox/recovery.ts` proves
+resource disappearance conservatively; unsupported or missing identities remain blocked.
+
+`session-execution-service.ts` calls the actual prompt primitive while holding admission.
+A batch is one system history item plus one model input, even when details require pages.
+`batch-page.ts` returns complete large members in bounded JSON fragments. The execution
+owner retains raw requests and full failures; `recoverInboxExecution` retries cleanup.
+Coordinator `stop()` now has a shared awaited drain receipt; `recoverStop()` is its
+independent retry entry. Same-process legacy handoff uses `startAfterLegacyDrain`.
+
+Only a confirmed normal release can grant an automatic intent. Stop cancels queued
+human execution eligibility and pauses automatic work. Fresh human input carries saved
+results, and a failed/unreleased execution cannot manufacture another wake. See the
+[contract](../../../../specs/session-orchestration.md#idempotent-message-consumption).
 
 Consumed Operation payloads expire after seven days. `operation_retired_ids`
 retains only their Session/Operation keys for the life of the local store.

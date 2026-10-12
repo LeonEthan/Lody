@@ -1,8 +1,10 @@
+import { operationInboxLegacy, type OperationInboxLegacy } from './inbox/legacy';
+import type { InboxBatch } from './inbox/model';
 import { isSessionCollaborationStopped } from '@lody/shared';
 import { randomUUID } from 'node:crypto';
 import { watch, type FSWatcher } from 'node:fs';
 import path from 'node:path';
-import { performance } from 'node:perf_hooks';
+import { withTimeout } from '@/lib/loro/timeout-utils';
 
 import type { RepoWatchHandle } from 'loro-repo';
 
@@ -12,7 +14,6 @@ import {
   getSessionRoomId,
   isLoroRepoDocDeleted,
   makeLodyError,
-  type AgentConfigId,
   type LodyOperationCompletion,
   type LodyOperationItemResult,
   type MachineId,
@@ -21,15 +22,10 @@ import {
   type SessionHistoryInput,
   type SessionId,
   type SessionMeta,
-  type StoredLodyDelivery,
   type StoredLodyOperation,
   type WorkspaceId,
 } from '@lody/shared';
 
-import {
-  readMergedAgentConfigById,
-  type AgentConfigPointLookup,
-} from '@/lib/agent-config-machine-flock';
 import type { LoroDocumentManager, SessionDocument } from '@/lib/loro/doc';
 import { subscribeSessionChanges } from '@/lib/loro/doc';
 import type { Logger } from '@/utils/logger';
@@ -38,11 +34,7 @@ import type { SessionExecutionService } from '@/session/session-execution-servic
 import type { SessionUserResolver } from '@/session/session-user-resolver';
 import { createSessionBackend, type SessionBackend } from '@/session/session-backend';
 
-import {
-  DELIVERY_MAX_ATTEMPTS,
-  getLodyOperationStorePath,
-  LodyOperationStore,
-} from './operation-store';
+import { getLodyOperationStorePath, LodyOperationStore } from './operation-store';
 import {
   getOperationProgressTargetKey,
   getOperationProgressTurnId,
@@ -54,25 +46,9 @@ type TargetSubscription = {
   unsubscribe: () => void;
 };
 
-type DeliveryTurnSettlement = 'handled' | 'cancelled' | 'not_started' | 'uncertain';
-
-type ObservedDeliverySettlement = {
-  claimId: string;
-} & (
-  | { outcome: DeliveryTurnSettlement }
-  | { outcome: 'finalize'; pendingHistoryWrite?: () => Promise<void> }
-);
-
 const TARGET_OUTPUT_PREVIEW_MAX_BYTES = 8 * 1024;
 const MATERIALIZATION_RETRY_MIN_MS = 1_000;
 const MATERIALIZATION_RETRY_MAX_MS = 30_000;
-// A Delivery that could not run within this grace window after its Operation's
-// deadline is expired instead of dispatched: waking a Session with a
-// continuation turn for work that ended long ago (stranded store, daemon down
-// for days) surprises the user and spends tokens on a stale result. The
-// default Operation deadline is 24h, so a legitimately finished completion
-// always has at least this window to reach the requester's idle boundary.
-const DELIVERY_EXPIRY_GRACE_MS = 8 * 60 * 60 * 1_000;
 // This module is loaded once by each CLI Worker process. All workspace
 // coordinators in that Worker share one boot identity, while a replacement
 // Worker necessarily receives a fresh identity after the supervisor's child
@@ -162,13 +138,6 @@ export type LodyOperationCoordinatorOptions = {
 const isTerminalAssistantEntry = (entry: SessionHistoryInput): boolean =>
   entry.role === 'assistant' && (entry.finished === true || typeof entry.endedAt === 'number');
 
-const completionText = (operation: StoredLodyOperation): string =>
-  [
-    `Lody Operation ${operation.operationId} (${operation.kind}) finished.`,
-    'Use the structured completion below to continue the user task. Do not restart completed targets.',
-    JSON.stringify(operation.completion),
-  ].join('\n\n');
-
 export class LodyOperationCoordinator {
   private readonly storeFactory: () => LodyOperationStore;
   private readonly now: () => number;
@@ -176,12 +145,7 @@ export class LodyOperationCoordinator {
   private readonly deadlineTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly materializationTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private readonly materializationRetryAttempts = new Map<string, number>();
-  private readonly configurationTimers = new Map<SessionId, ReturnType<typeof setTimeout>>();
   private readonly reconcileChains = new Map<string, Promise<void>>();
-  private readonly deliveryChains = new Map<SessionId, Promise<void>>();
-  private readonly queuedDeliveryIds = new Set<string>();
-  private readonly dirtyDeliveryIds = new Set<string>();
-  private readonly observedDeliverySettlements = new Map<string, ObservedDeliverySettlement>();
   private readonly operationAbortControllers = new Map<string, AbortController>();
   private metaWatch: RepoWatchHandle | null = null;
   private store: LodyOperationStore | null = null;
@@ -189,6 +153,17 @@ export class LodyOperationCoordinator {
   private progressRetryTimer: ReturnType<typeof setTimeout> | null = null;
   private storeWakeTimer: ReturnType<typeof setTimeout> | null = null;
   private started = false;
+  private inbox: OperationInboxLegacy | undefined;
+  private shutdown: Promise<void> | undefined;
+  private quiesceReceipt: Promise<void> | undefined;
+  private quiesceFailure: unknown;
+  private legacyDrain: Promise<void> | undefined;
+  private legacyHandoffPending = false;
+  private stoppedComplete = true;
+  private shutdownFailure: unknown;
+  private shutdownRecovery: Promise<void> | undefined;
+  private readonly inboxExecutions = new Set<Promise<void>>();
+  private readonly projectedBatches = new Set<string>();
   private readonly materializationClaimToken = randomUUID();
   private readonly workerBootId: string;
 
@@ -200,7 +175,16 @@ export class LodyOperationCoordinator {
   }
 
   start(): void {
+    if (this.legacyHandoffPending) throw new Error('Legacy coordinator has not physically drained');
     if (this.started) return;
+    if (!this.stoppedComplete) throw new Error('Coordinator shutdown is not complete');
+    this.shutdown = undefined;
+    this.shutdownFailure = undefined;
+    this.shutdownRecovery = undefined;
+    this.quiesceReceipt = undefined;
+    this.quiesceFailure = undefined;
+    this.projectedBatches.clear();
+    this.stoppedComplete = false;
     this.started = true;
     this.metaWatch = this.options.workspaceDocument.repo.watch(
       (event) => {
@@ -220,6 +204,36 @@ export class LodyOperationCoordinator {
     // event loop (multiple workspace coordinators watching the shared
     // machine-level store amplify it).
     this.store = this.storeFactory();
+    this.store.inbox.activate(this.options.workspaceId, this.workerBootId);
+    this.inbox = operationInboxLegacy({
+      workspaceId: this.options.workspaceId,
+      owner: this.workerBootId,
+      sql: this.store.inbox,
+      openRecoveryRepository: () => {
+        const store = this.storeFactory();
+        return { sql: store.inbox, close: () => store.close() };
+      },
+      quiesce: () => this.options.executionService.quiesceInboxExecutions?.(),
+      ready: (batch) =>
+        this.started &&
+        !this.options.executionService.getExecutionSnapshot(batch.sessionId as SessionId)
+          .hasActiveTurn &&
+        !this.options.dispatchWatcher.hasPendingDispatch(batch.sessionId as SessionId),
+      admit: (batch) =>
+        this.started &&
+        (batch.kind !== 'automatic' ||
+          !this.options.dispatchWatcher.hasPendingDispatch(batch.sessionId as SessionId)),
+      launch: (batch) => {
+        const pending = this.launchInboxBatch(batch);
+        this.inboxExecutions.add(pending);
+        void pending.finally(() => this.inboxExecutions.delete(pending)).catch(() => undefined);
+        return pending;
+      },
+      report: (cause) => this.options.logger.warn(`[inbox] ${String(cause)}`),
+    });
+    this.options.executionService.setOperationInbox?.(this.inbox, this.store.inbox, (sessionId) => {
+      void this.options.dispatchWatcher.enqueueSessionCheck?.(sessionId);
+    });
     const recoveredClaims = this.store.recoverOrphanedDeliveryClaims(
       this.options.workspaceId,
       this.workerBootId
@@ -252,11 +266,28 @@ export class LodyOperationCoordinator {
     void this.wake('startup');
   }
 
+  /** Upgrade-only adapter: old stop is not a release receipt. Never activates on timeout. */
+  async startAfterLegacyDrain(
+    previous: { stop(): void | Promise<void>; idle(): Promise<void> },
+    physicalRelease: () => Promise<void>
+  ): Promise<void> {
+    this.legacyHandoffPending = true;
+    this.legacyDrain ??= (async () => {
+      await previous.stop();
+      await previous.idle();
+      await physicalRelease();
+    })();
+    await withTimeout(this.legacyDrain, 15_000, 'Legacy coordinator release is unresolved');
+    this.legacyHandoffPending = false;
+    this.start();
+  }
+
   hasPendingWorkForRequester(sessionId: SessionId): boolean {
     return this.store?.hasPendingWorkForRequester(this.options.workspaceId, sessionId) ?? true;
   }
 
-  stop(): void {
+  stop(): Promise<void> {
+    if (this.shutdown) return this.shutdown;
     this.started = false;
     this.metaWatch?.unsubscribe();
     this.metaWatch = null;
@@ -285,8 +316,10 @@ export class LodyOperationCoordinator {
         );
       }
     }
-    this.store?.close();
-    this.store = null;
+    this.quiesceReceipt = this.inbox?.quiesce() ?? Promise.resolve();
+    void this.quiesceReceipt.catch((cause) => {
+      this.quiesceFailure = cause;
+    });
     for (const subscription of this.targetSubscriptions.values()) {
       subscription.unsubscribe();
     }
@@ -298,15 +331,53 @@ export class LodyOperationCoordinator {
     for (const timer of this.materializationTimers.values()) clearTimeout(timer);
     this.materializationTimers.clear();
     this.materializationRetryAttempts.clear();
-    for (const timer of this.configurationTimers.values()) clearTimeout(timer);
-    this.configurationTimers.clear();
-    this.reconcileChains.clear();
-    this.deliveryChains.clear();
-    this.queuedDeliveryIds.clear();
-    this.dirtyDeliveryIds.clear();
-    this.observedDeliverySettlements.clear();
     for (const controller of this.operationAbortControllers.values()) controller.abort();
     this.operationAbortControllers.clear();
+    this.shutdown = this.finishStop().catch((cause) => {
+      this.shutdownFailure = cause;
+      throw cause;
+    });
+    return this.shutdown;
+  }
+
+  private async finishStop(): Promise<void> {
+    await this.quiesceReceipt;
+    // Keep the native runtime/connection alive for the final release and settlement receipts.
+    await withTimeout(
+      (async () => {
+        await this.idle();
+        await this.options.executionService.drainInboxExecutions?.();
+        await Promise.allSettled([...this.inboxExecutions]);
+      })(),
+      15_000,
+      'Coordinator resources did not drain'
+    );
+    await this.inbox?.close();
+    this.options.executionService.setOperationInbox?.(undefined, undefined);
+    this.store?.close();
+    this.store = null;
+    this.stoppedComplete = true;
+  }
+  recoverStop(): Promise<void> {
+    if (this.stoppedComplete) return Promise.resolve();
+    if (!this.shutdownFailure) return this.stop();
+    if (this.shutdownRecovery) return this.shutdownRecovery;
+    const recovery = (async () => {
+      if (this.quiesceFailure) {
+        this.quiesceFailure = undefined;
+        this.quiesceReceipt = this.inbox?.quiesce();
+        await this.quiesceReceipt;
+      }
+      await this.options.executionService.recoverUnreleasedInboxExecutions?.();
+      await this.finishStop();
+    })();
+    this.shutdownRecovery = recovery;
+    void recovery
+      .finally(() => {
+        if (this.shutdownRecovery === recovery) this.shutdownRecovery = undefined;
+      })
+      .catch(() => undefined);
+    return recovery;
   }
 
   wake(reason: string): Promise<void> {
@@ -334,24 +405,18 @@ export class LodyOperationCoordinator {
 
   async idle(): Promise<void> {
     await Promise.all([...this.reconcileChains.values()]);
-    await Promise.all([...this.deliveryChains.values()]);
   }
 
   private withStore<T>(fn: (store: LodyOperationStore) => T): T {
     // Use the lifetime connection while started; see start() for why transient
     // open/close cycles are forbidden (WAL/SHM churn re-wakes the watcher).
     if (this.store) return fn(this.store);
-    // In-flight chains can outlive stop(); fall back to a transient connection.
-    const store = this.storeFactory();
-    try {
-      return fn(store);
-    } finally {
-      store.close();
-    }
+    throw new Error('Operation coordinator has released its store');
   }
 
-  private async reconcile(reason: string): Promise<void> {
+  private async reconcile(_reason: string): Promise<void> {
     if (!this.started) return;
+    await this.projectInboxReceipts();
     const active = this.withStore((store) =>
       store.listActive(this.options.workspaceId, this.options.machineId)
     );
@@ -383,11 +448,36 @@ export class LodyOperationCoordinator {
       this.progressRetryTimer = null;
     }
 
-    const pendingDeliveries = this.withStore((store) =>
-      store.listPendingDeliveries(this.options.workspaceId)
-    );
-    for (const delivery of pendingDeliveries) {
-      this.enqueueDelivery(delivery, reason);
+    // Result arrival is passive. The native inbox only resumes recorded release intents.
+    void this.inbox?.wake().catch((cause) => this.options.logger.warn(`[inbox] ${String(cause)}`));
+  }
+
+  /** Restore only the stable history projection; it never authorizes model input. */
+  private async projectInboxReceipts(): Promise<void> {
+    const ownerStore = this.store;
+    if (!ownerStore) return;
+    for (const batch of ownerStore.inbox.historyReceipts(this.options.workspaceId)) {
+      const key = JSON.stringify([batch.batchId, batch.state]);
+      if (this.projectedBatches.has(key)) continue;
+      const meta = await this.options.workspaceDocument.repo.getDocMeta(
+        getSessionRoomId(batch.sessionId as SessionId)
+      );
+      if (!meta?.meta || isLoroRepoDocDeleted(meta)) continue;
+      const doc = await this.options.workspaceDocument.getOrCreateSessionDoc(
+        batch.sessionId as SessionId
+      );
+      const backend = await createSessionBackend(doc, meta.meta as SessionMeta);
+      if (!this.started || this.store !== ownerStore) return;
+      await backend.applyHistoryAction({
+        kind: 'operation-batch-status',
+        batchId: batch.batchId,
+        turnId: batch.kind === 'automatic' ? batch.inputId : `operation-batch:${batch.batchId}`,
+        status:
+          batch.state === 'superseded'
+            ? 'not_submitted'
+            : (batch.state as 'submitted' | 'unknown' | 'settled'),
+      });
+      this.projectedBatches.add(key);
     }
   }
 
@@ -955,519 +1045,48 @@ export class LodyOperationCoordinator {
     return output;
   }
 
-  private enqueueDelivery(delivery: StoredLodyDelivery, reason: string): void {
-    if (this.queuedDeliveryIds.has(delivery.deliveryId)) {
-      // A wake can carry the state transition that makes an earlier transient
-      // return runnable. Coalesce duplicates, but remember to make one serial
-      // follow-up attempt after the current attempt finishes.
-      this.dirtyDeliveryIds.add(delivery.deliveryId);
-      return;
-    }
-    this.queuedDeliveryIds.add(delivery.deliveryId);
-    const sessionId = delivery.requesterSessionId;
-    const previous = this.deliveryChains.get(sessionId) ?? Promise.resolve();
-    const next = previous
-      .catch(() => undefined)
-      .then(async () => {
-        let attemptReason = reason;
-        for (;;) {
-          this.dirtyDeliveryIds.delete(delivery.deliveryId);
-          try {
-            await this.deliverIfRunnable(delivery, attemptReason);
-          } catch (error: unknown) {
-            this.options.logger.warn(
-              `[orchestration] Delivery ${delivery.deliveryId} failed: ${
-                error instanceof Error ? error.message : String(error)
-              }`
-            );
-          }
-          const retry = this.dirtyDeliveryIds.delete(delivery.deliveryId);
-          if (!this.started || !retry || !this.isDeliveryPending(delivery)) {
-            return;
-          }
-          attemptReason = 'coalesced';
-        }
-      })
-      .catch((error: unknown) => {
-        this.options.logger.warn(
-          `[orchestration] Delivery ${delivery.deliveryId} coalesced retry failed: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-      })
-      .finally(() => {
-        const lateRetry = this.dirtyDeliveryIds.delete(delivery.deliveryId);
-        this.queuedDeliveryIds.delete(delivery.deliveryId);
-        if (this.deliveryChains.get(sessionId) === next) {
-          this.deliveryChains.delete(sessionId);
-        }
-        // A wake can land after the worker loop decides it is clean but before
-        // this chain's Promise settles. Clear this chain's ownership first so
-        // the follow-up is enqueued behind any newer session work.
-        if (this.started && lateRetry && this.isDeliveryPending(delivery)) {
-          this.enqueueDelivery(delivery, 'coalesced');
-        }
-      });
-    this.deliveryChains.set(sessionId, next);
-  }
-
-  private isDeliveryPending(delivery: StoredLodyDelivery): boolean {
-    return this.withStore((store) =>
-      store
-        .listPendingDeliveries(this.options.workspaceId, delivery.requesterSessionId)
-        .some((candidate) => candidate.deliveryId === delivery.deliveryId)
+  private async launchInboxBatch(batch: InboxBatch): Promise<void> {
+    if (!this.started || !this.store) return;
+    const sessionId = batch.sessionId as SessionId;
+    const record = await this.options.workspaceDocument.repo.getDocMeta(
+      getSessionRoomId(sessionId)
     );
-  }
-
-  private async settleObservedDeliveryClaim(
-    delivery: StoredLodyDelivery,
-    settlement: ObservedDeliverySettlement
-  ): Promise<StoredLodyDelivery> {
-    const previous = this.observedDeliverySettlements.get(delivery.deliveryId);
-    if (!previous || previous.claimId === settlement.claimId) {
-      this.observedDeliverySettlements.set(delivery.deliveryId, settlement);
-    }
-    if (settlement.outcome === 'finalize' && settlement.pendingHistoryWrite) {
-      const current = this.withStore((store) =>
-        store.getDelivery(delivery.requesterSessionId, delivery.operationId)
-      );
-      if (
-        current.activeClaimWorkerBootId !== this.workerBootId ||
-        current.activeClaimId !== settlement.claimId
-      ) {
-        if (this.observedDeliverySettlements.get(delivery.deliveryId) === settlement) {
-          this.observedDeliverySettlements.delete(delivery.deliveryId);
-        }
-        return current;
-      }
-      await settlement.pendingHistoryWrite();
-      delete settlement.pendingHistoryWrite;
-    }
-    // History writes can yield across workspace stop or claim replacement.
-    const current = this.withStore((store) => {
-      let latest = store.getDelivery(delivery.requesterSessionId, delivery.operationId);
-      if (
-        latest.activeClaimWorkerBootId !== this.workerBootId ||
-        latest.activeClaimId !== settlement.claimId
-      ) {
-        return latest;
-      }
-      if (
-        settlement.outcome === 'handled' ||
-        settlement.outcome === 'cancelled' ||
-        settlement.outcome === 'finalize'
-      ) {
-        return store.consumeClaimedDelivery(
-          delivery.requesterSessionId,
-          delivery.operationId,
-          this.workerBootId,
-          settlement.claimId
-        ).delivery;
-      }
-      if (settlement.outcome === 'uncertain') {
-        store.markClaimedDeliveryExecutionUncertain(
-          delivery.requesterSessionId,
-          delivery.operationId,
-          this.workerBootId,
-          settlement.claimId
-        );
-      } else {
-        store.releaseDeliveryClaim(
-          delivery.requesterSessionId,
-          delivery.operationId,
-          this.workerBootId,
-          settlement.claimId
-        );
-      }
-      latest = store.getDelivery(delivery.requesterSessionId, delivery.operationId);
-      return latest;
-    });
+    if (!this.started || !record?.meta || isLoroRepoDocDeleted(record)) return;
+    const meta = record.meta as SessionMeta;
     if (
-      current.activeClaimWorkerBootId !== this.workerBootId ||
-      current.activeClaimId !== settlement.claimId
-    ) {
-      if (this.observedDeliverySettlements.get(delivery.deliveryId) === settlement) {
-        this.observedDeliverySettlements.delete(delivery.deliveryId);
-      }
-    }
-    return current;
-  }
-
-  private async deliverIfRunnable(delivery: StoredLodyDelivery, reason: string): Promise<void> {
+      meta.isArchived ||
+      meta.machineId !== this.options.machineId ||
+      (await isSessionCollaborationStopped(this.options.workspaceDocument.repo, sessionId))
+    )
+      return;
+    const cliType = batch.config.cliType ?? meta.cliType;
+    if (!cliType) return;
+    const requester = await this.resolveRequesterIdentity(batch.userId);
     if (!this.started) return;
-    delivery = this.withStore((store) =>
-      store.getDelivery(delivery.requesterSessionId, delivery.operationId)
-    );
-    if (delivery.state === 'consumed') {
-      this.observedDeliverySettlements.delete(delivery.deliveryId);
-      return;
-    }
-    // A claim is exclusive regardless of owner. Foreign-boot claims
-    // are removed only once during Worker startup, after the lifecycle barrier.
-    if (delivery.activeClaimId || delivery.activeClaimWorkerBootId) {
-      const settlement = this.observedDeliverySettlements.get(delivery.deliveryId);
-      if (
-        settlement &&
-        delivery.activeClaimWorkerBootId === this.workerBootId &&
-        delivery.activeClaimId === settlement.claimId
-      ) {
-        await this.settleObservedDeliveryClaim(delivery, settlement);
-      } else if (settlement) {
-        this.observedDeliverySettlements.delete(delivery.deliveryId);
-      }
-      return;
-    }
-    this.observedDeliverySettlements.delete(delivery.deliveryId);
-    const metaRecord = await this.options.workspaceDocument.repo.getDocMeta(
-      getSessionRoomId(delivery.requesterSessionId)
-    );
-    if (!metaRecord?.meta || isLoroRepoDocDeleted(metaRecord)) return;
-    const meta = metaRecord.meta as SessionMeta;
-    if (meta.isArchived || meta.machineId !== this.options.machineId) return;
-    const sessionDoc = await this.options.workspaceDocument.getOrCreateSessionDoc(
-      delivery.requesterSessionId
-    );
-    const backend = await createSessionBackend(sessionDoc, meta);
-    this.subscribeTarget(delivery.requesterSessionId, sessionDoc, backend);
-
-    const execution = this.options.executionService.getExecutionSnapshot(
-      delivery.requesterSessionId
-    );
-    const operation = this.withStore((store) =>
-      store.get(delivery.requesterSessionId, delivery.operationId)
-    );
-    if (this.now() >= Date.parse(operation.deadlineAt) + DELIVERY_EXPIRY_GRACE_MS) {
-      await this.finalizeDeliveryWithoutExecution(
-        sessionDoc,
-        operation,
-        delivery,
-        reason,
-        'expired_stale',
-        undefined,
-        false,
-        delivery.executionPhase === 'uncertain' ? 'uncertain' : 'ready'
-      );
-      return;
-    }
-    if (
-      delivery.executionPhase === 'ready' &&
-      (await isSessionCollaborationStopped(
-        this.options.workspaceDocument.repo,
-        delivery.requesterSessionId
-      ))
-    ) {
-      await this.finalizeDeliveryWithoutExecution(
-        sessionDoc,
-        operation,
-        delivery,
-        reason,
-        'collaboration_stopped',
-        {
-          code: 'COLLABORATION_STOPPED',
-          message:
-            'The user stopped this conversation tree. The result was saved without starting another turn.',
-        }
-      );
-      return;
-    }
-    if (delivery.executionPhase === 'uncertain') {
-      await this.failUncertainDelivery(sessionDoc, operation, delivery, reason);
-      return;
-    }
-    if (execution.hasActiveTurn) return;
-    if (this.options.dispatchWatcher.hasPendingDispatch(delivery.requesterSessionId)) return;
-    if (delivery.attemptCount >= DELIVERY_MAX_ATTEMPTS) {
-      await this.failExhaustedDelivery(sessionDoc, operation, delivery, reason);
-      return;
-    }
-
-    const configuration = await this.resolveFrozenConfiguration(operation, delivery, reason);
-    if (configuration === 'unknown') {
-      this.armConfigurationRetry(delivery.requesterSessionId);
-      return;
-    }
-    if (configuration === 'unavailable') {
-      await this.finalizeDeliveryWithoutExecution(
-        sessionDoc,
-        operation,
-        delivery,
-        reason,
-        'configuration_unavailable',
-        {
-          code: 'CONFIGURATION_UNAVAILABLE',
-          message: 'The frozen continuation agent configuration is no longer available.',
-        }
-      );
-      return;
-    }
-
-    const frozen = operation.frozenContinuationConfig.inputConfig;
-    const requester = await this.resolveRequesterIdentity(operation.requesterUserId);
-    const attemptId = randomUUID();
-    let observedSettlement: DeliveryTurnSettlement | undefined;
-    const settleResidualClaim = () =>
-      observedSettlement
-        ? this.settleObservedDeliveryClaim(delivery, {
-            claimId: attemptId,
-            outcome: observedSettlement,
-          })
-        : this.withStore((store) => {
-            let current = store.getDelivery(delivery.requesterSessionId, delivery.operationId);
-            if (
-              current.activeClaimWorkerBootId !== this.workerBootId ||
-              current.activeClaimId !== attemptId
-            ) {
-              return current;
-            }
-            if (current.executionPhase === 'started') {
-              store.markClaimedDeliveryExecutionUncertain(
-                delivery.requesterSessionId,
-                delivery.operationId,
-                this.workerBootId,
-                attemptId
-              );
-            } else {
-              store.releaseDeliveryClaim(
-                delivery.requesterSessionId,
-                delivery.operationId,
-                this.workerBootId,
-                attemptId
-              );
-            }
-            current = store.getDelivery(delivery.requesterSessionId, delivery.operationId);
-            return current;
-          });
-    const continuation = this.options.executionService.continueSession(
+    await this.options.executionService.continueSession(
       {
         type: 'session/chat',
-        sessionId: delivery.requesterSessionId,
+        sessionId,
         machineId: this.options.machineId,
         workspaceId: this.options.workspaceId,
-        acpSessionConfig: {
-          prompt: completionText(operation),
-          cliType: frozen.cliType ?? meta.cliType,
-          agentType: frozen.agentType ?? meta.agentType,
-          ...(frozen.modeId ? { modeId: frozen.modeId } : {}),
-          ...(frozen.modelId ? { modelId: frozen.modelId } : {}),
-          ...(frozen.configOptionValues ? { configOptionValues: frozen.configOptionValues } : {}),
-          ...(meta.acpSessionId ? { resume: meta.acpSessionId } : {}),
-          chainDepth: operation.initiatorChainDepth + 1,
-        },
-        userTurnId: delivery.systemTurnId,
-        userId: operation.requesterUserId,
+        userTurnId: batch.inputId,
+        userId: batch.userId,
         userName: requester.name,
         userEmail: requester.email,
-      },
-      {
-        dispatchSource: 'delivery',
-        onTurnClaimed: async () => {
-          if (!this.started) return false;
-          const claim = this.withStore((store) =>
-            store.claimDeliveryExecution(delivery.requesterSessionId, delivery.operationId, {
-              claimId: attemptId,
-              workerBootId: this.workerBootId,
-            })
-          );
-          if (claim.status !== 'claimed') {
-            this.options.logger.debug(
-              `[orchestration] Delivery ${delivery.deliveryId} claim lost status=${claim.status}`
-            );
-            return false;
-          }
-          try {
-            await this.writeCompletionTurn(sessionDoc, operation, delivery);
-            const prepared = this.withStore((store) =>
-              store.prepareClaimedDeliveryExecution(
-                delivery.requesterSessionId,
-                delivery.operationId,
-                this.workerBootId,
-                attemptId
-              )
-            );
-            if (!prepared.prepared) {
-              this.withStore((store) =>
-                store.releaseDeliveryClaim(
-                  delivery.requesterSessionId,
-                  delivery.operationId,
-                  this.workerBootId,
-                  attemptId
-                )
-              );
-              this.options.logger.debug(
-                `[orchestration] Delivery ${delivery.deliveryId} execution start lost its claim`
-              );
-              return false;
-            }
-          } catch (error) {
-            this.withStore((store) =>
-              store.releaseDeliveryClaim(
-                delivery.requesterSessionId,
-                delivery.operationId,
-                this.workerBootId,
-                attemptId
-              )
-            );
-            throw error;
-          }
-          return true;
+        acpSessionConfig: {
+          ...batch.config,
+          cliType,
+          agentType: batch.config.agentType ?? meta.agentType,
+          prompt: 'Review the completed results according to the current conversation request.',
+          inputBlocks: undefined,
+          resume: meta.acpSessionId ?? undefined,
+          chainDepth: batch.chainDepth,
         },
-        onTurnStarted: async () =>
-          this.withStore((store) =>
-            store.markClaimedDeliveryExecutionStarted(
-              delivery.requesterSessionId,
-              delivery.operationId,
-              this.workerBootId,
-              attemptId
-            )
-          ),
-        onTurnSettled: async (outcome) => {
-          observedSettlement = outcome;
-          const settled = await this.settleObservedDeliveryClaim(delivery, {
-            claimId: attemptId,
-            outcome,
-          });
-          if (outcome === 'handled' || outcome === 'cancelled') {
-            this.options.logger.debug(
-              `[orchestration] Delivery ${delivery.deliveryId} consumed=${String(settled.state === 'consumed')}`
-            );
-          }
-        },
-      }
-    );
-    try {
-      await continuation;
-    } catch (error) {
-      const afterInterruption = await settleResidualClaim();
-      if (afterInterruption.executionPhase === 'uncertain') {
-        await this.failUncertainDelivery(sessionDoc, operation, afterInterruption, reason);
-      }
-      if (
-        afterInterruption.state === 'pending' &&
-        !afterInterruption.activeClaimId &&
-        afterInterruption.attemptCount >= DELIVERY_MAX_ATTEMPTS
-      ) {
-        await this.failExhaustedDelivery(sessionDoc, operation, afterInterruption, reason);
-      }
-      throw error;
-    }
-    const afterExecution = await settleResidualClaim();
-    if (afterExecution.executionPhase === 'uncertain') {
-      await this.failUncertainDelivery(sessionDoc, operation, afterExecution, reason);
-      return;
-    }
-    if (
-      afterExecution.state === 'pending' &&
-      !afterExecution.activeClaimId &&
-      afterExecution.attemptCount >= DELIVERY_MAX_ATTEMPTS
-    ) {
-      await this.failExhaustedDelivery(sessionDoc, operation, afterExecution, reason);
-    }
-  }
-
-  private async failExhaustedDelivery(
-    sessionDoc: SessionDocument,
-    operation: StoredLodyOperation,
-    delivery: StoredLodyDelivery,
-    wakeReason: string
-  ): Promise<void> {
-    await this.finalizeDeliveryWithoutExecution(
-      sessionDoc,
-      operation,
-      delivery,
-      wakeReason,
-      'attempts_exhausted',
-      {
-        code: 'DELIVERY_ATTEMPTS_EXHAUSTED',
-        message: 'The completion continuation did not settle after two delivery attempts.',
       },
-      true
+      { dispatchSource: 'delivery', inboxBatch: batch }
     );
   }
 
-  private async failUncertainDelivery(
-    sessionDoc: SessionDocument,
-    operation: StoredLodyOperation,
-    delivery: StoredLodyDelivery,
-    wakeReason: string
-  ): Promise<void> {
-    await this.finalizeDeliveryWithoutExecution(
-      sessionDoc,
-      operation,
-      delivery,
-      wakeReason,
-      'execution_uncertain',
-      {
-        status: 'uncertain',
-        code: 'DELIVERY_EXECUTION_UNCERTAIN',
-        message:
-          'The completion continuation may have started before execution was interrupted. It was not replayed; review the session output and continue manually if needed.',
-      },
-      false,
-      'uncertain'
-    );
-  }
-
-  private async finalizeDeliveryWithoutExecution(
-    sessionDoc: SessionDocument,
-    operation: StoredLodyOperation,
-    delivery: StoredLodyDelivery,
-    wakeReason: string,
-    evidence: string,
-    continuationFailure?: {
-      status?: 'not_started' | 'uncertain';
-      code:
-        | 'COLLABORATION_STOPPED'
-        | 'CONFIGURATION_UNAVAILABLE'
-        | 'DELIVERY_ATTEMPTS_EXHAUSTED'
-        | 'DELIVERY_EXECUTION_UNCERTAIN';
-      message: string;
-    },
-    requireAttemptsExhausted = false,
-    requiredExecutionPhase: 'ready' | 'uncertain' = 'ready'
-  ): Promise<void> {
-    if (!this.started) return;
-    const startedAt = performance.now();
-    const claimId = randomUUID();
-    const claim = this.withStore((store) =>
-      store.claimDeliveryFinalization(delivery.requesterSessionId, delivery.operationId, {
-        claimId,
-        workerBootId: this.workerBootId,
-        requireAttemptsExhausted,
-        requiredExecutionPhase,
-      })
-    );
-    if (claim.status !== 'claimed') {
-      this.options.logger.debug(
-        `[orchestration] Delivery ${delivery.deliveryId} finalization skipped status=${claim.status} reason=${evidence} wake=${wakeReason}`
-      );
-      return;
-    }
-    const settled = await this.settleObservedDeliveryClaim(delivery, {
-      claimId,
-      outcome: 'finalize',
-      ...(continuationFailure
-        ? {
-            pendingHistoryWrite: () =>
-              this.writeCompletionTurn(sessionDoc, operation, delivery, continuationFailure),
-          }
-        : {}),
-    });
-    if (settled.state !== 'consumed') return;
-    const timer = this.configurationTimers.get(delivery.requesterSessionId);
-    if (timer) clearTimeout(timer);
-    this.configurationTimers.delete(delivery.requesterSessionId);
-    this.options.logger.debug(
-      `[orchestration] Delivery ${delivery.deliveryId} consumed reason=${evidence} wake=${wakeReason} durationMs=${(
-        performance.now() - startedAt
-      ).toFixed(2)}`
-    );
-  }
-
-  /**
-   * Requester commit identity for a delivery continuation turn. Resolution
-   * failure degrades to the placeholder identity (which makes the session fall
-   * back to the host's git config) rather than dropping the delivery.
-   */
   private async resolveRequesterIdentity(
     requesterUserId: string
   ): Promise<{ name: string; email: string }> {
@@ -1490,121 +1109,5 @@ export class LodyOperationCoordinator {
       );
       return fallback;
     }
-  }
-
-  private async resolveFrozenConfiguration(
-    operation: StoredLodyOperation,
-    delivery: StoredLodyDelivery,
-    wakeReason: string
-  ): Promise<'available' | 'unavailable' | 'unknown'> {
-    const startedAt = performance.now();
-    const agentConfigId = operation.frozenContinuationConfig.agentConfigId as
-      | AgentConfigId
-      | undefined;
-    const finish = (
-      result: 'available' | 'unavailable' | 'unknown',
-      lookup: AgentConfigPointLookup | null,
-      synced: boolean | null
-    ) => {
-      this.options.logger.debug(
-        `[orchestration] Delivery ${delivery.deliveryId} configuration resolved result=${result} source=${
-          lookup?.source ?? 'frozen-no-agent-config'
-        } synced=${synced === null ? 'not-needed' : String(synced)} wake=${wakeReason} durationMs=${(
-          performance.now() - startedAt
-        ).toFixed(2)}`
-      );
-      return result;
-    };
-    if (!agentConfigId) return finish('available', null, null);
-    const read = async () =>
-      await readMergedAgentConfigById(
-        this.options.workspaceDocument.repo,
-        this.options.workspaceId,
-        this.options.machineId,
-        agentConfigId
-      );
-    const initial = await read();
-    if (initial.config) return finish('available', initial, null);
-    const synced = await this.options.workspaceDocument.syncMachineFlockDoc(
-      this.options.machineId,
-      { reason: 'orchestration-delivery-configuration', scheduleRetry: true }
-    );
-    if (!synced) return finish('unknown', initial, false);
-    const afterSync = await read();
-    return afterSync.config
-      ? finish('available', afterSync, true)
-      : finish('unavailable', afterSync, true);
-  }
-
-  private armConfigurationRetry(sessionId: SessionId): void {
-    if (this.configurationTimers.has(sessionId)) return;
-    const timer = setTimeout(() => {
-      this.configurationTimers.delete(sessionId);
-      void this.wake('configuration-retry');
-    }, 5_000);
-    timer.unref?.();
-    this.configurationTimers.set(sessionId, timer);
-  }
-
-  private async writeCompletionTurn(
-    sessionDoc: SessionDocument,
-    operation: StoredLodyOperation,
-    delivery: StoredLodyDelivery,
-    continuationFailure?: {
-      status?: 'not_started' | 'uncertain';
-      code:
-        | 'COLLABORATION_STOPPED'
-        | 'CONFIGURATION_UNAVAILABLE'
-        | 'DELIVERY_ATTEMPTS_EXHAUSTED'
-        | 'DELIVERY_EXECUTION_UNCERTAIN';
-      message: string;
-    }
-  ): Promise<void> {
-    if (!operation.completion) {
-      throw new Error(`Finished Operation ${operation.operationId} has no completion.`);
-    }
-    const completion = operation.completion;
-    const buildTurn = (progressMessageId: string | undefined): SessionHistoryInput => {
-      const item: MessageContent = {
-        type: 'operation_completion',
-        deliveryId: delivery.deliveryId,
-        operationId: operation.operationId,
-        operationKind: operation.kind,
-        ...(progressMessageId ? { progressMessageId } : {}),
-        completion,
-        ...(continuationFailure
-          ? {
-              continuation: {
-                status: continuationFailure.status ?? ('not_started' as const),
-                reason: {
-                  code: continuationFailure.code,
-                  message: continuationFailure.message,
-                },
-              },
-            }
-          : {}),
-      };
-      return {
-        id: delivery.systemTurnId,
-        role: 'system',
-        author: { v: 1, kind: 'system' },
-        userId: operation.requesterUserId,
-        timestamp: new Date(this.now()).toISOString(),
-        items: [item],
-        fileDiff: [],
-        finished: true,
-        inputConfig: {
-          ...operation.frozenContinuationConfig.inputConfig,
-          prompt: completionText(operation),
-          chainDepth: operation.initiatorChainDepth + 1,
-        },
-      };
-    };
-    const backend = await createSessionBackend(sessionDoc);
-    await backend.applyHistoryAction({
-      kind: 'operation-completion',
-      operation,
-      turn: buildTurn(undefined),
-    });
   }
 }

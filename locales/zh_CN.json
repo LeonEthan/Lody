@@ -4892,5 +4892,7 @@
   "sessions.messageAuthor.source": "打开来源会话",
   "sessions.messageAuthor.on": "开启",
   "sessions.messageAuthor.off": "关闭",
-  "settings.memory.rolePromptHint": "记忆 Provider 可能向提示词注入角色定义，请留意是否与 Lody 中的配置重复或冲突。"
+  "settings.memory.rolePromptHint": "记忆 Provider 可能向提示词注入角色定义，请留意是否与 Lody 中的配置重复或冲突。",
+  "orchestration.batchResults": "{{count}} 项任务结果已完成",
+  "orchestration.batchResultsUnknown": "{{count}} 项结果已保存，模型是否收到尚不确定"
 }

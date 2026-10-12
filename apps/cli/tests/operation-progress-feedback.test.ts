@@ -11,11 +11,19 @@ import {
   type StoredLodyOperation,
 } from '@lody/shared';
 import { LodyOperationCoordinator } from '../src/orchestration/operation-coordinator';
+import { LodyOperationStore } from '../src/orchestration/operation-store';
+import { mkdtempSync, rmSync } from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
 
 // Use real Mirror notifications: an array-only history mock hides this feedback loop.
 describe('nested operation progress feedback', () => {
   it('quiesces for A -> B -> C and still publishes subsequent child completion', async () => {
     vi.useFakeTimers();
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'lody-progress-inbox-'));
+    const actualStore = new LodyOperationStore(path.join(directory, 'operations.sqlite3'), () =>
+      Date.parse('2026-01-01T01:00:00Z')
+    );
     const makeDoc = (id: string) => {
       const mirror = new Mirror({
         doc: new Loro(),
@@ -94,16 +102,17 @@ describe('nested operation progress feedback', () => {
     let coordinator: LodyOperationCoordinator;
     const logger = { warn: vi.fn(), debug: vi.fn() };
     const store = {
+      inbox: actualStore.inbox,
       recoverOrphanedDeliveryClaims: () => 0,
       abandonDeliveryClaimsOwnedBy: () => 0,
       listActive: () => {
         // Deterministic safety guard makes the broken version fail, never hang the runner.
-        if (++scans === 20) coordinator.stop();
+        if (++scans === 20) void coordinator.stop();
         return [];
       },
       listPendingProgress: () => pending.filter((op) => !settled.has(op.operationId)),
       listPendingDeliveries: () => [],
-      close: () => {},
+      close: () => actualStore.close(),
       settleProgress: (_requester: unknown, id: string) => settled.add(id),
     };
     coordinator = new LodyOperationCoordinator({
@@ -167,8 +176,10 @@ describe('nested operation progress feedback', () => {
       expect(settled).toEqual(new Set(['op-B']));
       expect(logger.warn).not.toHaveBeenCalled();
     } finally {
-      coordinator.stop();
+      await coordinator.stop();
       for (const doc of docs.values()) doc.mirror.dispose();
+      actualStore.close();
+      rmSync(directory, { recursive: true, force: true });
       vi.useRealTimers();
     }
   });

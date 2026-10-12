@@ -2735,6 +2735,12 @@ const SystemMessageRowView = ({
             key={`worktree-script-${item.phase}-${itemIndex}`}
             script={item}
           />
+        ) : item.type === 'operation_completion_batch' ? (
+          <OperationCompletionBatchView
+            key={item.batchId}
+            batch={item}
+            onNavigateSession={onNavigateSession}
+          />
         ) : item.type === 'operation_progress' ? (
           <CreatedSessionList
             key={item.operationId}
@@ -2753,6 +2759,41 @@ const SystemMessageRowView = ({
           />
         )
       )}
+    </div>
+  );
+};
+
+const OperationCompletionBatchView = ({
+  batch,
+  onNavigateSession,
+}: {
+  batch: Extract<MessageContent, { type: 'operation_completion_batch' }>;
+  onNavigateSession?: (target: SessionNavigationTarget) => void;
+}) => {
+  const { t } = useTranslation();
+  return (
+    <div>
+      <div>
+        {t(
+          batch.deliveryStatus === 'unknown'
+            ? 'orchestration.batchResultsUnknown'
+            : 'orchestration.batchResults',
+          {
+            defaultValue:
+              batch.deliveryStatus === 'unknown'
+                ? '{{count}} task results saved; model delivery is uncertain'
+                : '{{count}} completed task results',
+            count: batch.memberCount,
+          }
+        )}
+      </div>
+      {(batch.members ?? []).map((member) => (
+        <OperationCompletionView
+          key={member.deliveryId}
+          completion={member}
+          onNavigateSession={onNavigateSession}
+        />
+      ))}
     </div>
   );
 };

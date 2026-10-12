@@ -25,7 +25,7 @@ import {
   isPreparedSessionDispatched,
   type PreparedSessionInput,
 } from '@/lib/prepared-session-input';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import {
   SessionDiscoveryFilterShape,
   matchesSessionDiscovery,
@@ -2498,11 +2498,22 @@ async function dispatchTurnFastPath(args: {
   userTurnId: string;
   userId: string;
   timestamp: string;
+  inputOrigin: 'human' | 'agent';
   inputConfig: SessionTurnInputConfig | undefined;
 }): Promise<void> {
   const environment = getSessionCommandEnvironment();
   if (environment) {
-    await environment.host.dispatchSession(args.sessionId);
+    await environment.host.dispatchSession(
+      args.sessionId,
+      args.inputConfig
+        ? {
+            inputId: args.userTurnId,
+            userId: args.userId,
+            config: args.inputConfig,
+            inputOrigin: args.inputOrigin,
+          }
+        : undefined
+    );
     return;
   }
   if (!args.inputConfig) {
@@ -2517,6 +2528,7 @@ async function dispatchTurnFastPath(args: {
           userTurnId: args.userTurnId,
           userId: args.userId,
           timestamp: args.timestamp,
+          inputOrigin: args.inputOrigin,
           inputConfig: args.inputConfig!,
           timeoutMs: 15_000,
         })
@@ -3826,6 +3838,7 @@ export async function createSessionResult(
       userTurnId,
       userId: requesterUserId,
       timestamp: userTurn.timestamp,
+      inputOrigin: options.delegatedRequester ? 'agent' : 'human',
       inputConfig: userTurn.inputConfig,
     });
     return {
@@ -4077,6 +4090,7 @@ export async function sendSessionChatResult(
       userTurnId,
       userId: requesterUserId,
       timestamp: userTurn.timestamp,
+      inputOrigin: delegatedRequester ? 'agent' : 'human',
       inputConfig: userTurn.inputConfig,
     });
     return {
@@ -4861,11 +4875,15 @@ const sessionCancelCommand = new Command('cancel')
   .description('Cancel the current running turn for a session')
   .option('--workspace <selector>', 'Target workspace id, slug, or name')
   .option('--turn-id <turnId>', 'Cancel only when this exact assistant turn is active')
+  .addOption(new Option('--operation-cancel', 'Internal accepted-task cancellation').hideHelp())
   .option('--json', 'Print JSON output')
   .option('--debug', 'Enable debug output')
   .argument('[sessionId]', 'Session ID; falls back to LODY_SESSION_ID')
   .action(
-    async (sessionIdArg: string | undefined, options: CommonOptions & { turnId?: string }) => {
+    async (
+      sessionIdArg: string | undefined,
+      options: CommonOptions & { turnId?: string; operationCancel?: boolean }
+    ) => {
       await runSessionCommand(options, async () => {
         const auth = getAuthContextOrThrow();
         const sessionId = (normalizeCliValue(sessionIdArg) ??
@@ -4919,6 +4937,7 @@ const sessionCancelCommand = new Command('cancel')
 
           await ensureTargetMachineOnline({ auth, workspaceId, machineId: session.machineId });
 
+          const cancelId = uuidV4();
           const response =
             session.machineId === auth.machineId
               ? extractCancelResponse(
@@ -4928,12 +4947,20 @@ const sessionCancelCommand = new Command('cancel')
                     machineId: auth.machineId,
                     workspaceId,
                     turnId,
+                    pauseInbox: !options.operationCancel,
+                    cancelId,
                   })
                 )
               : await withMachineRpcClient(
                   { auth, workspaceId, machineId: session.machineId },
                   async (client) =>
-                    await client.requestSessionCancel({ sessionId, turnId, timeoutMs: 10_000 })
+                    await client.requestSessionCancel({
+                      sessionId,
+                      turnId,
+                      timeoutMs: 10_000,
+                      cancelId,
+                      ...(options.operationCancel ? { pauseInbox: false } : {}),
+                    })
                 );
 
           if (!response) {

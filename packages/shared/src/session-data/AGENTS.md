@@ -65,3 +65,7 @@
 - Submissions append on the live doc as local commits; transports upload only
   local events. Never author on a fork and import the export: it misses upload,
   copies the whole doc and adds a permanent peer.
+
+- `operation_completion_batch` is one stable system item with fixed batch identity/member count.
+  Receipt projections target its exact turn and batch, preserve user text/config and do not
+  rewrite unchanged status. Full result bodies remain in the scoped orchestration repository.

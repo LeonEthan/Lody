@@ -416,3 +416,58 @@ describe('LodyFleet local session control streaming', () => {
     expect(onResponse).toHaveBeenCalledWith(responses[0]);
   });
 });
+
+it('retains the failed workspace owner and retries only its unresolved cleanup phase', async () => {
+  const catalog = createCatalogStub(() => Effect.succeed(catalogSnapshot({})));
+  const fleet = createFleetHarness(catalog).fleet as unknown as {
+    runtimes: Map<string, unknown>;
+    cleanupOwners: Map<string, unknown>;
+    stopWorkspace(id: string): Promise<void>;
+    retryWorkspaceCleanup(id: string): Promise<void>;
+  };
+  const steps: string[] = [];
+  let failed = true;
+  let released = false;
+  const state = {
+    workspace: { id: 'retained' },
+    schedules: {
+      dispose: async () => {
+        steps.push('schedules released');
+      },
+    },
+    lody: {
+      cleanup: async () => {
+        if (failed) {
+          steps.push('resource release failed');
+          throw new Error('retained raw request');
+        }
+        released = true;
+        steps.push('resource released');
+      },
+    },
+    unsubscribeTerminalCleanup: () => {},
+    prPollerWorkspace: {
+      dispose: async () => {
+        steps.push('poller released');
+      },
+    },
+  };
+  fleet.runtimes.set('retained', state);
+  await expect(fleet.stopWorkspace('retained')).rejects.toThrow('retained raw request');
+  expect(fleet.runtimes.get('retained')).toBe(state);
+  expect(fleet.cleanupOwners.get('retained')).toBe(state);
+  expect(released).toBe(false);
+  await expect(fleet.stopWorkspace('retained')).rejects.toThrow('retained raw request');
+  expect(steps).toEqual(['schedules released', 'resource release failed']);
+  failed = false;
+  await fleet.retryWorkspaceCleanup('retained');
+  expect(released).toBe(true);
+  expect(fleet.runtimes.has('retained')).toBe(false);
+  expect(fleet.cleanupOwners.has('retained')).toBe(false);
+  expect(steps).toEqual([
+    'schedules released',
+    'resource release failed',
+    'resource released',
+    'poller released',
+  ]);
+});

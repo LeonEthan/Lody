@@ -2374,9 +2374,13 @@ describe('SessionDispatchWatcher', () => {
     const cancelSession = vi.fn(async () => ({ success: true }));
     const sessionId = 'session-2' as SessionId;
     const roomId = `session-${sessionId}`;
+    const subscriptions = new Set<() => void>();
     const sessionDoc = withHistoryPort({
       mirror: {
-        subscribe: vi.fn(() => vi.fn()),
+        subscribe: (listener: () => void) => {
+          subscriptions.add(listener);
+          return () => subscriptions.delete(listener);
+        },
       },
       getMetaState: vi.fn(async () => ({
         id: sessionId,
@@ -2445,8 +2449,10 @@ describe('SessionDispatchWatcher', () => {
         sessionId,
         turnId: 'assistant-turn-2',
       }),
-      { pendingInput: 'promote', prePromptSession: 'discard' }
+      { pendingInput: 'preserve', prePromptSession: 'discard' }
     );
+    expect(subscriptions.size).toBe(0);
+    await watcher.stop();
   });
 
   it('handles cancel metadata without waiting for an in-flight dispatch to finish', async () => {
@@ -2539,7 +2545,7 @@ describe('SessionDispatchWatcher', () => {
         sessionId,
         turnId: 'assistant-turn-2b',
       }),
-      { pendingInput: 'promote', prePromptSession: 'discard' }
+      { pendingInput: 'preserve', prePromptSession: 'discard' }
     );
 
     resolveContinue?.();

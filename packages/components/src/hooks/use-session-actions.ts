@@ -496,11 +496,12 @@ export function useSessionActions(): SessionActions {
       const existing = await runtime.repo.getDocMeta(roomId);
       if (isLoroRepoDocDeleted(existing)) return;
       const meta = existing?.meta as SessionMeta | undefined;
+      const cancelId = crypto.randomUUID();
       const machineId = meta?.machineId;
       if (machineId) {
         // Fast-path RPC is intentionally redundant with the durable meta fallback below.
         void runtime
-          .requestSessionCancel(machineId, sessionId, turnId, { timeoutMs: 2_000 })
+          .requestSessionCancel(machineId, sessionId, turnId, { timeoutMs: 2_000, cancelId })
           .then((response) => {
             if (response && !response.success) {
               log('session cancel rpc failed for %s/%s: %s', sessionId, turnId, response.error);
@@ -513,6 +514,7 @@ export function useSessionActions(): SessionActions {
       await runtime.writer.upsertDocMeta(roomId, {
         // Stop targets the assistant turn currently on screen, not the originating user turn.
         lastCanceledTurn: turnId,
+        lastCancelRequestId: cancelId,
       } as Partial<SessionMeta>);
     },
     [runtime]

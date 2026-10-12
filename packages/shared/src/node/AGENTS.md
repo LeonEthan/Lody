@@ -103,3 +103,9 @@ record: [process tree layer](../../../../.agents/notes/implemented/architecture/
 - Retry acquisition only; body/release failures preserve the full Cause. Use
   `squashFileLockFailure` at Legacy boundaries to retain every lock cleanup owner
   alongside process leases and the original operation failure.
+
+## Supervised Inbox compatibility
+
+Supervisor launch contract v2 requires Inbox protocol v1. TS and CJS constants agree.
+A mismatched supervised worker exits 45 before host ownership/storage; do not downgrade
+to the v1 per-Delivery worker. Foreground arbitrary old binaries are unsupported.

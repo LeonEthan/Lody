@@ -164,9 +164,8 @@ applied processing record becomes canceled, never an ordinary replay.
 
 The execution service does not decide that interruption means non-delivery. AgentClient returns
 `applied`, `not-applied`, or `unknown`; only `not-applied` can move a steer back to ordinary
-dispatch, and only when the cancellation boundary selected `pendingInput: 'promote'`. User Stop
-selects promotion, while internal cancellation such as Edit & Resend and access revocation
-preserves the pending input. `unknown` becomes `delivery_unknown` in history. The UI offers a
+dispatch, and only when the cancellation boundary selected `pendingInput: 'promote'`. User Stop preserves history and cancels queued execution eligibility; Edit & Resend and
+access revocation also preserve pending input. Inbox recovery never revives pre-Stop input. `unknown` becomes `delivery_unknown` in history. The UI offers a
 confirmed fresh send with a duplicate-work warning, never an automatic retry. RPC application
 ACKs update presentation only; the execution service alone projects processing and terminal
 steer status, so delayed ACKs cannot resurrect canceled or completed history.
@@ -455,3 +454,13 @@ Execution reads inherited flags before setup and ACP dispatch. Metadata updates
 cancel exact active turns with pending input preserved, while late completions are
 recorded without continuation. Users must explicitly restore collaboration; offline
 machines enforce the state after sync. See the [orchestration contract](../../../../specs/session-orchestration.md#user-controlled-conversation-tree-stop).
+
+## Operation result input
+
+The independent Inbox supplies one batch reference beside an intact ordinary input.
+All visible turns share its admission, including existing goal turns with their own
+synthetic input identity; goal controls/configuration are otherwise preserved. Stop
+persists pause and cancels pre-Stop queued eligibility. Fresh human entry may retry
+retained physical cleanup, but cannot dispatch until proof of release. Runtime ownership
+lasts through durable release/settlement, so a Stop during final release can veto the
+automatic intent. Post-fence human-plus-batch input cannot use stale-ACP replay.

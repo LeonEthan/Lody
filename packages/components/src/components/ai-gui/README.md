@@ -299,3 +299,10 @@ Assistant replies do not show an author identity entry or its popover. It reads 
 in `view.tsx`; execution controls continue to describe the receiving turn. The
 [identity contract](../../../../../specs/message-author-identity.md) defines capture,
 recovery and legacy behavior.
+
+## Completed work batches
+
+Render `operation_completion_batch` as one result group with total count and delivery
+uncertainty. Its bounded member preview reuses existing completion/creation cards and
+`progressMessageId` deduplication. Rendering is passive: it never resumes a session or
+reads every omitted result. The `CompletedWorkBatch` story covers the uncertain state.

@@ -1,3 +1,4 @@
+import { InboxSqlite } from './inbox/sqlite';
 import { SessionInputAttachmentsSchema } from '@/lib/session-input-content';
 import {
   MemoryBindingSchema,
@@ -385,6 +386,7 @@ export const getOperationCompletionTurnId = (
 
 export class LodyOperationStore {
   private readonly db: Database.Database;
+  readonly inbox: InboxSqlite;
 
   /**
    * `maintenance: false` skips the open-time repair/cleanup write transactions.
@@ -408,6 +410,8 @@ export class LodyOperationStore {
     this.db.pragma('journal_mode = WAL');
     this.db.pragma('foreign_keys = ON');
     this.migrate();
+    InboxSqlite.migrate(this.db);
+    this.inbox = new InboxSqlite(this.db, () => new Date(this.now()).toISOString());
     if (options.maintenance !== false) {
       this.repairTerminalDeliveries();
       this.cleanupExpired(false);
@@ -415,7 +419,7 @@ export class LodyOperationStore {
   }
 
   close(): void {
-    this.db.close();
+    if (this.db.open) this.db.close();
   }
 
   accept(
@@ -1255,8 +1259,13 @@ export class LodyOperationStore {
 
   deleteRequesterSession(requesterSessionId: SessionId): void {
     this.db
-      .prepare('DELETE FROM operations WHERE requester_session_id = ?')
-      .run(requesterSessionId);
+      .transaction(() => {
+        this.inbox.deleteSession(requesterSessionId);
+        this.db
+          .prepare('DELETE FROM operations WHERE requester_session_id = ?')
+          .run(requesterSessionId);
+      })
+      .immediate();
   }
 
   snapshot(operation: StoredLodyOperation): LodyOperationSnapshot {
@@ -1492,6 +1501,7 @@ export class LodyOperationStore {
              )`
           )
           .run(cutoff);
+        this.inbox.cleanupExpired();
         this.db
           .prepare(
             `INSERT INTO orchestration_meta (key, value) VALUES ('last_cleanup_at_ms', ?)
