@@ -154,7 +154,7 @@ results cannot grant additional wakes. Reopen recovers recorded, provably unsubm
 intents; a backlog alone cannot create one.
 
 Stop, trusted human acceptance and actual transport initiation share Session admission.
-Stop persists pause before cancellation and cancels pre-Stop queued input eligibility
+Inbox-aware Stop persists pause before cancellation and cancels pre-Stop queued input eligibility
 while retaining history. Fresh human input carries saved results; old instructions
 require a new send. Agent chat, role, userId and author cannot clear pause. Failed exits
 never auto-continue; unreleased resources block all successors. Normal future human
@@ -177,14 +177,21 @@ inputs also disable whole-input stale-ACP replay. Retry settlement writes only. 
 request/resource release differs from waiter cancellation or Scope close: retain full
 failures, shared shutdown receipts and independent recovery owners until actual release.
 
-Old orchestration data is not preserved: discard old-only stores and unclaimed
-compatibility backlog rather than replaying or importing it. Delete per-Delivery
-storage and execution APIs. Preserve current Inbox pause, resource ownership and
+Preserve released Operation rows, author/input snapshots, recovery state and retired
+IDs across upgrade; active Operations continue reconciliation. Delete only per-Delivery
+storage/execution and unclaimed compatibility result copies. Never import or replay
+the old completion-notification backlog. Preserve current Inbox pause, resource ownership and
 unknown/submitted batch evidence; deleting data is not proof of physical release.
 Schema/protocol v2 requires host launch v3. Supported launches end the previous
 Worker before ownership transfer and reject earlier contracts before storage access.
 Passive result data does not count as running work. Preserve ordinary no-batch user
 recovery, retired current Operation IDs and tree-stop rules.
+
+Stop producers negotiate Inbox v2 before adding cancelId/pauseInbox or publishing a
+control-request marker. Without it, use the released cancel fields and assistant Turn
+ID marker. A new CLI treats Stop without pause-protocol fields as ordinary execution
+cancellation, without persistent Inbox pause that an old client cannot resume. Missing
+receipts still do not imply human authority. Inbox-aware Stop retains the pause rules above.
 
 ## Implementation evidence
 

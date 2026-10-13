@@ -1,4 +1,10 @@
 import {
+  getMachineRoomId,
+  machineSupportsProtocolCapability,
+  MACHINE_PROTOCOL_CAPABILITIES,
+  OPERATION_INBOX_PROTOCOL_VERSION,
+} from '@lody/shared';
+import {
   assertMachineFlockCacheSufficient,
   validateWithMachineFlockFreshness,
   type MachineFlockFreshness,
@@ -256,6 +262,21 @@ export type ChatOptions = CommonOptions &
     wait?: boolean;
     timeout?: number;
   };
+
+/** Additive Stop fields are sent only to a peer that implements Inbox pause/resume. */
+export function getSessionCancelProtocolFields(
+  machine: Parameters<typeof machineSupportsProtocolCapability>[0],
+  cancelId: string,
+  pauseInbox: boolean
+): { cancelId?: string; pauseInbox?: boolean } {
+  return machineSupportsProtocolCapability(
+    machine,
+    MACHINE_PROTOCOL_CAPABILITIES.operationInbox,
+    OPERATION_INBOX_PROTOCOL_VERSION
+  )
+    ? { cancelId, pauseInbox }
+    : {};
+}
 
 export async function ensureSessionCreateWorkspaceMetaFresh(args: {
   manager: Pick<LoroDocumentManager, 'syncMetaOrThrow'>;
@@ -4953,7 +4974,12 @@ const sessionCancelCommand = new Command('cancel')
 
           await ensureTargetMachineOnline({ auth, workspaceId, machineId: session.machineId });
 
-          const cancelId = uuidV4();
+          const machine = await manager.repo.getDocMeta(getMachineRoomId(session.machineId));
+          const inboxCancel = getSessionCancelProtocolFields(
+            machine?.meta,
+            uuidV4(),
+            !options.operationCancel
+          );
           const response =
             session.machineId === auth.machineId
               ? extractCancelResponse(
@@ -4963,8 +4989,7 @@ const sessionCancelCommand = new Command('cancel')
                     machineId: auth.machineId,
                     workspaceId,
                     turnId,
-                    pauseInbox: !options.operationCancel,
-                    cancelId,
+                    ...inboxCancel,
                   })
                 )
               : await withMachineRpcClient(
@@ -4974,8 +4999,7 @@ const sessionCancelCommand = new Command('cancel')
                       sessionId,
                       turnId,
                       timeoutMs: 10_000,
-                      cancelId,
-                      ...(options.operationCancel ? { pauseInbox: false } : {}),
+                      ...inboxCancel,
                     })
                 );
 

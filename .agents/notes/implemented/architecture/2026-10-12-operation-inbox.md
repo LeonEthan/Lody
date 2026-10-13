@@ -15,7 +15,7 @@ Per-result continuations and reverse task chat could repeatedly restart conversa
 The [Session orchestration Spec](../../../../specs/session-orchestration.md) owns behavior; the [orchestration README](../../../../apps/cli/src/orchestration/README.md#completion-consumption) owns implementation and transaction contracts. This record consolidates the former investigation, reverse-chat note, design and implementation plan; their earlier revisions remain in Git history.
 
 - Result arrival grants no execution permission. Actual normal release records one immutable watermark, including empty boundaries; only eligible, nonempty membership grants an automatic intent. Restart recovers that intent without a new event. Late results and duplicate releases cannot enlarge it.
-- Stop persists pause before cancellation. Pre-Stop queued inputs retain their history but lose execution eligibility; fresh human input carries result data, not canceled instructions. Human text, configuration and causal depth remain unchanged. Agent-authored tasks cannot clear pause.
+- Inbox-aware Stop persists pause before cancellation. Pre-Stop queued inputs retain their history but lose execution eligibility; fresh human input carries result data, not canceled instructions. Human text, configuration and causal depth remain unchanged. Agent-authored tasks cannot clear pause.
 - Stop, trusted human acceptance and actual transport start share admission. Unknown submission never replays, including user-plus-batch stale-ACP recovery; only settlement retries. Scope closure or canceled waiting does not prove resource release.
 - B cannot chat back to A while A's exact Agent-authored input drives B. Single, batch and legacy paths reject before new work with `REVERSE_CHAT_FORBIDDEN`; subsequent independent input replaces that scope. This avoids a new task graph or task/note tools, but does not guarantee prevention of longer cycles or repeated outbound delegation.
 
@@ -33,9 +33,9 @@ Review of `40ef5c29cbe496f28f17ab10297cf37c3c48030f` found three adapter defects
 2. Trusted renderer/non-delegated CLI sends persist `humanInputReceipts` before activation or queuing. History fallback restores matching authorization after lost or oversized RPC; generic history, foreign receipts and canceled/terminal inputs cannot clear pause.
 3. Coordinator `recoverStop()` calls independent `recoverClose()` to repair durable settlement/release/pause writes. Preserve the original failed receipt and recovery owner; never replay transport or treat repeated Scope close as recovery.
 
-Manual Stop shares its request ID between RPC and persistent fallback, preventing late duplicates from pausing fresh input. Failed writes retain request identities for repair. Consumed payload copies follow Operation retention; permanent Session deletion removes Inbox copies. The final storage boundary is schema/Inbox protocol v2 and host launch v3. Old orchestration data compatibility is explicitly abandoned: old-only stores and unused compatibility result copies are deleted on open, not imported or replayed. Current Inbox pause, unknown submission and resource ownership remain. Completion indexes directly into Inbox; old tables, per-result claims/continuations, models and coordinator fixture are removed. Persistent result sequences cannot be reused after retention cleanup, and passive results no longer imply busy execution. `inbox/legacy.ts` only bridges current unfinished Session/ACP consumers; batch-member display format remains. No compatible released SHA exists yet.
+Manual Stop shares its request ID between RPC and persistent fallback, preventing late duplicates from pausing fresh input. Failed writes retain request identities for repair. Consumed payload copies follow Operation retention; permanent Session deletion removes Inbox copies. The final storage boundary is schema/Inbox protocol v2 and host launch v3. Upgrade preserves released Operations, author/input snapshots, recovery state and retired IDs; only Delivery tables and unused compatibility result copies are removed. Legacy completion backlog is never imported or replayed. Current Inbox pause, unknown submission and resource ownership remain. Completion indexes directly into Inbox; old tables, per-result claims/continuations, models and coordinator fixture are removed. Persistent result sequences cannot be reused after retention cleanup, and passive results no longer imply busy execution. `inbox/legacy.ts` only bridges current unfinished Session/ACP consumers; batch-member display format remains. Inbox has not shipped, but Operation tables have: those compatibility boundaries must not be conflated.
 
-Source provenance is separate from display snapshots. A retained current Operation with no author snapshot but a saved `sourceTurnId` reads as minimal Agent provenance from its frozen requester Session/source Turn, using the generic `Agent` label without Role/model/catalog reconstruction. Create/chat reject delegated input without source identity before publication; ordinary human entry points remain human-authored. Reverse checks use the exact input’s Agent Session, never parent relationships. This neither imports old-only stores nor rewrites existing history.
+Source provenance is separate from display snapshots. A retained current Operation with no author snapshot but a saved `sourceTurnId` reads as minimal Agent provenance from its frozen requester Session/source Turn, using the generic `Agent` label without Role/model/catalog reconstruction. Create/chat reject delegated input without source identity before publication; ordinary human entry points remain human-authored. Reverse checks use the exact input’s Agent Session, never parent relationships. This preserves existing Operations and does not rewrite history.
 
 Stop request details now live in one replaceable `cancelRequest` control-document slot, rather than an extra metadata ID field. The renderer persists the payload before publishing `lastCanceledTurn = cancel-request:<id>`; RPC remains an immediate fast path with the same ID. The watcher waits for matching control data and processes control arrivals on its separate cancellation chain. Legacy turn-ID markers remain supported. SQLite owns durable deduplication, so reopen and late RPC/fallback cannot pause fresh input again, while a new click has an independent ID. Resource ownership, actual-release handoff and failed-pause recovery are unchanged; this adapter adjustment does not extend the native migration.
 
@@ -65,6 +65,18 @@ parent relationships or older input. Operation receipts, Inbox results, finaliza
 and release retain their behavior. Stop is rechecked after the author read. The
 execution suite passes 256 tests, including Agent suppression, later human delivery
 and completed history/release in both cases.
+
+Upgrade review identified destructive Operation migration, unsupported Stop fields sent
+to released CLIs, and persistent pause that old clients could never resume. The fix
+retains Operations, duplicate guards, author snapshots and recovery state; removes
+only Delivery scheduling data; negotiates Inbox v2 before sending new Stop fields;
+and treats identity-free legacy Stop as ordinary execution cancellation without
+persistent Inbox pause. This avoids inferring human authority from missing receipts,
+role or author. Updated clients retain the persistent-pause contract. New tests use
+real SQLite upgrade/completion, React Stop publication and the Session/Inbox boundary
+for the next legacy message after Stop.
+
+Upgrade validation: 4 CLI suites / 487 tests and 79 component tests pass. All three targeted cases fail against reviewed `552c349` source in the isolated copy and pass after restoring the fix. CLI Stop also tests released strict parsing and Inbox v2 pause / Operation cancellation fields. No full-machine upgrade or old-desktop-binary end-to-end acceptance is claimed.
 
 ## Verification and remaining limits
 

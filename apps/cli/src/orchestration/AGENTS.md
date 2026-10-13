@@ -55,7 +55,7 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
 - `inbox/service.ts` is native Effect v4. Scope owns its signal/fibers and repository connection;
   one per-Session admission covers Stop, trusted human acceptance and actual transport start.
   Native workflows never import platform I/O or consumers. Registered entry bridges own runtimes.
-- Stop persists pause and cancels pre-Stop queued input eligibility while retaining history.
+- Inbox-aware Stop pauses/cancels queued eligibility; legacy Stop only cancels execution.
   Only trusted fresh human receipts clear pause; role/userId/author are insufficient. New human
   acceptance cannot revive a canceled execution or discard an already prepared human input.
 - Fixed batch claims and submission fence precede synchronous transport initiation under the
@@ -68,7 +68,7 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
   every Session owned by the execution. Only explicitly complete identities can prove restart
   release; legacy snapshots and interrupted journaling remain blocked. Coordinator recovery
   calls `recoverClose`, not the cached failed `close` receipt; never replay transport.
-- Schema/Inbox v2 drops old-only stores, Delivery data/APIs and unused compatibility results.
+- Schema/Inbox v2 drops Delivery data/APIs; keep Operation rows and retired IDs.
   Keep current pause/unknown/resource evidence and monotonic sequences. Host v3 rejects old
   workers before storage; end the prior Worker before handoff. Passive results are not busy.
 - Create Operations may also maintain one stable `role: system` `operation_progress`

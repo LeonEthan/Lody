@@ -564,6 +564,24 @@ describe('useSessionActions', () => {
     return actions;
   };
 
+  it('uses released Stop wire fields and turn marker when the target has no Inbox capability', async () => {
+    const sessionId = 'legacy-stop' as SessionId;
+    const metaRepo = createSessionMetaRepo([
+      { id: sessionId, machineId: 'old-machine', userId: 'user-1' } as SessionMeta,
+    ]);
+    const runtime = createRuntime({ repo: metaRepo.repo });
+    const received: unknown[] = [];
+    runtime.requestSessionCancel = async (_machine, _session, turnId, options) => {
+      expect(Object.keys(options ?? {})).toEqual(['timeoutMs']);
+      received.push(turnId);
+      return { success: true } as never;
+    };
+    const actions = await renderActions(runtime);
+    await actions.requestSessionCancel(sessionId, 'assistant-legacy');
+    expect(received).toEqual(['assistant-legacy']);
+    expect(metaRepo.getSession(sessionId)?.lastCanceledTurn).toBe('assistant-legacy');
+  });
+
   it('persists Stop details before publishing only its marker, and reuses the request on RPC', async () => {
     const sessionId = 'session-stop-control' as SessionId;
     const metaRepo = createSessionMetaRepo([
@@ -576,6 +594,9 @@ describe('useSessionActions', () => {
         agentType: 'codex',
       },
     ]);
+    metaRepo.setMeta(getMachineRoomId('machine-1'), {
+      protocolCapabilities: CURRENT_MACHINE_PROTOCOL_CAPABILITIES,
+    });
     const doc = new LoroDoc();
     const control = createSessionControlPlaneMirror({
       doc,

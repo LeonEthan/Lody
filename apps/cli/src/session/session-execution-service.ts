@@ -6567,6 +6567,12 @@ export class SessionExecutionService {
   }> {
     const { sessionId, turnId } = message;
     const pendingInput = options.pendingInput ?? 'preserve';
+    // Legacy clients cannot send trusted human receipts to resume a persistent pause.
+    // Their Stop still cancels this execution, without opting into Inbox pause.
+    const pauseInbox =
+      options.pauseInbox !== false &&
+      message.pauseInbox !== false &&
+      (options.pauseInbox === true || message.pauseInbox === true || Boolean(message.cancelId));
     if (message.subagentTaskId) {
       // This control never writes lastCanceledTurn or interrupts the parent runtime.
       if (
@@ -6595,12 +6601,7 @@ export class SessionExecutionService {
     // Cancel is exact-match only: a stale stop request must not interrupt a newer assistant turn.
     if (!isPrompting && !isCurrentExecutionTurn) {
       const target = this.operationInbox?.pauseTarget(this.deps.workspaceId, sessionId, turnId);
-      if (
-        this.operationInbox &&
-        target &&
-        options.pauseInbox !== false &&
-        message.pauseInbox !== false
-      ) {
+      if (this.operationInbox && target && pauseInbox) {
         const pendingIds = await this.pendingInboxInputIds(sessionId);
         const paused = await this.operationInbox.pause(
           target,
@@ -6687,12 +6688,7 @@ export class SessionExecutionService {
     }
 
     const stoppedRuntime = this.turnRuntimeBySession.get(sessionId);
-    if (
-      this.operationInbox &&
-      stoppedRuntime?.invocation?.requesterUserId &&
-      options.pauseInbox !== false &&
-      message.pauseInbox !== false
-    ) {
+    if (this.operationInbox && stoppedRuntime?.invocation?.requesterUserId && pauseInbox) {
       const scope = {
         workspaceId: this.deps.workspaceId,
         sessionId,
@@ -6723,11 +6719,7 @@ export class SessionExecutionService {
         return { success: false, error: `Stop could not be saved: ${formatErrorMessage(error)}` };
       }
     }
-    if (
-      this.operationInbox &&
-      stoppedRuntime?.inboxOwner?.input &&
-      (options.pauseInbox === false || message.pauseInbox === false)
-    ) {
+    if (this.operationInbox && stoppedRuntime?.inboxOwner?.input && !pauseInbox) {
       if (
         !(await this.operationInbox.cancelExecution(
           stoppedRuntime.inboxOwner!.input,

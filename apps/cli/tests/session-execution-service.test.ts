@@ -10786,6 +10786,72 @@ describe('Operation Inbox execution boundary', () => {
     }
   });
 
+  it('legacy Stop cancels the turn without locking out the next legacy user input', async () => {
+    const building = createDeferred();
+    const release = createDeferred();
+    const received: ContentBlock[][] = [];
+    let hold = true;
+    const f = inboxExecutionFixture(
+      async (blocks) => {
+        received.push(blocks);
+        return {};
+      },
+      async (blocks) => {
+        if (hold) {
+          building.resolve();
+          await release.promise;
+        }
+        return blocks as ContentBlock[];
+      }
+    );
+    try {
+      const running = f.service.continueSession(f.message); // No human receipt, like a released client.
+      await building.promise;
+      const turnId = f.service.getExecutionSnapshot(f.message.sessionId).activeTurnId!;
+      await f.service.cancelSession({
+        type: 'session/cancel',
+        sessionId: f.message.sessionId,
+        turnId,
+        machineId: 'machine-1',
+        workspaceId: 'workspace-1' as WorkspaceId,
+      });
+      release.resolve();
+      await running;
+      expect(received).toEqual([]);
+      hold = false;
+      f.client.isCreated = () => true; // A fresh Agent is available after the cancelled acquisition.
+      await f.doc.sessionData.commands.applyHistoryAction({
+        kind: 'upsert-turn',
+        turn: {
+          id: 'legacy-next',
+          role: 'user',
+          timestamp: '2026-10-12T00:00:00Z',
+          status: 'pending',
+          read: false,
+          items: [{ type: 'text', text: 'next' }],
+          inputConfig: f.message.acpSessionConfig,
+          finished: true,
+          fileDiff: [],
+        },
+      });
+      await f.service.continueSession({ ...f.message, userTurnId: 'legacy-next' });
+      expect(received).toHaveLength(1);
+      expect(
+        (await (await createSessionBackend(f.doc)).readHistory()).find(
+          (entry) => entry.id === 'legacy-next'
+        )?.status
+      ).toBe('handled');
+      expect(
+        (f.store as unknown as { db: Database.Database }).db
+          .prepare('SELECT paused FROM inbox_sessions')
+          .get()
+      ).toEqual({ paused: 0 });
+    } finally {
+      release.resolve();
+      await f.close();
+    }
+  });
+
   it('Stop accepted while input is being built submits nothing and retains all eight results', async () => {
     const building = createDeferred();
     const release = createDeferred();
@@ -10808,6 +10874,7 @@ describe('Operation Inbox execution boundary', () => {
       await building.promise;
       const turnId = f.service.getExecutionSnapshot(f.message.sessionId).activeTurnId!;
       await f.service.cancelSession({
+        cancelId: 'modern-stop',
         type: 'session/cancel',
         sessionId: f.message.sessionId,
         turnId,

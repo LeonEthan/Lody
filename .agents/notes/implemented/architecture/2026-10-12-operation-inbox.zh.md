@@ -15,7 +15,7 @@ Translation: current
 [会话编排 Spec](../../../../specs/session-orchestration.zh.md)维护行为，[编排 README](../../../../apps/cli/src/orchestration/README.md#completion-consumption)维护实现与事务契约。本文合并原调查、反向 chat 修复记录、设计和实施计划；早期版本保留在 Git 历史中。
 
 - 结果到达不获得执行许可。真实自然释放只记录一次固定水位，空边界也保留；只有非空且可处理的成员才产生自动意图。重开无需新事件即可恢复该意图；迟到结果和重复释放不能扩大水位。
-- Stop 先持久暂停，再取消执行。Stop 前排队的输入保留历史，但失去执行资格；新的用户消息携带结果资料，不携带已取消的旧指令。用户原文、配置和因果深度保持不变，Agent 任务不能解除暂停。
+- 支持 Inbox 的 Stop 先持久暂停，再取消执行。Stop 前排队的输入保留历史，但失去执行资格；新的用户消息携带结果资料，不携带已取消的旧指令。用户原文、配置和因果深度保持不变，Agent 任务不能解除暂停。
 - Stop、可信用户接受和真实 transport 启动共用准入。未知提交不重发，包括携带 batch 的用户输入的 stale-ACP 恢复；只重试结算。Scope 关闭或等待者取消不代表资源真实释放。
 - B 当前准确输入由 Agent A 发起时，不能向 A 发新 chat。单条、批量和旧入口在接受新工作前返回 `REVERSE_CHAT_FORBIDDEN`；后续独立输入替换此限制。这样不需要任务图或 task/note 新工具，但不保证消除更长的环或重复向外委派。
 
@@ -33,9 +33,9 @@ Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fi
 2. 可信 renderer／非委派 CLI 在激活或入队前持久保存 `humanInputReceipts`。RPC 丢失或输入过大时，历史兜底恢复匹配授权；普通历史、用户不符的回执、已取消／已结束输入不能解除暂停。
 3. 协调器 `recoverStop()` 调用独立的 `recoverClose()`，只补写结算／释放／暂停回执。保留原失败回执和恢复所有者，不重发 transport，也不把再次关闭 Scope 当成恢复。
 
-手动 Stop 的 RPC 与持久兜底共用请求 ID，防止迟到重复请求再次暂停新输入。写盘失败保留请求身份以便补写。已消费结果副本随 Operation 保留期清理；永久删除 Session 同时删除 Inbox 副本。最终存储边界是 schema／Inbox protocol v2、host launch v3。此次明确放弃旧编排数据兼容：旧版专用库和未使用的兼容结果副本在首次打开时删除，不重放、不导入；当前 Inbox 的暂停、未知提交和资源所有权保留。完成结果直接入 Inbox，删除旧表、逐条认领／续跑接口、旧模型和旧协调器 fixture；结果序号持久递增，保留期清理不能重用旧水位。忙闲判断不再把被动结果算作执行。`inbox/legacy.ts` 只桥接仍未迁移的当前 Session／ACP，batch 成员的展示格式仍保留。目前没有已发布的兼容 SHA。
+手动 Stop 的 RPC 与持久兜底共用请求 ID，防止迟到重复请求再次暂停新输入。写盘失败保留请求身份以便补写。已消费结果副本随 Operation 保留期清理；永久删除 Session 同时删除 Inbox 副本。最终存储边界是 schema／Inbox protocol v2、host launch v3。升级保留已经发布的 Operation 表、作者／输入快照、恢复状态和退役 ID，只删除旧 Delivery 表及未使用的兼容结果副本，旧通知积压不重放、不导入；当前 Inbox 的暂停、未知提交和资源所有权保留。完成结果直接入 Inbox，删除旧表、逐条认领／续跑接口、旧模型和旧协调器 fixture；结果序号持久递增，保留期清理不能重用旧水位。忙闲判断不再把被动结果算作执行。`inbox/legacy.ts` 只桥接仍未迁移的当前 Session／ACP，batch 成员的展示格式仍保留。Inbox 尚未发布，但 Operation 表已有发布版本，不能把二者的兼容性混为一谈。
 
-作者来源与展示快照分开：保留下来的当前 Operation 即使没有作者快照，只要保存了 `sourceTurnId`，读取时也以冻结的 `requesterSessionId/sourceTurnId` 保留最小 Agent 来源，通用名称为 `Agent`，不补 Role、模型或目录信息。create/chat 在任何发布前拒绝缺少来源身份的委派；普通用户入口仍署名 human。反向检查直接读取准确输入的 Agent `sessionId`，不依赖父子关系。此修复不导入旧版专用库，也不重写既有历史。
+作者来源与展示快照分开：保留下来的当前 Operation 即使没有作者快照，只要保存了 `sourceTurnId`，读取时也以冻结的 `requesterSessionId/sourceTurnId` 保留最小 Agent 来源，通用名称为 `Agent`，不补 Role、模型或目录信息。create/chat 在任何发布前拒绝缺少来源身份的委派；普通用户入口仍署名 human。反向检查直接读取准确输入的 Agent `sessionId`，不依赖父子关系。此修复保留已有 Operation，不重写既有历史。
 
 Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest` 槽位，不再增加 metadata ID 字段。renderer 先持久保存详情，再写 `lastCanceledTurn = cancel-request:<id>`；RPC 保持立即发送，并使用同一 ID。Watcher 等待匹配的控制数据，通过独立取消链处理控制数据到达；旧版直接写 turn ID 的请求仍兼容。SQLite 负责持久去重，因此重开及迟到 RPC／兜底不会再次暂停新输入，新的点击仍有独立 ID。资源所有权、真实释放移交及暂停写盘失败恢复保持不变；本次 adapter 调整不扩展原生迁移。
 
@@ -48,6 +48,10 @@ Coordinator 的协调、合并唤醒和重试已经迁到原生 Effect workflow�
 ExecutionOwner 收拢输入、batch、资源和原始请求，负责提交、结算、真实释放与独立恢复；Session 不再直接访问 Inbox SQL。关闭所有者保留共享失败回执和完整 Cause，恢复只重试结算。Fleet 启动失败与正常停止共用阶段所有者，生产自动重试会先恢复旧所有者。Session／ACP／历史能力仍为登记的临时 adapter，不能据此声称依赖链全部迁移。
 
 Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮准确输入的作者（包括 steer 后的来源），不读取父子关系或旧输入；历史中的 Agent 输入不会影响后续用户 turn。Operation 回执、结果入队、收尾和资源释放保持原行为。作者读取后再检查 Stop。执行服务 256 项测试通过，包含 Agent 不通知、后续 human 正常通知及两者均完成历史／释放的边界。
+
+升级审核指出三个发布边界：原迁移误删仍在运行的 Operation 和退役 ID、新客户端 Stop 向旧 CLI 发送不支持的字段、旧客户端 Stop 触发无法恢复的 Inbox 暂停。修订保留 Operation 与去重／作者／恢复记录，只移除旧 Delivery；界面与 CLI 按目标 Inbox v2 能力选择 Stop 格式；无协议身份的 legacy Stop 只取消当前执行，不持久暂停。选择这一兼容行为避免从缺失回执或 role／author 猜测 human 授权，升级客户端的持久暂停仍保持原契约。新用例运行真实 SQLite 升级与任务完成、React Stop 写入和 Session／Inbox 的 Stop 后新消息执行。
+
+升级修订验证：CLI 4 suites／487 项、组件 79 项通过；三个定向用例在审核版本 `552c349` 分别失败，恢复修复后均通过。CLI Stop 另验证 released strict 解析拒绝新字段的边界及 Inbox v2 的显式暂停／Operation 取消行为。没有真实升级整机或旧桌面二进制端到端验收。
 
 ## 验证与剩余边界
 

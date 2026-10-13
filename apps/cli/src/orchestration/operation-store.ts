@@ -1042,24 +1042,8 @@ export class LodyOperationStore {
               | undefined
           )?.seq ?? 0;
       }
-      // Retire old-only stores, never restore their unfinished tasks or receipts.
-      // A previous Inbox keeps its current ownership, pause and no-replay evidence.
-      if (tables.has('operations') && !hasInbox) {
-        for (const table of [
-          'operation_item_materializations',
-          'operation_progress_settlements',
-          'operation_authors',
-          'operation_inputs',
-          'delivery_execution_state',
-          'deliveries',
-          'operations',
-          'operation_retired_ids',
-          'orchestration_meta',
-        ]) {
-          this.db.exec(`DROP TABLE IF EXISTS ${table}`);
-        }
-        sequence = 0;
-      }
+      // Released Operations and their duplicate guards remain authoritative.
+      // Retire only the old per-result Delivery scheduler; never replay its backlog.
       this.db.exec(
         'DROP TRIGGER IF EXISTS inbox_results_insert; DROP TRIGGER IF EXISTS inbox_reject_legacy_submission; DROP TRIGGER IF EXISTS deliveries_insert_execution_state; DROP TABLE IF EXISTS delivery_execution_state; DROP TABLE IF EXISTS deliveries;'
       );
@@ -1154,11 +1138,7 @@ export class LodyOperationStore {
     `);
       if (hasInbox) {
         // Passive upgrade copies with no batch are legacy backlog, not new work.
-        this.db.exec(`DELETE FROM operations WHERE EXISTS(
-            SELECT 1 FROM inbox_results r WHERE r.session_id=operations.requester_session_id
-            AND r.operation_id=operations.operation_id AND r.automatic_eligible=0
-            AND NOT EXISTS(SELECT 1 FROM inbox_members m WHERE m.sequence=r.sequence));
-            DELETE FROM inbox_results WHERE automatic_eligible=0
+        this.db.exec(`DELETE FROM inbox_results WHERE automatic_eligible=0
             AND NOT EXISTS(SELECT 1 FROM inbox_members m WHERE m.sequence=inbox_results.sequence);`);
         sequence = Math.max(
           sequence,

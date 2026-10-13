@@ -1,3 +1,6 @@
+import { z } from 'zod';
+import { getSessionCancelProtocolFields } from './session';
+import { CURRENT_MACHINE_PROTOCOL_CAPABILITIES } from '@lody/shared';
 import { LoroDoc } from 'loro-crdt';
 import { createHistoryWriter } from '@lody/shared';
 import { createLoroSessionData } from '@lody/shared/session-data';
@@ -2743,5 +2746,33 @@ describe('Machine Flock freshness fallback validation', () => {
         cause: deadline(),
       }).toLodyError()
     ).toMatchObject({ code: 'SYNC_UNAVAILABLE', retryable: true });
+  });
+});
+
+describe('Stop protocol negotiation', () => {
+  it('keeps released strict cancel payloads valid and opts modern peers into durable pause', () => {
+    const legacy = z
+      .object({ sessionId: z.string(), turnId: z.string(), timeoutMs: z.number() })
+      .strict();
+    const common = { sessionId: 'session', turnId: 'turn', timeoutMs: 10000 };
+    for (const machine of [undefined, {}, { protocolCapabilities: { operationInbox: 1 } }]) {
+      expect(
+        legacy.parse({ ...common, ...getSessionCancelProtocolFields(machine, 'cancel-id', true) })
+      ).toEqual(common);
+    }
+    expect(
+      getSessionCancelProtocolFields(
+        { protocolCapabilities: CURRENT_MACHINE_PROTOCOL_CAPABILITIES },
+        'cancel-id',
+        true
+      )
+    ).toEqual({ cancelId: 'cancel-id', pauseInbox: true });
+    expect(
+      getSessionCancelProtocolFields(
+        { protocolCapabilities: CURRENT_MACHINE_PROTOCOL_CAPABILITIES },
+        'cancel-id',
+        false
+      )
+    ).toEqual({ cancelId: 'cancel-id', pauseInbox: false });
   });
 });

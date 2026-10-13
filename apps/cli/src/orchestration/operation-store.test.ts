@@ -157,19 +157,40 @@ describe('LodyOperationStore', () => {
     }
   });
 
-  it('deletes old-only tasks and Delivery state instead of recovering or indexing them', async () => {
-    const root = await mkdtemp(path.join(os.tmpdir(), 'lody-discard-old-store-'));
+  it('upgrades released Operation tables without losing active work or duplicate guards', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'lody-upgrade-store-'));
     roots.add(root);
     const filename = path.join(root, 'operations.sqlite3');
+    const now = () => Date.parse('2026-10-12T00:00:00Z');
+    const input = baseInput();
+    const active = { ...input, operationId: 'old-active' };
+    const finished = { ...input, operationId: 'old-finished' };
+    const author = buildAgentMessageAuthor({
+      sessionId: input.requesterSessionId,
+      turnId: 'source-turn-1',
+      name: 'Agent',
+    });
+    const seed = new LodyOperationStore(filename, now);
+    seed.accept({ ...active, author });
+    seed.accept(finished);
+    seed.finish(input.requesterSessionId, finished.operationId, {
+      type: 'result',
+      value: { items: [] },
+    });
+    seed.close();
     const old = new Database(filename);
-    old.exec(`CREATE TABLE operations(operation_id TEXT,state TEXT);
-      INSERT INTO operations VALUES('old-active','active'),('old-finished','finished');
+    for (const { name } of old
+      .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'inbox_%'")
+      .all() as { name: string }[])
+      old.exec(`DROP TABLE ${name}`);
+    old.exec(`UPDATE orchestration_meta SET value='1' WHERE key='schema_version';
+      INSERT INTO operation_retired_ids VALUES('requester-session','old-retired');
       CREATE TABLE deliveries(operation_id TEXT,state TEXT);
       INSERT INTO deliveries VALUES('old-finished','pending');
       CREATE TABLE delivery_execution_state(operation_id TEXT,execution_phase TEXT);
       INSERT INTO delivery_execution_state VALUES('old-finished','started');`);
     old.close();
-    const store = new LodyOperationStore(filename);
+    const store = new LodyOperationStore(filename, now);
     try {
       const db = (store as unknown as { db: Database.Database }).db;
       expect(
@@ -179,11 +200,28 @@ describe('LodyOperationStore', () => {
           )
           .all()
       ).toEqual([]);
-      expect(store.listActive('workspace-1' as WorkspaceId, 'machine-1' as MachineId)).toEqual([]);
-      expect(db.prepare('SELECT * FROM operations').all()).toEqual([]);
+      expect(store.get(input.requesterSessionId, active.operationId)).toMatchObject({
+        state: 'active',
+        author,
+      });
+      expect(store.get(input.requesterSessionId, finished.operationId).state).toBe('finished');
+      expect(store.accept(finished).created).toBe(false);
+      expect(() =>
+        store.accept({
+          ...input,
+          operationId: 'old-retired',
+          requesterSessionId: 'requester-session' as SessionId,
+        })
+      ).toThrow();
       expect(db.prepare('SELECT * FROM inbox_results').all()).toEqual([]);
+      store.finish(input.requesterSessionId, active.operationId, {
+        type: 'result',
+        value: { items: [] },
+      });
+      expect(db.prepare('SELECT operation_id FROM inbox_results').all()).toEqual([
+        { operation_id: active.operationId },
+      ]);
       expect(store.inbox.pending('workspace-1')).toEqual([]);
-      expect(store.accept(baseInput()).created).toBe(true);
     } finally {
       store.close();
     }

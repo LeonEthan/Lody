@@ -39,6 +39,7 @@ import {
   sanitizeMessageTextSpans,
   machineSupportsProtocolCapability,
   MACHINE_PROTOCOL_CAPABILITIES,
+  OPERATION_INBOX_PROTOCOL_VERSION,
 } from '@lody/shared';
 import { useAtomValue, useSetAtom, useStore } from 'jotai';
 import { usePostHog } from '@posthog/react';
@@ -501,12 +502,23 @@ export function useSessionActions(): SessionActions {
       const existing = await runtime.repo.getDocMeta(roomId);
       if (isLoroRepoDocDeleted(existing)) return;
       const meta = existing?.meta as SessionMeta | undefined;
-      const cancelId = crypto.randomUUID();
       const machineId = meta?.machineId;
+      const machine = machineId
+        ? await runtime.repo.getDocMeta(getMachineRoomId(machineId))
+        : undefined;
+      const supportsInbox = machineSupportsProtocolCapability(
+        machine?.meta,
+        MACHINE_PROTOCOL_CAPABILITIES.operationInbox,
+        OPERATION_INBOX_PROTOCOL_VERSION
+      );
+      const cancelId = supportsInbox ? crypto.randomUUID() : undefined;
       if (machineId) {
         // RPC and the durable control request share an identity, even if either arrives late.
         void runtime
-          .requestSessionCancel(machineId, sessionId, turnId, { timeoutMs: 2_000, cancelId })
+          .requestSessionCancel(machineId, sessionId, turnId, {
+            timeoutMs: 2_000,
+            ...(cancelId ? { cancelId } : {}),
+          })
           .then((response) => {
             if (response && !response.success) {
               log('session cancel rpc failed for %s/%s: %s', sessionId, turnId, response.error);
@@ -516,14 +528,16 @@ export function useSessionActions(): SessionActions {
             log('session cancel rpc threw for %s/%s: %o', sessionId, turnId, error);
           });
       }
-      await runtime.sendResources.withSessionStore(sessionId, (sessionStore) => {
-        sessionStore.setState((draft: SessionDocDraft) => {
-          draft.cancelRequest = { id: cancelId, turnId };
+      if (cancelId) {
+        await runtime.sendResources.withSessionStore(sessionId, (sessionStore) => {
+          sessionStore.setState((draft: SessionDocDraft) => {
+            draft.cancelRequest = { id: cancelId, turnId };
+          });
         });
-      });
-      await runtime.repo.flush();
+        await runtime.repo.flush();
+      }
       await runtime.writer.upsertDocMeta(roomId, {
-        lastCanceledTurn: getSessionCancelRequestMarker(cancelId),
+        lastCanceledTurn: cancelId ? getSessionCancelRequestMarker(cancelId) : turnId,
       } as Partial<SessionMeta>);
     },
     [runtime]

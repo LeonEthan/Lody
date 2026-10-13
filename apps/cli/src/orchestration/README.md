@@ -65,10 +65,17 @@ independent retry entry. Old coordinator handoff and per-result execution APIs a
 an independent connection to retry only settlement/release/pause writes. The original
 failed close receipt remains unchanged; requests are never resubmitted.
 
-Only a confirmed normal release can grant an automatic intent. Stop cancels queued
+Only a confirmed normal release can grant an automatic intent. Inbox-aware Stop cancels queued
 human execution eligibility and pauses automatic work. Fresh human input carries saved
 results, and a failed/unreleased execution cannot manufacture another wake. See the
 [contract](../../../../specs/session-orchestration.md#idempotent-message-consumption).
+
+New Stop producers negotiate Inbox v2 with the target machine before adding `cancelId`
+and `pauseInbox` or publishing a control-request marker. Without that capability they
+send the released cancel RPC fields and write the exact assistant Turn ID. The new
+CLI accepts that legacy Stop as execution cancellation, without a persistent Inbox
+pause that the old client cannot resume. No missing receipt is guessed to be human.
+Explicit no-pause cancellation and Operation cancellation remain supported.
 
 ### Batch transactions
 
@@ -98,8 +105,10 @@ unfinished creation progress keeps its Operation until projection is settled. Re
 Operation IDs still prevent replay. Pending result data is passive, not busy work;
 automation admission observes active Operations, executions, blocked resources and runnable intents.
 
-Schema v2 deletes `deliveries` and `delivery_execution_state`. Stores without Inbox
-state are discarded rather than migrated into tasks. Previously imported, unclaimed
+Schema v2 deletes only `deliveries` and `delivery_execution_state`. Released Operation
+rows, author/input snapshots, materialization/progress state and retired IDs survive
+the upgrade; active Operations continue normal reconciliation. Finished legacy
+Delivery backlog is not imported or replayed. Previously imported, unclaimed
 compatibility results are discarded; current batches, pause and resource ownership remain.
 The cleanup is transactional and is retried after storage failure. Inbox protocol v2
 requires supervisor contract v3; earlier supervised workers are rejected before storage access.
