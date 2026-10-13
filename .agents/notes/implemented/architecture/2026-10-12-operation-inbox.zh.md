@@ -35,6 +35,10 @@ Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fi
 
 手动 Stop 的 RPC 与持久兜底共用请求 ID，防止迟到重复请求再次暂停新输入。写盘失败保留请求身份以便补写。已消费结果副本随 Operation 保留期清理；永久删除 Session 同时删除 Inbox 副本。兼容边界是 Inbox schema／protocol v1、host launch v2；不支持降级到旧逐 Delivery 二进制，同进程移交必须真实排空执行链及资源。目前没有已发布的兼容 SHA。
 
+Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest` 槽位，不再增加 metadata ID 字段。renderer 先持久保存详情，再写 `lastCanceledTurn = cancel-request:<id>`；RPC 保持立即发送，并使用同一 ID。Watcher 等待匹配的控制数据，通过独立取消链处理控制数据到达；旧版直接写 turn ID 的请求仍兼容。SQLite 负责持久去重，因此重开及迟到 RPC／兜底不会再次暂停新输入，新的点击仍有独立 ID。资源所有权、真实释放移交及暂停写盘失败恢复保持不变；本次 adapter 调整不扩展原生迁移。
+
+本次 Stop 存储调整通过 CLI 159 项、发送／meta cache 97 项、Shared schema／兼容 16 项测试；最后加入 SQLite 与 CRDT 同时重开的 fixture 后，所属 58 项测试复跑通过。锁定依赖的源码副本中类型、lint、格式和六项静态 guard 通过。root check 仍在未修改的 Git transport `context_unreadable` 用例失败，不宣称全绿或独立基线验证。docs 的 82 项错误数组不变；这些测试与下方的前次证据有交集。
+
 ## 验证与剩余边界
 
 作者验证使用锁定依赖的隔离源码副本，并核对改动源码字节一致；不是独立 base/head 审核。下面的测试范围有交集，不能累加。

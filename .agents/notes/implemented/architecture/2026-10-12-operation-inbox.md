@@ -35,6 +35,10 @@ Review of `40ef5c29cbe496f28f17ab10297cf37c3c48030f` found three adapter defects
 
 Manual Stop shares its request ID between RPC and persistent fallback, preventing late duplicates from pausing fresh input. Failed writes retain request identities for repair. Consumed payload copies follow Operation retention; permanent Session deletion removes Inbox copies. Compatibility is Inbox schema/protocol v1 and host launch v2. Old per-Delivery binaries are unsupported downgrades; same-process handoff requires actual chain/resource draining. No compatible released SHA exists yet.
 
+Stop request details now live in one replaceable `cancelRequest` control-document slot, rather than an extra metadata ID field. The renderer persists the payload before publishing `lastCanceledTurn = cancel-request:<id>`; RPC remains an immediate fast path with the same ID. The watcher waits for matching control data and processes control arrivals on its separate cancellation chain. Legacy turn-ID markers remain supported. SQLite owns durable deduplication, so reopen and late RPC/fallback cannot pause fresh input again, while a new click has an independent ID. Resource ownership, actual-release handoff and failed-pause recovery are unchanged; this adapter adjustment does not extend the native migration.
+
+The Stop-storage adjustment passed 159 CLI tests, 97 send/meta-cache tests and 16 Shared schema/compatibility tests; the final SQLite-plus-CRDT reopen fixture passed its 58-test owning suite. Types, lint, format and six static guards passed in the pinned source copy. Root check still fails on the unchanged Git transport `context_unreadable` case; it is not a full-green or independent baseline claim. Docs retain the same 82-error array. These scopes overlap the earlier evidence below.
+
 ## Verification and remaining limits
 
 Author validation used a separate source copy with pinned dependencies and matching changed-source bytes, not an independent base/head review. Counts overlap and must not be added.

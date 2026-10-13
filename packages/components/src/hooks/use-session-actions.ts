@@ -24,6 +24,7 @@ import {
   getMachineFlockDeleteLocalProjectIds,
   getMachineFlockLocalProjects,
   getSessionRoomId,
+  getSessionCancelRequestMarker,
   machineFlockKeys,
   SessionStatusFactory,
   getLocalProjectHistoryProviderKey,
@@ -44,7 +45,11 @@ import { usePostHog } from '@posthog/react';
 // Default import: `debug` is CJS. Named `{ debug }` breaks Vite 8 / TanStack
 // module-runner interop used by site-docs SSR (UNEXPECTED named-export error).
 import debug from 'debug';
-import { activeWorkspaceRuntimeAtom, type WorkspaceRuntime } from '@/atoms/runtime';
+import {
+  activeWorkspaceRuntimeAtom,
+  type SessionDocDraft,
+  type WorkspaceRuntime,
+} from '@/atoms/runtime';
 import {
   clearSessionRunConfigDraftsAtom,
   sessionRunConfigDraftAccountAtom,
@@ -499,7 +504,7 @@ export function useSessionActions(): SessionActions {
       const cancelId = crypto.randomUUID();
       const machineId = meta?.machineId;
       if (machineId) {
-        // Fast-path RPC is intentionally redundant with the durable meta fallback below.
+        // RPC and the durable control request share an identity, even if either arrives late.
         void runtime
           .requestSessionCancel(machineId, sessionId, turnId, { timeoutMs: 2_000, cancelId })
           .then((response) => {
@@ -511,10 +516,14 @@ export function useSessionActions(): SessionActions {
             log('session cancel rpc threw for %s/%s: %o', sessionId, turnId, error);
           });
       }
+      await runtime.sendResources.withSessionStore(sessionId, (sessionStore) => {
+        sessionStore.setState((draft: SessionDocDraft) => {
+          draft.cancelRequest = { id: cancelId, turnId };
+        });
+      });
+      await runtime.repo.flush();
       await runtime.writer.upsertDocMeta(roomId, {
-        // Stop targets the assistant turn currently on screen, not the originating user turn.
-        lastCanceledTurn: turnId,
-        lastCancelRequestId: cancelId,
+        lastCanceledTurn: getSessionCancelRequestMarker(cancelId),
       } as Partial<SessionMeta>);
     },
     [runtime]

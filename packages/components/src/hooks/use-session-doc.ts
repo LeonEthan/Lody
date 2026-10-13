@@ -122,6 +122,7 @@ export function useSessionDoc(
       session: { id: sessionId },
       mq: [],
       humanInputReceipts: {},
+      cancelRequest: undefined,
       forkOperation: undefined,
       preview: undefined,
       externalHistoryCursor: undefined,

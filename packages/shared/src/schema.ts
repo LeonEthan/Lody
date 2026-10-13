@@ -1101,10 +1101,8 @@ export type SessionMeta = {
   steerOperationLedger?: Record<string, SessionSteerOperationRecord>;
   /** Recoverable queue promotion receipts, keyed by the stable operation id. */
   queuePromotionLedger?: Record<string, SessionQueuePromotionRecord>;
-  /** Assistant turn id the client wants to stop; cancel is ignored unless it matches the machine's in-memory active turn. */
+  /** Stop request marker into the Session control doc; legacy values directly name the target turn. */
   lastCanceledTurn?: string;
-  /** Same Stop id on fast RPC and durable fallback; duplicates cannot cancel a later human input. */
-  lastCancelRequestId?: string;
   /** Latest user history entry id that the machine has fully handled. */
   lastHandledUserMsgId?: string;
   /** User history entry id currently being processed by the machine. */
@@ -1357,6 +1355,11 @@ export const sessionDocSchema = schema({
   humanInputReceipts: schema
     .LoroMap({}, { required: false })
     .catchall(schema.LoroMap({ userId: schema.String() })),
+  /** Latest Stop only; metadata carries its marker, not its payload. */
+  cancelRequest: schema.LoroMap(
+    { id: schema.String(), turnId: schema.String() },
+    { required: false }
+  ),
   /** Temporary durable state for an asynchronous Session fork. Removed on success. */
   forkOperation: sessionForkOperationDocSchema,
   preview: sessionPreviewDocSchema,

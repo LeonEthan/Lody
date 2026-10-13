@@ -471,6 +471,13 @@ activation; execution restores the matching receipt through ordinary history dis
 RPC is redundant, including for large inputs. Generic history imports and Agent chat
 do not stamp this map, and canceled/terminal input IDs cannot clear a later pause.
 
+Stop details occupy one replaceable `cancelRequest` slot in the Session control doc.
+The existing `lastCanceledTurn` metadata field carries only `cancel-request:<id>`;
+legacy values still directly name a turn. Publish that marker after persisting the
+payload. The watcher waits for matching control data and checks control arrivals on
+its separate cancellation chain. RPC uses the same ID, so a late fallback cannot
+pause fresh input again; a second click gets a new ID even for the same target turn.
+
 The Session sandbox persists incomplete identity before spawn and continuously adds
 ACP/terminal process roots. Execution retains every attached Session owner until release,
 including replacements within one turn. Restart probes require explicit completeness and

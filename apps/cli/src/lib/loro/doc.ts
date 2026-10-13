@@ -2396,6 +2396,7 @@ export class SessionDocument implements LoroDocument<Omit<SessionDocMeta, 'histo
       session: state.session,
       mq: state.mq as SessionDocMeta['mq'],
       humanInputReceipts: state.humanInputReceipts as SessionDocMeta['humanInputReceipts'],
+      cancelRequest: state.cancelRequest as SessionDocMeta['cancelRequest'],
       forkOperation: state.forkOperation as SessionDocMeta['forkOperation'],
       preview: state.preview as SessionDocMeta['preview'],
       externalHistoryCursor: state.externalHistoryCursor as SessionDocMeta['externalHistoryCursor'],

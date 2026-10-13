@@ -36,7 +36,7 @@ Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
 - Never replay late history; recovery is a new send. Use last row per ID; stop no-progress repairs.
 - `hasPendingUserTurnActivation` is the ONLY pending-turn predicate; never compare those two
   pointers in a consumer.
-- Never inspect historical Session documents to infer work, or publish or clear active presence
+- Stop data: control doc; meta: pointer. Never scan old docs for work or change active presence
   here (`../lib/loro/session-active-presence.ts`).
 - Keep bootstrap and live reconciliation bounded as README describes; add no per-trigger scan or
   extra throttle.

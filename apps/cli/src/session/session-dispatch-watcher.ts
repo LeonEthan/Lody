@@ -7,6 +7,7 @@ import {
   buildSessionTurnInputConfig,
   normalizeSessionTurnInputConfig,
   getSessionRoomId,
+  isSessionCancelRequestMarker,
   type ChatFailedReason,
   isLoroRepoDocDeleted,
   isSessionDocRoomId,
@@ -289,8 +290,9 @@ const isConfigOptionValueRecord = (
  *
  * ```
  * 1. Guard: not owned / archived / no lastCanceledTurn → noop
- * 2. Guard: lastCanceledTurn === already-seen turn     → noop (deduplicate)
- * 3. Execute cancel, record the turn as seen.
+ * 2. Guard: lastCanceledTurn === already-seen marker   → noop (deduplicate)
+ * 3. New marker: await its matching control-document payload.
+ * 4. Execute cancel, record the marker as seen.
  * ```
  *
  * ### Concurrency Model
@@ -389,8 +391,8 @@ export class SessionDispatchWatcher {
   private readonly cancelCheckChains = new Map<SessionId, Promise<void>>();
 
   /**
-   * Tracks the last assistant-turn and Stop-request identity processed per session.
-   * RPC and durable metadata share one request; a new Stop for the same execution
+   * Tracks the last Stop marker processed per session (legacy markers are turn IDs).
+   * RPC and the durable control payload share one request; a new Stop for the same execution
    * has a new request identity.
    */
   private readonly cancelSeenTurn = new Map<SessionId, string>();
@@ -1236,6 +1238,7 @@ export class SessionDispatchWatcher {
         if (!this.watchedSessions.has(sessionId)) {
           const unsubscribe = subscribeSessionChanges(sessionDoc, () => {
             if (isActive()) {
+              void this.enqueueCancelCheck(sessionId, lifecycleGeneration);
               void this.enqueueSessionCheck(sessionId, { lifecycleGeneration });
             }
           });
@@ -1290,8 +1293,7 @@ export class SessionDispatchWatcher {
       hasUnprocessedCancelRequest: Boolean(
         typeof meta.lastCanceledTurn === 'string' &&
         meta.lastCanceledTurn.length > 0 &&
-        JSON.stringify([meta.lastCanceledTurn, meta.lastCancelRequestId ?? 'legacy']) !==
-          this.cancelSeenTurn.get(meta.id)
+        meta.lastCanceledTurn !== this.cancelSeenTurn.get(meta.id)
       ),
       hasRpcTurnOffer: (this.rpcTurnStash.get(meta.id)?.size ?? 0) > 0,
       hasAccessRetry: this.accessFibers.has(meta.id),
@@ -1899,13 +1901,17 @@ export class SessionDispatchWatcher {
       return;
     }
 
+    const cancelRequest =
+      typeof meta?.lastCanceledTurn === 'string' &&
+      isSessionCancelRequestMarker(meta.lastCanceledTurn)
+        ? (await sessionDoc.getDocState())?.cancelRequest
+        : undefined;
+    if (!isActive()) return;
     const action = resolveSessionCancelAction(
       meta ?? undefined,
-      this.cancelSeenTurn.get(sessionId) ===
-        JSON.stringify([meta?.lastCanceledTurn, meta?.lastCancelRequestId ?? 'legacy'])
-        ? meta?.lastCanceledTurn
-        : undefined,
-      this.deps.machineId
+      this.cancelSeenTurn.get(sessionId),
+      this.deps.machineId,
+      cancelRequest
     );
 
     if (action.type === 'noop') {
@@ -1915,10 +1921,7 @@ export class SessionDispatchWatcher {
     if (!isActive()) {
       return;
     }
-    this.cancelSeenTurn.set(
-      sessionId,
-      JSON.stringify([action.turnId, meta?.lastCancelRequestId ?? 'legacy'])
-    );
+    this.cancelSeenTurn.set(sessionId, meta!.lastCanceledTurn!);
     await this.deps.executionService.cancelSession(
       {
         type: 'session/cancel',
@@ -1926,7 +1929,7 @@ export class SessionDispatchWatcher {
         machineId: this.deps.machineId,
         workspaceId: this.deps.workspaceId,
         turnId: action.turnId,
-        cancelId: meta?.lastCancelRequestId,
+        cancelId: action.cancelId,
       },
       { pendingInput: 'preserve', prePromptSession: 'discard' }
     );
