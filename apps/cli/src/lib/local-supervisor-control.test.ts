@@ -18,7 +18,7 @@ describe('local supervisor control', () => {
     expect(
       resolveLocalSupervisorIdentity({
         LODY_DAEMON_SUPERVISED: '1',
-        LODY_SUPERVISOR_CONTRACT: '2',
+        LODY_SUPERVISOR_CONTRACT: '3',
       })
     ).toEqual({ status: 'invalid', reason: 'Invalid daemon supervisor identity' });
     expect(
@@ -34,7 +34,7 @@ describe('local supervisor control', () => {
 
     const resolution = resolveLocalSupervisorIdentity({
       LODY_DAEMON_SUPERVISED: '1',
-      LODY_SUPERVISOR_CONTRACT: '2',
+      LODY_SUPERVISOR_CONTRACT: '3',
       LODY_SUPERVISOR_PID: '123',
       LODY_SUPERVISOR_INSTANCE_ID: 'instance-a',
       LODY_SUPERVISOR_TOKEN: 'x'.repeat(32),
@@ -73,24 +73,27 @@ describe('local supervisor control', () => {
     expect(missing.status === 'invalid' && missing.reason).toContain('contract version (none)');
   });
 
-  it('rejects the pre-Inbox v1 launch contract before runtime ownership is granted', () => {
-    const result = resolveLocalSupervisorIdentity({
-      LODY_DAEMON_SUPERVISED: '1',
-      LODY_SUPERVISOR_CONTRACT: '1',
-      LODY_SUPERVISOR_PID: '123',
-      LODY_SUPERVISOR_INSTANCE_ID: 'old-host',
-      LODY_SUPERVISOR_TOKEN: 'x'.repeat(32),
-    });
-    expect(result).toEqual({
-      status: 'invalid',
-      reason: 'The daemon supervisor speaks contract version 1, but this worker requires version 2',
-    });
-  });
+  it.each(['1', '2'])(
+    'rejects old launch contract %s before runtime ownership is granted',
+    (version) => {
+      const result = resolveLocalSupervisorIdentity({
+        LODY_DAEMON_SUPERVISED: '1',
+        LODY_SUPERVISOR_CONTRACT: version,
+        LODY_SUPERVISOR_PID: '123',
+        LODY_SUPERVISOR_INSTANCE_ID: 'old-host',
+        LODY_SUPERVISOR_TOKEN: 'x'.repeat(32),
+      });
+      expect(result).toEqual({
+        status: 'invalid',
+        reason: `The daemon supervisor speaks contract version ${version}, but this worker requires version 3`,
+      });
+    }
+  );
 
   it('scrubs the private supervisor capability after validation', () => {
     const env: NodeJS.ProcessEnv = {
       LODY_DAEMON_SUPERVISED: '1',
-      LODY_SUPERVISOR_CONTRACT: '2',
+      LODY_SUPERVISOR_CONTRACT: '3',
       LODY_SUPERVISOR_PID: '123',
       LODY_SUPERVISOR_INSTANCE_ID: 'instance-a',
       LODY_SUPERVISOR_TOKEN: 'x'.repeat(32),

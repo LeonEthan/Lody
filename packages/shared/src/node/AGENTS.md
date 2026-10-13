@@ -106,9 +106,9 @@ record: [process tree layer](../../../../.agents/notes/implemented/architecture/
 
 ## Supervised Inbox compatibility
 
-Supervisor launch contract v2 requires Inbox protocol v1. TS and CJS constants agree.
+Supervisor launch contract v3 requires Inbox protocol v2. TS and CJS constants agree.
 A mismatched supervised worker exits 45 before host ownership/storage; do not downgrade
-to the v1 per-Delivery worker. Foreground arbitrary old binaries are unsupported.
+to an earlier worker contract. Foreground arbitrary old binaries are unsupported.
 
 ## Local Loro writer boundary
 

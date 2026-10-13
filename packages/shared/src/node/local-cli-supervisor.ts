@@ -9,8 +9,8 @@ export const LODY_SUPERVISOR_CONTRACT_ENV = 'LODY_SUPERVISOR_CONTRACT';
  * launched with a supervision marker but a different contract version must exit
  * with `CLI_EXIT_CODE_SUPERVISOR_CONTRACT_MISMATCH` instead of guessing.
  */
-// v2 requires the durable Inbox v1 admission/Stop contract; v1 per-Delivery workers are incompatible.
-export const LOCAL_CLI_SUPERVISOR_CONTRACT_VERSION = '2';
+// v3 requires Inbox v2 without Delivery storage; earlier worker contracts are incompatible.
+export const LOCAL_CLI_SUPERVISOR_CONTRACT_VERSION = '3';
 
 /** Startup dependency is temporarily unavailable; retry without counting as a crash. */
 export const CLI_EXIT_CODE_RETRYABLE_STARTUP = 2;

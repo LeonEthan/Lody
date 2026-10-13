@@ -1,3 +1,4 @@
+import type { StoredLodyOperation } from '@lody/shared';
 import type { InboxResourceIdentity } from './recovery';
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
@@ -50,7 +51,7 @@ const MemberRow = z.object({
   completion_json: z.string(),
 });
 
-/** Uses the Operation connection; triggers index completion inside its existing transaction. */
+/** Uses the Operation connection; completion is indexed in its existing transaction. */
 export class InboxSqlite {
   constructor(
     private readonly db: Database.Database,
@@ -59,12 +60,19 @@ export class InboxSqlite {
 
   static migrate(db: Database.Database): void {
     if (
-      db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'inbox_results_insert'").get() &&
+      (
+        db.prepare("SELECT sql FROM sqlite_master WHERE name='inbox_modes'").get() as
+          | { sql: string }
+          | undefined
+      )?.sql.includes('protocol=2') &&
       db.prepare("SELECT 1 FROM sqlite_master WHERE name='inbox_resources'").get() &&
       (db.prepare('PRAGMA table_info(inbox_sessions)').all() as { name: string }[]).some(
         (c) => c.name === 'active_input'
       ) &&
-      db.prepare("SELECT 1 FROM sqlite_master WHERE name='inbox_stops'").get()
+      db.prepare("SELECT 1 FROM sqlite_master WHERE name='inbox_stops'").get() &&
+      (db.prepare('PRAGMA table_info(inbox_results)').all() as { name: string }[]).some(
+        (c) => c.name === 'consumed_at'
+      )
     )
       return;
     db.transaction(() => {
@@ -77,7 +85,7 @@ export class InboxSqlite {
           workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, user_id TEXT NOT NULL,
           execution_id TEXT NOT NULL, identity_json TEXT, state TEXT NOT NULL DEFAULT 'active', cause TEXT,
           PRIMARY KEY(workspace_id,session_id,execution_id));
-        CREATE TABLE IF NOT EXISTS inbox_modes(workspace_id TEXT PRIMARY KEY, owner TEXT NOT NULL, protocol INTEGER NOT NULL CHECK(protocol=1));
+        CREATE TABLE IF NOT EXISTS inbox_modes(workspace_id TEXT PRIMARY KEY, owner TEXT NOT NULL, protocol INTEGER NOT NULL CHECK(protocol=2));
         CREATE TABLE IF NOT EXISTS inbox_sessions(
           workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, user_id TEXT NOT NULL,
           revision INTEGER NOT NULL DEFAULT 0, paused INTEGER NOT NULL DEFAULT 0,
@@ -87,7 +95,7 @@ export class InboxSqlite {
           sequence INTEGER PRIMARY KEY, workspace_id TEXT NOT NULL, session_id TEXT NOT NULL,
           user_id TEXT NOT NULL, operation_id TEXT NOT NULL, operation_kind TEXT NOT NULL, source_turn_id TEXT, created_at TEXT, completed_at TEXT,
           chain_depth INTEGER NOT NULL, completion_json TEXT NOT NULL,
-          automatic_eligible INTEGER NOT NULL DEFAULT 0, claim TEXT, consumed INTEGER NOT NULL DEFAULT 0,
+          automatic_eligible INTEGER NOT NULL DEFAULT 1, claim TEXT, consumed INTEGER NOT NULL DEFAULT 0, consumed_at TEXT,
           UNIQUE(session_id,operation_id));
         CREATE TABLE IF NOT EXISTS inbox_inputs(
           workspace_id TEXT NOT NULL, session_id TEXT NOT NULL, user_id TEXT NOT NULL,
@@ -114,24 +122,26 @@ export class InboxSqlite {
         CREATE TABLE IF NOT EXISTS inbox_members(
           batch_id TEXT NOT NULL REFERENCES inbox_batches(batch_id), sequence INTEGER NOT NULL REFERENCES inbox_results(sequence),
           PRIMARY KEY(batch_id,sequence));
-        INSERT OR IGNORE INTO inbox_results(sequence,workspace_id,session_id,user_id,operation_id,operation_kind,source_turn_id,created_at,completed_at,chain_depth,completion_json,consumed)
-          SELECT d.sequence,d.workspace_id,d.requester_session_id,o.requester_user_id,d.operation_id,o.kind,
-            json_extract(o.frozen_config_json,'$.sourceTurnId'),o.created_at,o.finished_at,d.initiator_chain_depth,d.completion_json,
-            CASE WHEN d.state='consumed' OR e.execution_phase IN ('started','uncertain') THEN 1 ELSE 0 END
-          FROM deliveries d JOIN operations o USING(requester_session_id,operation_id)
-          JOIN delivery_execution_state e USING(requester_session_id,operation_id);
-        CREATE TRIGGER IF NOT EXISTS inbox_results_insert AFTER INSERT ON deliveries BEGIN
-          INSERT OR IGNORE INTO inbox_results(sequence,workspace_id,session_id,user_id,operation_id,operation_kind,source_turn_id,created_at,completed_at,chain_depth,completion_json,automatic_eligible)
-          SELECT NEW.sequence,NEW.workspace_id,NEW.requester_session_id,o.requester_user_id,NEW.operation_id,o.kind,
-            json_extract(o.frozen_config_json,'$.sourceTurnId'),o.created_at,o.finished_at,NEW.initiator_chain_depth,NEW.completion_json,1
-          FROM operations o WHERE o.requester_session_id=NEW.requester_session_id AND o.operation_id=NEW.operation_id;
-        END;
-        CREATE TRIGGER IF NOT EXISTS inbox_reject_legacy_submission BEFORE UPDATE OF execution_phase ON delivery_execution_state
-        WHEN NEW.execution_phase IN ('prepared','started') AND EXISTS(
-          SELECT 1 FROM deliveries d JOIN inbox_modes m ON m.workspace_id=d.workspace_id
-          WHERE d.requester_session_id=NEW.requester_session_id AND d.operation_id=NEW.operation_id)
-        BEGIN SELECT RAISE(ABORT,'INBOX_PROTOCOL_REQUIRED'); END;
       `);
+      const modesSql = (
+        db.prepare("SELECT sql FROM sqlite_master WHERE name='inbox_modes'").get() as {
+          sql: string;
+        }
+      ).sql;
+      if (!modesSql.includes('protocol=2')) {
+        db.exec(`ALTER TABLE inbox_modes RENAME TO inbox_modes_v1;
+          CREATE TABLE inbox_modes(workspace_id TEXT PRIMARY KEY,owner TEXT NOT NULL,protocol INTEGER NOT NULL CHECK(protocol=2));
+          INSERT INTO inbox_modes SELECT workspace_id,owner,2 FROM inbox_modes_v1;
+          DROP TABLE inbox_modes_v1;`);
+      }
+      if (
+        !(db.prepare('PRAGMA table_info(inbox_results)').all() as { name: string }[]).some(
+          (c) => c.name === 'consumed_at'
+        )
+      ) {
+        db.exec('ALTER TABLE inbox_results ADD COLUMN consumed_at TEXT');
+        db.exec('UPDATE inbox_results SET consumed_at=completed_at WHERE consumed=1');
+      }
       if (
         !(db.prepare('PRAGMA table_info(inbox_sessions)').all() as { name: string }[]).some(
           (c) => c.name === 'active_input'
@@ -141,6 +151,44 @@ export class InboxSqlite {
     }).immediate();
   }
 
+  /** Called inside the Operation completion transaction; arrival grants no execution. */
+  indexCompletion(operation: StoredLodyOperation): void {
+    if (!operation.completion || !operation.finishedAt) throw new Error('Missing completion');
+    if (
+      this.db
+        .prepare('SELECT 1 FROM inbox_results WHERE session_id=? AND operation_id=?')
+        .get(operation.requesterSessionId, operation.operationId)
+    )
+      return;
+    const { value } = this.db
+      .prepare(
+        "UPDATE orchestration_meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='inbox_sequence' RETURNING CAST(value AS INTEGER) AS value"
+      )
+      .get() as { value: number };
+    this.db
+      .prepare(`INSERT INTO inbox_results(sequence,workspace_id,session_id,user_id,operation_id,operation_kind,source_turn_id,created_at,completed_at,chain_depth,completion_json,automatic_eligible)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,1)`)
+      .run(
+        value,
+        operation.workspaceId,
+        operation.requesterSessionId,
+        operation.requesterUserId,
+        operation.operationId,
+        operation.kind,
+        operation.frozenContinuationConfig.sourceTurnId ?? null,
+        operation.createdAt,
+        operation.finishedAt,
+        operation.initiatorChainDepth,
+        JSON.stringify(operation.completion)
+      );
+  }
+  hasRunnableWork(workspaceId: string, sessionId: string): boolean {
+    return !!this.db
+      .prepare(`SELECT 1 FROM inbox_sessions s WHERE s.workspace_id=? AND s.session_id=? AND
+      (s.active_execution IS NOT NULL OR s.blocked=1 OR (s.paused=0 AND EXISTS(
+        SELECT 1 FROM inbox_intents i WHERE i.workspace_id=s.workspace_id AND i.session_id=s.session_id AND i.user_id=s.user_id AND i.state IN ('pending','prepared')))) LIMIT 1`)
+      .get(workspaceId, sessionId);
+  }
   closeConnection(): void {
     if (this.db.open) this.db.close();
   }
@@ -205,7 +253,7 @@ export class InboxSqlite {
   }
   private currentOwner(workspaceId: string, owner: string): boolean {
     return !!this.db
-      .prepare('SELECT 1 FROM inbox_modes WHERE workspace_id=? AND owner=? AND protocol=1')
+      .prepare('SELECT 1 FROM inbox_modes WHERE workspace_id=? AND owner=? AND protocol=2')
       .get(workspaceId, owner);
   }
   activate(workspaceId: string, owner: string): void {
@@ -213,19 +261,11 @@ export class InboxSqlite {
       const prior = this.db
         .prepare('SELECT protocol FROM inbox_modes WHERE workspace_id=?')
         .get(workspaceId) as { protocol: number } | undefined;
-      if (prior && prior.protocol !== 1) throw new Error('INBOX_PROTOCOL_REQUIRED');
-      if (!prior) {
-        // Legacy work may have progressed after the companion schema was installed.
-        this.db
-          .prepare(`UPDATE inbox_results SET automatic_eligible=0,
-          consumed=CASE WHEN sequence IN(SELECT d.sequence FROM deliveries d JOIN delivery_execution_state e USING(requester_session_id,operation_id) WHERE d.state='consumed' OR e.execution_phase IN ('started','uncertain')) THEN 1 ELSE consumed END
-          WHERE workspace_id=?`)
-          .run(workspaceId);
-      }
+      if (prior && prior.protocol !== 2) throw new Error('INBOX_PROTOCOL_REQUIRED');
       // The host lease/process-exit barrier is required before changing the owner.
       this.db
         .prepare(
-          'INSERT INTO inbox_modes VALUES(?,?,1) ON CONFLICT(workspace_id) DO UPDATE SET owner=excluded.owner'
+          'INSERT INTO inbox_modes VALUES(?,?,2) ON CONFLICT(workspace_id) DO UPDATE SET owner=excluded.owner'
         )
         .run(workspaceId, owner);
       const uncertain = this.db
@@ -428,7 +468,7 @@ export class InboxSqlite {
     s: InboxScope,
     executionId: string,
     pendingIds: readonly string[] = [],
-    cancelId = `legacy:${executionId}`
+    cancelId = `execution:${executionId}`
   ): boolean {
     return this.transaction(() => {
       const prior = this.db
@@ -922,10 +962,9 @@ export class InboxSqlite {
       this.db
         .prepare('UPDATE inbox_batches SET state=?,cause=COALESCE(?,cause) WHERE batch_id=?')
         .run(outcome, cause ?? null, batch.batchId);
-      this.db.prepare('UPDATE inbox_results SET consumed=1 WHERE claim=?').run(batch.batchId);
       this.db
         .prepare(
-          "UPDATE deliveries SET state='consumed',consumed_at=COALESCE(consumed_at,?) WHERE sequence IN(SELECT sequence FROM inbox_members WHERE batch_id=?)"
+          'UPDATE inbox_results SET consumed=1,consumed_at=COALESCE(consumed_at,?) WHERE claim=?'
         )
         .run(this.now(), batch.batchId);
       this.db

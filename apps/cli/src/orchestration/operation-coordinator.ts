@@ -111,7 +111,7 @@ export type LodyOperationCoordinatorOptions = {
   workspaceDocument: LoroDocumentManager;
   executionService: SessionExecutionService;
   dispatchWatcher: SessionDispatchWatcher;
-  // Delivery turns run inside the requester's own Session, so they must carry
+  // Inbox turns run inside the requester's own Session, so they must carry
   // the requester's commit identity. Without it the continuation turn would
   // overwrite the session's git identity with a placeholder, and any commit it
   // makes would be authored by the daemon host instead of the requesting user.
@@ -157,8 +157,6 @@ export class LodyOperationCoordinator {
   private shutdown: Promise<void> | undefined;
   private quiesceReceipt: Promise<void> | undefined;
   private quiesceFailure: unknown;
-  private legacyDrain: Promise<void> | undefined;
-  private legacyHandoffPending = false;
   private stoppedComplete = true;
   private shutdownFailure: unknown;
   private shutdownRecovery: Promise<void> | undefined;
@@ -175,7 +173,6 @@ export class LodyOperationCoordinator {
   }
 
   start(): void {
-    if (this.legacyHandoffPending) throw new Error('Legacy coordinator has not physically drained');
     if (this.started) return;
     if (!this.stoppedComplete) throw new Error('Coordinator shutdown is not complete');
     this.shutdown = undefined;
@@ -234,15 +231,7 @@ export class LodyOperationCoordinator {
     this.options.executionService.setOperationInbox?.(this.inbox, this.store.inbox, (sessionId) => {
       void this.options.dispatchWatcher.enqueueSessionCheck?.(sessionId);
     });
-    const recoveredClaims = this.store.recoverOrphanedDeliveryClaims(
-      this.options.workspaceId,
-      this.workerBootId
-    );
-    if (recoveredClaims > 0) {
-      this.options.logger.warn(
-        `[orchestration] Recovered ${recoveredClaims} orphaned Delivery claim(s) from an exited Worker`
-      );
-    }
+
     const storePath = this.options.storePath ?? getLodyOperationStorePath(this.options.machineId);
     const storeBasename = path.basename(storePath);
     const watchOperationStore =
@@ -266,22 +255,6 @@ export class LodyOperationCoordinator {
     void this.wake('startup');
   }
 
-  /** Upgrade-only adapter: old stop is not a release receipt. Never activates on timeout. */
-  async startAfterLegacyDrain(
-    previous: { stop(): void | Promise<void>; idle(): Promise<void> },
-    physicalRelease: () => Promise<void>
-  ): Promise<void> {
-    this.legacyHandoffPending = true;
-    this.legacyDrain ??= (async () => {
-      await previous.stop();
-      await previous.idle();
-      await physicalRelease();
-    })();
-    await withTimeout(this.legacyDrain, 15_000, 'Legacy coordinator release is unresolved');
-    this.legacyHandoffPending = false;
-    this.start();
-  }
-
   hasPendingWorkForRequester(sessionId: SessionId): boolean {
     return this.store?.hasPendingWorkForRequester(this.options.workspaceId, sessionId) ?? true;
   }
@@ -297,25 +270,6 @@ export class LodyOperationCoordinator {
     this.storeWakeTimer = null;
     if (this.progressRetryTimer) clearTimeout(this.progressRetryTimer);
     this.progressRetryTimer = null;
-    if (this.store) {
-      try {
-        const abandonedClaims = this.store.abandonDeliveryClaimsOwnedBy(
-          this.options.workspaceId,
-          this.workerBootId
-        );
-        if (abandonedClaims > 0) {
-          this.options.logger.warn(
-            `[orchestration] Abandoned ${abandonedClaims} Delivery claim(s) while stopping the workspace coordinator`
-          );
-        }
-      } catch (error) {
-        this.options.logger.warn(
-          `[orchestration] Could not abandon Delivery claims during coordinator stop: ${
-            error instanceof Error ? error.message : String(error)
-          }`
-        );
-      }
-    }
     this.quiesceReceipt = this.inbox?.quiesce() ?? Promise.resolve();
     void this.quiesceReceipt.catch((cause) => {
       this.quiesceFailure = cause;
@@ -1086,7 +1040,7 @@ export class LodyOperationCoordinator {
           chainDepth: batch.chainDepth,
         },
       },
-      { dispatchSource: 'delivery', inboxBatch: batch }
+      { dispatchSource: 'inbox', inboxBatch: batch }
     );
   }
 

@@ -2855,22 +2855,11 @@ const OperationCompletionView = ({
         ]
       : []
   );
-  const continuationNotice = completion.continuation
-    ? t(
-        completion.continuation.status === 'uncertain'
-          ? 'orchestration.continuationUncertain'
-          : 'orchestration.continuationNotStarted'
-      )
-    : null;
   // The status card carries only what the cards cannot: a whole-Operation
-  // failure or cancellation, targetless failures, the continuation outcome, or
+  // failure or cancellation, targetless failures, or
   // the plain outcome when there is no Session to show.
   const showStatusCard =
-    cards.length === 0 ||
-    failedCompletion ||
-    cancelledCompletion ||
-    untargetedProblems.length > 0 ||
-    continuationNotice !== null;
+    cards.length === 0 || failedCompletion || cancelledCompletion || untargetedProblems.length > 0;
 
   return (
     <div className="flex flex-col gap-2" data-operation-completion={completion.operationKind}>
@@ -2940,16 +2929,6 @@ const OperationCompletionView = ({
                 {problem.label ? `${problem.label}: ${problem.message}` : problem.message}
               </div>
             ))}
-            {continuationNotice ? (
-              <div
-                className={cn(
-                  stylex.props(activityTypography.footnote).className,
-                  'mt-0.5 text-muted-foreground'
-                )}
-              >
-                {continuationNotice}
-              </div>
-            ) : null}
           </div>
         </div>
       ) : null}

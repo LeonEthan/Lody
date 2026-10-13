@@ -34,7 +34,7 @@ export const MACHINE_PROTOCOL_CAPABILITIES = {
   sessionCollaborationControl: 'sessionCollaborationControl',
 } as const;
 
-export const OPERATION_INBOX_PROTOCOL_VERSION = 1;
+export const OPERATION_INBOX_PROTOCOL_VERSION = 2;
 export const MEMORY_PROVIDERS_PROTOCOL_VERSION = 1;
 export const MCP_TOOL_DISCOVERY_PROTOCOL_VERSION = 1;
 export const LOCAL_PROJECT_HISTORY_PROVIDER_PROTOCOL_VERSION = 1;

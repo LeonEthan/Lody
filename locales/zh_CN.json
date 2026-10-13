@@ -4087,8 +4087,6 @@
   "orchestration.operationCompleted": "操作已完成",
   "orchestration.operationFailed": "操作失败",
   "orchestration.operationCancelled": "操作已取消",
-  "orchestration.continuationNotStarted": "保存的 Agent 配置不可用，因此没有启动后续执行。",
-  "orchestration.continuationUncertain": "后续执行可能在中断前已经启动，因此没有自动重放。请检查现有输出，并在需要时手动继续。",
   "sessions.turnConfig.tooltipEmpty": "此轮没有记录运行配置",
   "sessions.turnConfig.tooltip": "查看运行配置",
   "sessions.turnConfig.open": "运行配置",

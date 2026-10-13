@@ -5,6 +5,61 @@ import ts from 'typescript';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const dir = path.join(root, 'apps/cli/src/orchestration/inbox');
 const errors = [];
+const retiredMethods = new Set([
+  'deliverIfRunnable',
+  'listPendingDeliveries',
+  'getDelivery',
+  'claimDeliveryExecution',
+  'prepareClaimedDeliveryExecution',
+  'markClaimedDeliveryExecutionStarted',
+  'markClaimedDeliveryExecutionUncertain',
+  'claimDeliveryFinalization',
+  'releaseDeliveryClaim',
+  'consumeClaimedDelivery',
+  'recoverOrphanedDeliveryClaims',
+  'abandonDeliveryClaimsOwnedBy',
+  'startAfterLegacyDrain',
+  'settleVisibleTurn',
+]);
+for (const relative of [
+  'apps/cli/src/orchestration/operation-store.ts',
+  'apps/cli/src/orchestration/operation-coordinator.ts',
+  'apps/cli/src/session/session-execution-service.ts',
+]) {
+  const file = ts.createSourceFile(
+    relative,
+    fs.readFileSync(path.join(root, relative), 'utf8'),
+    ts.ScriptTarget.Latest,
+    true
+  );
+  const visit = (node) => {
+    if (
+      (ts.isMethodDeclaration(node) &&
+        ts.isIdentifier(node.name) &&
+        retiredMethods.has(node.name.text)) ||
+      (ts.isCallExpression(node) &&
+        ts.isPropertyAccessExpression(node.expression) &&
+        retiredMethods.has(node.expression.name.text))
+    ) {
+      errors.push(`${relative}: retired Delivery scheduler API`);
+    }
+    if (
+      ts.isPropertyAssignment(node) &&
+      node.name.getText(file) === 'dispatchSource' &&
+      ts.isStringLiteral(node.initializer) &&
+      node.initializer.text === 'delivery'
+    ) {
+      errors.push(`${relative}: retired per-Delivery dispatch source`);
+    }
+    if (
+      (ts.isPropertySignature(node) || ts.isPropertyAssignment(node)) &&
+      node.name.getText(file) === 'onTurnSettled'
+    )
+      errors.push(`${relative}: retired Delivery settlement callback`);
+    ts.forEachChild(node, visit);
+  };
+  visit(file);
+}
 for (const name of fs
   .readdirSync(dir)
   .filter((n) => n.endsWith('.ts') && !n.endsWith('.test.ts') && n !== 'legacy.ts')) {

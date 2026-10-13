@@ -33,30 +33,26 @@ Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fi
 2. 可信 renderer／非委派 CLI 在激活或入队前持久保存 `humanInputReceipts`。RPC 丢失或输入过大时，历史兜底恢复匹配授权；普通历史、用户不符的回执、已取消／已结束输入不能解除暂停。
 3. 协调器 `recoverStop()` 调用独立的 `recoverClose()`，只补写结算／释放／暂停回执。保留原失败回执和恢复所有者，不重发 transport，也不把再次关闭 Scope 当成恢复。
 
-手动 Stop 的 RPC 与持久兜底共用请求 ID，防止迟到重复请求再次暂停新输入。写盘失败保留请求身份以便补写。已消费结果副本随 Operation 保留期清理；永久删除 Session 同时删除 Inbox 副本。兼容边界是 Inbox schema／protocol v1、host launch v2；不支持降级到旧逐 Delivery 二进制，同进程移交必须真实排空执行链及资源。目前没有已发布的兼容 SHA。
+手动 Stop 的 RPC 与持久兜底共用请求 ID，防止迟到重复请求再次暂停新输入。写盘失败保留请求身份以便补写。已消费结果副本随 Operation 保留期清理；永久删除 Session 同时删除 Inbox 副本。最终存储边界是 schema／Inbox protocol v2、host launch v3。此次明确放弃旧编排数据兼容：旧版专用库和未使用的兼容结果副本在首次打开时删除，不重放、不导入；当前 Inbox 的暂停、未知提交和资源所有权保留。完成结果直接入 Inbox，删除旧表、逐条认领／续跑接口、旧模型和旧协调器 fixture；结果序号持久递增，保留期清理不能重用旧水位。忙闲判断不再把被动结果算作执行。`inbox/legacy.ts` 只桥接仍未迁移的当前 Session／ACP，batch 成员的展示格式仍保留。目前没有已发布的兼容 SHA。
 
 Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest` 槽位，不再增加 metadata ID 字段。renderer 先持久保存详情，再写 `lastCanceledTurn = cancel-request:<id>`；RPC 保持立即发送，并使用同一 ID。Watcher 等待匹配的控制数据，通过独立取消链处理控制数据到达；旧版直接写 turn ID 的请求仍兼容。SQLite 负责持久去重，因此重开及迟到 RPC／兜底不会再次暂停新输入，新的点击仍有独立 ID。资源所有权、真实释放移交及暂停写盘失败恢复保持不变；本次 adapter 调整不扩展原生迁移。
 
-本次 Stop 存储调整通过 CLI 159 项、发送／meta cache 97 项、Shared schema／兼容 16 项测试；最后加入 SQLite 与 CRDT 同时重开的 fixture 后，所属 58 项测试复跑通过。锁定依赖的源码副本中类型、lint、格式和六项静态 guard 通过。root check 仍在未修改的 Git transport `context_unreadable` 用例失败，不宣称全绿或独立基线验证。docs 的 82 项错误数组不变；这些测试与下方的前次证据有交集。
-
-与主分支 `7b540b10f` 合并后，保留它的 presence 子 Scope：先取消／排空原始请求，再清除 presence，最后释放 turn 槽位并允许 Inbox 自动移交。presence 清理失败仍保留旧执行所有者。daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。检查脚本保留主分支的原生 presence／local writer guard 和 Inbox guard。使用合并后的锁定依赖，包括 Streams 0.17.0、Effect 4.0.2，没有额外升级。执行／presence／Inbox／daemon 所属八个 suite 共 422 项通过；类型、格式及 `check:quick` 通过。文档错误数组仍是相同的 82 项。完整检查在最终测试断言调整前启动，未全绿，包含未修改的 native Git fixture 失败；最终调整由 422 项复跑覆盖，不宣称又一次完整 root 全绿。
+与主分支 `7b540b10f` 合并后，保留原始 ACP 排空 → presence 清除 → turn／Inbox 移交的顺序。presence 清理失败仍保留旧执行所有者；daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。依赖维持合并后的锁定版本，包括 Streams 0.17.0、Effect 4.0.2。
 
 ## 验证与剩余边界
 
-作者验证使用锁定依赖的隔离源码副本，并核对改动源码字节一致；不是独立 base/head 审核。下面的测试范围有交集，不能累加。
+作者验证使用锁定依赖的隔离源码副本，并核对改动源码字节一致；不是独立 base/head 审核。以下范围有交集，不能累加；以前的完整测试记录保留在 Git 历史中。
 
-| 范围 | 最近记录的证据 |
+| 范围 | 本次清理的证据 |
 | --- | --- |
-| 所属 CLI suites | 7 个 suite，676 项通过；批量、准入、SQLite／CRDT 重开、资源创建和协调器恢复 |
-| 用户发送／配置 | 4 个 suite，117 项通过；持久授权、RPC 丢失和大输入 |
-| Shared／组件完整测试 | 1428／5141 项通过 |
-| 类型、lint、格式、Inbox／进程／平台／public／i18n guard | 通过，lint 无 error |
-| root check | CLI 4065 项通过、4 项跳过；未修改的 Git transport 一项 `context_unreadable`，没有独立基线复现。最后资源改动经过专项复跑，不是又一次完整 root 全绿 |
-| 文档检查 | 82 项已有错误，无 Inbox 错误；本次合并后错误数组不变 |
+| Store／Coordinator／Inbox／执行／进度投影 | 最终 5 个 suite，387 项通过；删除旧库、事务回滚、保留当前未知／暂停／资源状态、消费保留期与序号不重用 |
+| 执行入口／Watcher／supervisor／注册／命令／MCP | 7 个 suite，509 项通过；旧宿主拒绝、batch 准入与反向 chat |
+| Shared 消息／组件关系展示 | 各 3／2 个 suite，28／28 项通过 |
+| 类型、lint、格式与 `check:quick` | 通过；保留现有边界检查，并禁止旧 API、逐条派发来源和结算回调回流 |
+| 完整 `pnpm check` | CLI 4076 项通过、4 项跳过；未修改的 Git transport 一项 `context_unreadable`／remote helper aborted，未独立复现基线；最终删减由所属测试和静态检查覆盖，不能宣称全仓全绿 |
+| 文档检查 | 82 项已有错误，无 Inbox 错误 |
 
-初版 `40ef5c29c` 的消费者验证还有 RPC 124 项、Electron 216 项通过，RPC 原有 3 项跳过。这些和仅反向 chat 的 75 项测试都不能证明修订后的 Inbox 已验收；详细中间测试表留在 Git 历史，不再重复维护活跃文档。
-
-测试通过 Deferred、注入时钟、fake timers 和故障触发器检查完整模型输入、持久行与真实释放。覆盖八项合批、空边界、迟到第九项、无新事件重开、暂停／未知不重发，以及真实旧协调器栅栏前后的移交。资源测试使用真实独立进程组，进程表为注入快照。不宣称真实模型、完整系统进程表、桌面端到端、合入或发布验收。
+测试通过 Deferred、注入时钟、fake timers 和故障触发器检查完整模型输入、持久行与真实释放。覆盖八项合批、空边界、迟到第九项、无新事件重开、暂停／未知不重发，以及当前调度所有权与资源释放。旧协调器 fixture 的早期移交测试随被退役的契约删除，不能充当新版验收。资源测试使用真实独立进程组，进程表为注入快照。不宣称真实模型、完整系统进程表、桌面端到端、合入或发布验收。
 
 修订候选仍待独立复审，Spec 保持 draft。未来 Lody 各落地端和 Agent adapter 都完整支持 ACP steer 后，再评估执行中合批交付，并验证实际应用、暂停、取消和未知交付。这是维护条件，不是当前行为或定时提醒。
 

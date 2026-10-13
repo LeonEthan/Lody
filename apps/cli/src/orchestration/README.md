@@ -34,7 +34,7 @@ A batch is one system history item plus one model input, even when details requi
 `batch-page.ts` returns complete large members in bounded JSON fragments. The execution
 owner retains raw requests and full failures; `recoverInboxExecution` retries cleanup.
 Coordinator `stop()` now has a shared awaited drain receipt; `recoverStop()` is its
-independent retry entry. Same-process legacy handoff uses `startAfterLegacyDrain`.
+independent retry entry. Old coordinator handoff and per-result execution APIs are removed.
 `recoverStop()` invokes the bridge's `recoverClose()` for failed close receipts, using
 an independent connection to retry only settlement/release/pause writes. The original
 failed close receipt remains unchanged; requests are never resubmitted.
@@ -62,23 +62,33 @@ Batch membership is immutable. History projection is an idempotent stable-ID wri
 
 Use `BEGIN IMMEDIATE` for claims. Automatic batches use their intent's saved watermark; human preparation snapshots the current watermark. The replacement batch may include newly available results; old membership history stays unchanged. Post-claim arrivals remain queued. History failure is pre-submission; uncertainty beyond the fence remains unknown and rebuilding history cannot restore submission eligibility.
 
-Consumed Operation payloads expire after seven days. `operation_retired_ids`
-retains only their Session/Operation keys for the life of the local store.
-The retirement trigger runs in the same cleanup transaction, before cascaded
-Delivery deletion; the insertion trigger also fences older writers. No columns
-are added to the strict legacy Operation or Delivery rows. Modern acceptance and
-retry lookup return non-retryable `OPERATION_ID_REUSED` for retired keys.
+### Storage and retirement
 
-Persistence and acknowledgement stay in this store: repeated notifications
-resolve the same Delivery, and successful settlement atomically records consumed
-state for its claim. No ACP client or provider-specific protocol is required.
-See the [scope correction](../../../../.agents/notes/rejected/architecture/2026-10-10-provider-prompt-receipts.md).
+Operation completion writes directly into `inbox_results` in the same transaction;
+there is no Delivery table, insert trigger or separate per-result execution claim.
+A persistent sequence counter survives deletion so late results cannot enter an old watermark.
+Settlement records consumption time; consumed payloads expire after seven days, while
+unfinished creation progress keeps its Operation until projection is settled. Retired
+Operation IDs still prevent replay. Pending result data is passive, not busy work;
+automation admission observes active Operations, executions, blocked resources and runnable intents.
+
+Schema v2 deletes `deliveries` and `delivery_execution_state`. Stores without Inbox
+state are discarded rather than migrated into tasks. Previously imported, unclaimed
+compatibility results are discarded; current batches, pause and resource ownership remain.
+The cleanup is transactional and is retried after storage failure. Inbox protocol v2
+requires supervisor contract v3; earlier supervised workers are rejected before storage access.
+No old binary downgrade or same-process Delivery scheduler handoff is supported.
+
+`inbox/legacy.ts` remains the registered Promise-to-Effect bridge for the current
+Session/ACP consumers. It is not an old Delivery scheduler or data compatibility layer.
+`operation_completion` and its stable `deliveryId` remain the batch member's display
+format; old per-member continuation statuses and notices are removed.
 
 ## Message-author snapshots
 
 `operation_authors` stores source identity and per-target Role display snapshots in
 the Operation acceptance transaction, with cascading cleanup. Separate storage
-keeps strict legacy `SELECT *` and frozen-config readers compatible. Missing rows
+keeps Operation records separate from display snapshots. Missing rows
 mean legacy provenance, not permission to reconstruct historical identities from
 current catalogs. See the [contract](../../../../specs/message-author-identity.md).
 

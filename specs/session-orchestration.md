@@ -125,8 +125,9 @@ Recovery uses the frozen prompt, Role revision and dispatch configuration. Befor
 replaying a missing target input, cloud confirms remote document catch-up; OSS
 confirms the authoritative daemon repo and rechecks the fixed Turn under the
 existing materialization claim. Missing cloud connectivity never counts as local
-authority in a cloud workspace. Completion uses the existing single-owner Delivery
-protocol. No persisted schema or hosted API changes are required.
+authority in a cloud workspace. Completion writes directly to the native Inbox in
+the same Operation transaction; the result-consumption rules below control execution.
+This changes local persisted storage, not the hosted API.
 
 ## User-controlled conversation-tree stop
 
@@ -176,12 +177,14 @@ inputs also disable whole-input stale-ACP replay. Retry settlement writes only. 
 request/resource release differs from waiter cancellation or Scope close: retain full
 failures, shared shutdown receipts and independent recovery owners until actual release.
 
-Drain the legacy coordinator and actual requests before transferring ownership; old
-stop returning is insufficient. Upgrade backlogs stay passive and legacy submitted or
-unknown results do not replay. Compatibility is Inbox schema/protocol v1; per-Delivery
-versions are unsupported downgrades. Supported update entry points must end the old
-Worker before launch. Preserve ordinary no-batch user recovery, retired Operation IDs
-and tree-stop rules.
+Old orchestration data is not preserved: discard old-only stores and unclaimed
+compatibility backlog rather than replaying or importing it. Delete per-Delivery
+storage and execution APIs. Preserve current Inbox pause, resource ownership and
+unknown/submitted batch evidence; deleting data is not proof of physical release.
+Schema/protocol v2 requires host launch v3. Supported launches end the previous
+Worker before ownership transfer and reject earlier contracts before storage access.
+Passive result data does not count as running work. Preserve ordinary no-batch user
+recovery, retired current Operation IDs and tree-stop rules.
 
 ## Implementation evidence
 

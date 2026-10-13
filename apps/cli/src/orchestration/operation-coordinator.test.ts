@@ -1,5 +1,4 @@
 import Database from 'better-sqlite3';
-import { LodyOperationCoordinator as LegacyOperationCoordinator } from '../../tests/fixtures/legacy-operation-coordinator';
 import { withHistoryPort } from '../../tests/history-port-fixture';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -23,19 +22,17 @@ import {
 import { LodyOperationCoordinator } from './operation-coordinator';
 import { LodyOperationStore } from './operation-store';
 
+const queuedResults = (store: LodyOperationStore, workspaceId: WorkspaceId) =>
+  (store as unknown as { db: Database.Database }).db
+    .prepare(
+      'SELECT session_id AS requesterSessionId,operation_id AS operationId,consumed FROM inbox_results WHERE workspace_id=? AND consumed=0 ORDER BY sequence'
+    )
+    .all(workspaceId);
+
 const roots = new Set<string>();
 const TEST_NOW_MS = Date.parse('2026-07-20T00:00:00Z');
 
-type DeliveryDispatchOptions = {
-  onTurnClaimed?: () => Promise<boolean>;
-  onTurnStarted?: () => Promise<boolean>;
-  onTurnSettled?: (
-    settlement: 'handled' | 'cancelled' | 'not_started' | 'uncertain'
-  ) => Promise<void>;
-};
-
 const makeHarness = async (options?: {
-  coordinatorClass?: typeof LodyOperationCoordinator;
   deadlineAt?: string;
   requesterArchived?: boolean;
   pendingUser?: boolean;
@@ -202,7 +199,7 @@ const makeHarness = async (options?: {
   });
   const openFlockDoc = vi.fn(async () => ({ flock: { scan: flockScan } }));
   const getRepoMeta = vi.fn(() => {
-    throw new Error('Delivery configuration lookup must not enumerate repo meta');
+    throw new Error('Inbox configuration lookup must not enumerate repo meta');
   });
   const getDocMeta = vi.fn(async (roomId: string) => {
     if (
@@ -226,11 +223,9 @@ const makeHarness = async (options?: {
   };
   let pendingUser = options?.pendingUser ?? false;
   let busy = options?.busy ?? false;
-  const continueSession = vi.fn(async (message: unknown, dispatchOptions: unknown) => {
+  const continueSession = vi.fn(async (message: unknown) => {
     const typedMessage = message as { sessionId: SessionId; userTurnId: string };
-    const typedOptions = dispatchOptions as DeliveryDispatchOptions;
     await options?.beforeTurnClaim?.();
-    if ((await typedOptions.onTurnClaimed?.()) === false) return;
     const assistantTurnId = `assistant:${typedMessage.userTurnId}`;
     histories.set(typedMessage.sessionId, [
       ...(histories.get(typedMessage.sessionId) ?? []),
@@ -244,7 +239,6 @@ const makeHarness = async (options?: {
         finished: true,
       },
     ]);
-    await typedOptions.onTurnSettled?.('handled');
   });
   const logger = { warn: vi.fn(), debug: vi.fn() };
   const syncMachineFlockDoc = vi.fn(
@@ -343,9 +337,7 @@ const makeHarness = async (options?: {
     materializeTarget,
     confirmTargetReadable: options?.confirmTargetReadable,
   } satisfies ConstructorParameters<typeof LodyOperationCoordinator>[0];
-  const coordinator = new (options?.coordinatorClass ?? LodyOperationCoordinator)(
-    coordinatorOptions
-  );
+  const coordinator = new LodyOperationCoordinator(coordinatorOptions);
   const store = new LodyOperationStore(storePath, () => TEST_NOW_MS);
   store.accept({
     workspaceId,
@@ -457,7 +449,7 @@ describe('LodyOperationCoordinator', () => {
             value: { items: [{ status: 'succeeded', output: { text: 'local result' } }] },
           },
         });
-        expect(store.listPendingDeliveries('workspace-1' as WorkspaceId)).toHaveLength(1);
+        expect(queuedResults(store, 'workspace-1' as WorkspaceId)).toHaveLength(1);
         expect(
           harness.histories
             .get(harness.requesterSessionId)
@@ -951,7 +943,7 @@ describe('LodyOperationCoordinator', () => {
               'workspace-1' as WorkspaceId,
               'machine-1' as MachineId
             ),
-            deliveries: store.listPendingDeliveries('workspace-1' as WorkspaceId),
+            deliveries: queuedResults(store, 'workspace-1' as WorkspaceId),
             completion: store.get(harness.requesterSessionId, 'review-round-1').completion,
           };
         } finally {
@@ -983,7 +975,7 @@ describe('LodyOperationCoordinator', () => {
         .map((row) => row.id);
       expect(continuationIds).toHaveLength(0);
       await harness.coordinator.stop();
-      // Opening the same SQLite store must restore observation even with no active Operation/Delivery.
+      // Opening the same SQLite store must restore observation even with no active Operation or runnable intent.
       harness.coordinator.start();
       await harness.coordinator.idle();
       expect(status()).toBe('running');
@@ -1069,7 +1061,7 @@ describe('LodyOperationCoordinator', () => {
     await harness.coordinator.stop();
     const store = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
     try {
-      expect(store.listPendingDeliveries('workspace-1' as WorkspaceId)).toHaveLength(1);
+      expect(queuedResults(store, 'workspace-1' as WorkspaceId)).toHaveLength(1);
       expect(
         store.listPendingProgress('workspace-1' as WorkspaceId, 'machine-1' as MachineId)
       ).toHaveLength(1);
@@ -1118,101 +1110,6 @@ describe('LodyOperationCoordinator', () => {
     await harness.coordinator.stop();
   });
 });
-
-it.each(['before', 'after'] as const)(
-  'waits for the real old coordinator %s its start fence before activating Inbox mode',
-  async (position) => {
-    let signalStarted!: () => void;
-    let finishRequest!: () => void;
-    let signalStop!: () => void;
-    let confirmPhysical!: () => void;
-    const started = new Promise<void>((r) => (signalStarted = r));
-    const request = new Promise<void>((r) => (finishRequest = r));
-    const stopped = new Promise<void>((r) => (signalStop = r));
-    const released = new Promise<void>((r) => (confirmPhysical = r));
-    const old = await makeHarness({
-      coordinatorClass: LegacyOperationCoordinator as unknown as typeof LodyOperationCoordinator,
-    });
-    const received: string[] = [];
-    old.continueSession.mockImplementation(async (_message: unknown, raw: unknown) => {
-      const hooks = raw as {
-        onTurnClaimed?: () => Promise<boolean>;
-        onTurnStarted?: () => Promise<boolean>;
-        onTurnSettled?: (s: 'handled') => Promise<void>;
-      };
-      if (position === 'before') {
-        signalStarted();
-        await request;
-      }
-      if ((await hooks.onTurnClaimed?.()) === false) return;
-      if ((await hooks.onTurnStarted?.()) === false) return;
-      if (position === 'after') {
-        signalStarted();
-        await request;
-      }
-      received.push('old provider received its input');
-      await hooks.onTurnSettled?.('handled');
-    });
-    old.histories.set(old.targetSessionId, [
-      {
-        id: 'turn-1',
-        role: 'user',
-        timestamp: '2026-07-20T00:00:00Z',
-        items: [{ type: 'text', text: 'work' }],
-        fileDiff: [],
-        status: 'handled',
-      },
-      {
-        id: 'target-answer',
-        role: 'assistant',
-        userTurnId: 'turn-1',
-        timestamp: '2026-07-20T00:00:01Z',
-        items: [{ type: 'text', text: 'result' }],
-        fileDiff: [],
-        finished: true,
-      },
-    ]);
-    old.coordinator.start();
-    await Promise.race([
-      started,
-      old.coordinator.idle().then(() => {
-        throw new Error(
-          `Old coordinator failed to reach start fence: ${JSON.stringify({ warn: old.logger.warn.mock.calls, debug: old.logger.debug.mock.calls, calls: old.continueSession.mock.calls.length, history: old.histories.get(old.targetSessionId) })}`
-        );
-      }),
-    ]);
-    const replacement = new LodyOperationCoordinator({
-      ...old.coordinatorOptions,
-      workerBootId: 'replacement',
-    });
-    const handoff = replacement.startAfterLegacyDrain(
-      {
-        stop: () => {
-          void old.coordinator.stop();
-          signalStop();
-        },
-        idle: () => old.coordinator.idle(),
-      },
-      () => released
-    );
-    await stopped;
-    expect(() => replacement.start()).toThrow('Legacy coordinator');
-    let db = new Database(old.storePath);
-    expect(db.prepare('SELECT COUNT(*) AS n FROM inbox_modes').get()).toEqual({ n: 0 });
-    db.close();
-    finishRequest();
-    await old.coordinator.idle();
-    expect(received).toEqual(position === 'after' ? ['old provider received its input'] : []);
-    expect(() => replacement.start()).toThrow('Legacy coordinator');
-    confirmPhysical();
-    await handoff;
-    db = new Database(old.storePath);
-    expect(db.prepare('SELECT protocol FROM inbox_modes').get()).toEqual({ protocol: 1 });
-    db.close();
-    await replacement.stop();
-    expect(received).toEqual(position === 'after' ? ['old provider received its input'] : []);
-  }
-);
 
 it('reprojects a crashed submitting batch as unknown without starting model work', async () => {
   const h = await makeHarness();

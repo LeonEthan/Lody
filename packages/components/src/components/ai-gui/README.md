@@ -276,7 +276,7 @@ the Subagent Task panel’s 22rem height cap and internal scrollbar. Controls us
 `buildChatVirtualRows` combines consecutive pure creation records (including
 separate MCP calls) under the first record's key; a different message or an
 unhydrated turn ends the group. The row retains its final turn index so visible
-range reporting keeps every grouped turn hydrated. Failure/continuation summaries
+range reporting keeps every grouped turn hydrated. Failure summaries
 remain outside the bounded card list, and card navigation/title/status remain live.
 Message-selection mode keeps original rows so each selected id matches one record.
 See the [decision note](../../../../../.agents/notes/implemented/feature/2026-10-11-created-session-list.md).

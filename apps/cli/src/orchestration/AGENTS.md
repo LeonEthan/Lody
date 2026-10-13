@@ -4,9 +4,9 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
 
 - `operation-store.ts` is the shared machine-local WAL SQLite source of truth.
   The key is `(requesterSessionId, operationId)`; foreign Session lookup must be
-  indistinguishable from absence. Operation finalization and Delivery insertion
+  indistinguishable from absence. Operation finalization and Inbox result insertion
   are one transaction. Cleanup retains retired ids; accepting them again is forbidden.
-  Delivery/system-Turn ids include both key parts; never
+  Result/system-Turn ids include both key parts; never
   derive a globally unique id from the Session-scoped `operationId` alone.
 - Target input creation is fenced by the SQLite item-materialization claim.
   Acceptance owns new claims; the lease Worker only adopts absent/expired
@@ -30,7 +30,7 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   Machine credential to execute. Completion preserves userId. Matching includes both ids, kind,
   and fingerprint; reuse from another Turn is `OPERATION_ID_REUSED`, not a retry.
   Presentation and attachment snapshots live in `operation_authors` / `operation_inputs`,
-  atomically with acceptance. Keep strict legacy rows/configs unchanged; recovery uses snapshots.
+  atomically with acceptance; recovery uses these frozen snapshots.
 - `operation-coordinator.ts` is owned only by the local Host-lease Worker. MCP
   subprocesses may accept Operations but never schedule completion Turns.
 - Reconciliation is level-checked. Loro subscriptions and SQLite directory
@@ -68,18 +68,18 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   every Session owned by the execution. Only explicitly complete identities can prove restart
   release; legacy snapshots and interrupted journaling remain blocked. Coordinator recovery
   calls `recoverClose`, not the cached failed `close` receipt; never replay transport.
-- Upgrade drains old reconciliation chains and actual requests before activating Inbox mode.
-  Old `stop()` alone is insufficient. Existing backlogs are passive; legacy submitted/unknown
-  results cannot be granted a new submission. Only Inbox v1-compatible writers may downgrade.
+- Schema/Inbox v2 drops old-only stores, Delivery data/APIs and unused compatibility results.
+  Keep current pause/unknown/resource evidence and monotonic sequences. Host v3 rejects old
+  workers before storage; end the prior Worker before handoff. Passive results are not busy.
 - Create Operations may also maintain one stable `role: system` `operation_progress`
   Turn in the requester Session, written only by the Host-lease Worker, never by MCP
   replicas. It is durable UI state, never agent input/dispatch. Merge duplicate rows through
   HistoryWriter without raw alias writes. Publish cards only from materialized Session/UserTurn evidence or an existing
   target, and merge status monotonically by exact target.
   Progress failures must not fail acceptance, materialization, cancellation, finalization,
-  Delivery, or target cancellation. Set `progressMessageId` only when the row covers every durable
+  result persistence, or target cancellation. Set `progressMessageId` only when the row covers every durable
   target and successful result; otherwise retain completion fallback cards. Root cancellation,
-  errors, and deadlines do not terminate targets. Delivery consumption does not end reconciliation:
+  errors, and deadlines do not terminate targets. Result consumption does not end reconciliation:
   retain it through target terminal state and local Loro flush, and preserve it through SQLite
   cleanup/restart. Missing evidence or writes retain an owned retry and never wake the agent.
   Unchanged progress must return before `updateHistory` / `Mirror.setState`: Mirror notifies
@@ -87,7 +87,7 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   coordinator forever. Test this with real Mirror subscriptions.
 - Missing Session metadata, a recoverable tombstone, or an unsynchronized
   Machine Flock document is uncertainty, not permanent deletion/configuration
-  absence. Keep the item/Delivery pending until positive evidence or deadline.
+  absence. Keep the item/result pending until positive evidence or deadline.
 - Deadlines finish the root with item `TARGET_TIMEOUT` results but never cancel
   target Turns. Operation cancel is the only best-effort remote-cancel path.
 - Store paths are keyed strictly by an explicit machineId

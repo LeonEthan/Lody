@@ -221,7 +221,11 @@ describe('durable Operation inbox', () => {
     expect(other.inbox.getBatch(b.batchId, b)?.state).toBe('unknown');
     expect(other.inbox.prepare(f.input, 'new-owner')).toBeUndefined();
     expect(other.inbox.fence(b, 'exec')).toBe(false);
-    expect(other.getDelivery('A' as SessionId, 'one').state).toBe('consumed');
+    expect(
+      (other as unknown as { db: Database.Database }).db
+        .prepare("SELECT consumed FROM inbox_results WHERE session_id='A' AND operation_id='one'")
+        .get()
+    ).toEqual({ consumed: 1 });
   });
   it('retains failed and unreleased state without granting automatic continuation', () => {
     for (const outcome of ['failed', 'unreleased'] as const) {
@@ -233,7 +237,7 @@ describe('durable Operation inbox', () => {
       if (outcome === 'unreleased') expect(f.sql.begin(f.input, 'successor')).toBe(false);
     }
   });
-  it('denies foreign batch lookup and legacy SQL submission after protocol activation', () => {
+  it('denies foreign batch lookup and has no per-result execution tables', () => {
     const f = fixture();
     f.add('one');
     f.sql.accept(f.input);
@@ -241,9 +245,13 @@ describe('durable Operation inbox', () => {
     expect(f.sql.getBatch(b.batchId, { ...f.input, userId: 'foreign' })).toBeUndefined();
     const db = new Database(f.filename);
     try {
-      expect(() =>
-        db.prepare("UPDATE delivery_execution_state SET execution_phase='started'").run()
-      ).toThrow('INBOX_PROTOCOL_REQUIRED');
+      expect(
+        db
+          .prepare(
+            "SELECT name FROM sqlite_master WHERE name IN ('deliveries','delivery_execution_state')"
+          )
+          .all()
+      ).toEqual([]);
     } finally {
       db.close();
     }
@@ -257,7 +265,7 @@ describe('durable Operation inbox', () => {
     expect(() => f.add('atomic')).toThrow('injected completion failure');
     expect(f.store.get('A' as SessionId, 'atomic').state).toBe('active');
     expect(db.prepare('SELECT * FROM inbox_results').all()).toEqual([]);
-    expect(db.prepare('SELECT * FROM deliveries').all()).toEqual([]);
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE name='deliveries'").all()).toEqual([]);
     db.close();
   });
   it('native service submits user-plus-results under the same admission as Stop', async () => {
@@ -519,7 +527,9 @@ describe('Inbox recovery and retained settlement', () => {
       }[];
       expect(batch.state).toBe('settled');
       expect(submitted).toEqual([batch.batch_id]);
-      expect(f.store.listPendingDeliveries('workspace' as WorkspaceId)).toEqual([]);
+      expect(
+        db.prepare('SELECT COUNT(*) AS count FROM inbox_results WHERE consumed=0').get()
+      ).toEqual({ count: 0 });
     } finally {
       db.close();
     }
@@ -970,7 +980,11 @@ it('owner replacement settles a crossed fence as unknown without making its memb
   stores.push(other);
   other.inbox.activate('workspace', 'replacement');
   expect(other.inbox.getBatch(batch.batchId, batch)?.state).toBe('unknown');
-  expect(other.getDelivery('A' as SessionId, 'one').state).toBe('consumed');
+  expect(
+    (other as unknown as { db: Database.Database }).db
+      .prepare("SELECT consumed FROM inbox_results WHERE session_id='A' AND operation_id='one'")
+      .get()
+  ).toEqual({ consumed: 1 });
   other.inbox.confirmReleased(f.input, 'execution-1');
   const next = { ...f.input, inputId: 'fresh' };
   other.inbox.accept(next);

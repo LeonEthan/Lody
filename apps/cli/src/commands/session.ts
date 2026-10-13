@@ -519,7 +519,6 @@ function formatVisibleTranscriptItem(item: MessageContent): string | undefined {
       operationKind: item.operationKind,
       ...(item.progressMessageId ? { progressMessageId: item.progressMessageId } : {}),
       completion: item.completion,
-      ...(item.continuation ? { continuation: item.continuation } : {}),
     });
   }
 

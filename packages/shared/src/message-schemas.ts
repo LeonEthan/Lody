@@ -3503,23 +3503,6 @@ export const OperationCompletionContentSchema = z.object({
   ]),
   progressMessageId: z.string().trim().min(1).optional(),
   completion: LodyOperationCompletionSchema,
-  continuation: z
-    .object({
-      status: z.enum(['not_started', 'uncertain']),
-      reason: z
-        .object({
-          code: z.enum([
-            'CONFIGURATION_UNAVAILABLE',
-            'DELIVERY_ATTEMPTS_EXHAUSTED',
-            'DELIVERY_EXECUTION_UNCERTAIN',
-            'COLLABORATION_STOPPED',
-          ]),
-          message: z.string(),
-        })
-        .strict(),
-    })
-    .strict()
-    .optional(),
 });
 
 export const NonSystemNoticeMessageContentSchema = z.discriminatedUnion('type', [

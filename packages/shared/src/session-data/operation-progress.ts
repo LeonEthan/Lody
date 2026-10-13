@@ -238,8 +238,6 @@ export function planOperationCompletion(
             if (item.type !== 'operation_completion' || item.deliveryId !== desired.deliveryId)
               return item;
             const next = progressMessageId ? { ...item, progressMessageId } : { ...item };
-            if (desired.continuation) next.continuation = desired.continuation;
-            else delete next.continuation;
             return next;
           }),
         }

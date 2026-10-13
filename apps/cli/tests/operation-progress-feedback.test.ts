@@ -103,15 +103,12 @@ describe('nested operation progress feedback', () => {
     const logger = { warn: vi.fn(), debug: vi.fn() };
     const store = {
       inbox: actualStore.inbox,
-      recoverOrphanedDeliveryClaims: () => 0,
-      abandonDeliveryClaimsOwnedBy: () => 0,
       listActive: () => {
         // Deterministic safety guard makes the broken version fail, never hang the runner.
         if (++scans === 20) void coordinator.stop();
         return [];
       },
       listPendingProgress: () => pending.filter((op) => !settled.has(op.operationId)),
-      listPendingDeliveries: () => [],
       close: () => actualStore.close(),
       settleProgress: (_requester: unknown, id: string) => settled.add(id),
     };

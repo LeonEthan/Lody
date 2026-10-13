@@ -324,11 +324,6 @@ type TurnRuntimeState = {
   pendingSteerConfig?: Set<Promise<void>>;
   interruptRequested: boolean;
   terminateSessionOnCancel: boolean;
-  settlement?: {
-    callback: (settlement: SessionTurnSettlement) => Promise<void>;
-    forcedOutcome?: SessionTurnSettlement;
-    completed: boolean;
-  };
   /** Logical prompt tail currently owned by the one session-owner fiber. */
   activePromptRun?: PromptHandoffRun;
   /** Serialized ancillary finalization for yielded logical turns. */
@@ -416,7 +411,7 @@ type VisibleSessionTurnOptions = {
   userTurnId?: string;
   invocation?: TurnInvocation;
   /**
-   * Turn that deterministically owns the assistant history entry. Delivery
+   * Turn that deterministically owns the assistant history entry. Inbox
    * uses its system Turn here while leaving userTurnId absent so it cannot
    * mutate user dispatch status or pointers.
    */
@@ -424,7 +419,6 @@ type VisibleSessionTurnOptions = {
   /** Goal action this turn runs; the agent receives it as prompt metadata. */
   goalControl?: GoalPromptControl;
   onTurnStarted?: () => Promise<boolean>;
-  onTurnSettled?: (settlement: SessionTurnSettlement) => Promise<void>;
   /**
    * How the turn payload reached this machine. 'rpc' turns can start before the
    * user's history entry syncs locally, so their turn-scoped history writes go
@@ -442,7 +436,7 @@ type VisibleSessionTurnPlan = {
 };
 
 /** How the turn payload reached this machine (RPC fast path vs CRDT history vs queue promotion). */
-export type SessionDispatchSource = 'rpc' | 'crdt' | 'queue' | 'delivery' | 'goal';
+export type SessionDispatchSource = 'rpc' | 'crdt' | 'queue' | 'inbox' | 'goal';
 
 type SessionDispatchOptions = {
   inboxBatch?: InboxBatch;
@@ -451,7 +445,7 @@ type SessionDispatchOptions = {
   goalControl?: GoalPromptControl;
   /**
    * Runs only after this process has synchronously claimed the per-Session
-   * visible-turn owner. Delivery uses this to append its system cause without
+   * visible-turn owner. Goal uses this to append its system cause without
    * racing a user dispatch between the idle check and the history write. False
    * means an external durable claim lost contention; the turn is released
    * without history, ACP, failure, or settlement side effects.
@@ -459,11 +453,7 @@ type SessionDispatchOptions = {
   onTurnClaimed?: () => Promise<boolean>;
   /** Runs immediately before the request can cross into the ACP provider. */
   onTurnStarted?: () => Promise<boolean>;
-  /** Reports whether the provider was handled, cancelled, never started, or left uncertain. */
-  onTurnSettled?: (settlement: SessionTurnSettlement) => Promise<void>;
 };
-
-type SessionTurnSettlement = 'handled' | 'cancelled' | 'not_started' | 'uncertain';
 
 export type PreparedSessionDispatchRequest =
   | { mode: 'create'; request: SessionCreateRequestValidated }
@@ -2135,7 +2125,6 @@ export class SessionExecutionService {
         } else switchInvocation();
         // Provider acceptance hands the original dispatch forward. A later
         // user-owned steer turn must not cancel or reopen that responsibility.
-        await this.settleVisibleTurn(runtime, 'handled', { force: true });
 
         try {
           await this.finalizeYieldedTurnOutput(runtime, options.sessionId, previousTurnId);
@@ -2663,7 +2652,7 @@ export class SessionExecutionService {
   private createTurnRuntime(
     options: Pick<
       VisibleSessionTurnOptions,
-      'sessionId' | 'session' | 'userTurnId' | 'invocation' | 'onTurnSettled' | 'goalControl'
+      'sessionId' | 'session' | 'userTurnId' | 'invocation' | 'goalControl'
     > & { turnId: string }
   ): TurnRuntimeState {
     return {
@@ -2686,30 +2675,8 @@ export class SessionExecutionService {
       interruptRequested: false,
       terminateSessionOnCancel: false,
       initializationStalled: false,
-      ...(options.onTurnSettled
-        ? { settlement: { callback: options.onTurnSettled, completed: false } }
-        : {}),
       yieldedFinalization: Promise.resolve(),
     };
-  }
-
-  private async settleVisibleTurn(
-    runtime: TurnRuntimeState,
-    outcome: SessionTurnSettlement,
-    options: { force?: boolean } = {}
-  ): Promise<void> {
-    const settlement = runtime.settlement;
-    if (!settlement || settlement.completed) return;
-    if (options.force) settlement.forcedOutcome = outcome;
-    const effectiveOutcome = settlement.forcedOutcome ?? outcome;
-    try {
-      await settlement.callback(effectiveOutcome);
-      settlement.completed = true;
-    } catch (error) {
-      this.deps.logger.error(
-        `[${runtime.sessionId}] Failed to persist ${effectiveOutcome} turn settlement: ${formatErrorMessage(error)}`
-      );
-    }
   }
 
   private getTurnRuntime(sessionId: SessionId, turnId: string): TurnRuntimeState | undefined {
@@ -4294,7 +4261,7 @@ export class SessionExecutionService {
                     Effect.tapError(() =>
                       self.ignoreWithWarning(
                         sessionId,
-                        'Failed to finalize a rejected Delivery start fence',
+                        'Failed to finalize a rejected input start fence',
                         self.tryPromise(() => self.handleTurnError(sessionId, sessionDoc))
                       )
                     )
@@ -4527,22 +4494,19 @@ export class SessionExecutionService {
 
     const fiber = Effect.runFork(program);
     runtime.fiber = fiber;
-    let settlement: SessionTurnSettlement | undefined;
     try {
       await this.awaitTurnFiber(fiber, sessionId, turnId);
       if (outcome === 'unknown') {
         outcome = 'completed';
       }
-      settlement = 'handled';
     } catch (error) {
       if (isSessionTurnClaimContended(error)) {
         outcome = 'claim-contended';
       } else if (isSessionTurnStartFenceFailed(error)) {
         outcome = 'start-fence-failed';
         this.deps.logger.warn(
-          `[${sessionId}] Delivery start fence failed before provider execution: ${formatErrorMessage(error.cause)}`
+          `[${sessionId}] Input start fence failed before provider execution: ${formatErrorMessage(error.cause)}`
         );
-        settlement = 'not_started';
       } else if (isSessionTurnHalted(error)) {
         outcome = `halted-${error.reason}`;
         await this.finalizeHaltedTurn({
@@ -4551,7 +4515,6 @@ export class SessionExecutionService {
           turnId: runtime.turnId,
           reason: error.reason,
         });
-        settlement = 'handled';
       } else if (
         isSessionTurnCancelled(error) ||
         runtime.cancelFinalized ||
@@ -4560,15 +4523,6 @@ export class SessionExecutionService {
         (await this.isUserTurnCancelled(sessionDoc, runtime.userTurnId))
       ) {
         outcome = 'cancelled';
-        const explicitlyCancelled =
-          runtime.cancelRequested ||
-          this.isTurnCancelled(sessionId, runtime.turnId) ||
-          (await this.isUserTurnCancelled(sessionDoc, runtime.userTurnId));
-        settlement = explicitlyCancelled
-          ? 'cancelled'
-          : runtime.promptStarted
-            ? 'uncertain'
-            : 'not_started';
       } else {
         await this.handleVisibleTurnUnhandledError({
           sessionId,
@@ -4581,21 +4535,12 @@ export class SessionExecutionService {
           onUnhandledError: effectiveErrorContext.onUnhandledError,
         });
         outcome = 'unhandled-error-recorded';
-        settlement =
-          options.dispatchSource === 'delivery' &&
-          runtime.promptStarted &&
-          isAgentDisconnectedError(error)
-            ? 'uncertain'
-            : 'handled';
       }
     } finally {
       if (!runtime.promptStarted) {
         this.deps.clearConversationTurn(sessionId, runtime.turnId);
       }
       span.end({ outcome, turnId });
-    }
-    if (settlement) {
-      await this.settleVisibleTurn(runtime, settlement);
     }
     if (inboxInput) {
       // Prompt completion cannot release an in-flight sandbox acquisition.
@@ -5194,9 +5139,15 @@ export class SessionExecutionService {
     message: SessionChatRequestValidated,
     dispatchOptions?: SessionDispatchOptions
   ): Promise<void> {
+    if (
+      dispatchOptions?.dispatchSource === 'inbox' &&
+      (!dispatchOptions.inboxBatch || !this.operationInbox)
+    ) {
+      throw new Error('INBOX_BATCH_REQUIRED');
+    }
     const turn = await this.prepareContinueSessionTurn(message, dispatchOptions);
     if (
-      dispatchOptions?.dispatchSource !== 'delivery' &&
+      dispatchOptions?.dispatchSource !== 'inbox' &&
       (await this.markCancelledUserTurnBeforeOwner({
         sessionId: message.sessionId,
         sessionDoc: turn.options.sessionDoc,
@@ -5231,7 +5182,7 @@ export class SessionExecutionService {
     const { sessionId, acpSessionConfig, userId, userName, userEmail, userTurnId } = message;
     // System-caused turns own an assistant entry, not a user dispatch pointer.
     const executionUserTurnId =
-      dispatchOptions?.dispatchSource === 'delivery' || dispatchOptions?.dispatchSource === 'goal'
+      dispatchOptions?.dispatchSource === 'inbox' || dispatchOptions?.dispatchSource === 'goal'
         ? undefined
         : userTurnId;
     const sessionDoc =
@@ -5759,7 +5710,7 @@ export class SessionExecutionService {
             return undefined;
           });
 
-        // Delivery has already crossed its durable start fence before prompt submission.
+        // Inbox has already crossed its durable start fence before prompt submission.
         // A disconnected transport with no observed output cannot prove non-consumption.
         // Ordinary turns retain their existing bounded stale-connection recovery.
         const promptWithStaleACPRecovery = (
@@ -5771,7 +5722,7 @@ export class SessionExecutionService {
                 const hasPromptOutput =
                   self.deps.hasPromptOutputForTurn?.(sessionId, runtime.turnId) ?? false;
                 if (
-                  dispatchOptions?.dispatchSource === 'delivery' ||
+                  dispatchOptions?.dispatchSource === 'inbox' ||
                   Boolean(dispatchOptions?.inboxBatch) ||
                   Boolean(ctx.runtime.inboxBatch) ||
                   runtime.turnId !== turnId ||
@@ -5976,12 +5927,11 @@ export class SessionExecutionService {
           requesterUserId: userId,
           inputConfig: acpSessionConfig,
         },
-        ...(dispatchOptions?.dispatchSource === 'delivery'
+        ...(dispatchOptions?.dispatchSource === 'inbox'
           ? { assistantEntryParentTurnId: userTurnId }
           : {}),
         ...(dispatchOptions?.goalControl ? { goalControl: dispatchOptions.goalControl } : {}),
         ...(dispatchOptions?.onTurnStarted ? { onTurnStarted: dispatchOptions.onTurnStarted } : {}),
-        ...(dispatchOptions?.onTurnSettled ? { onTurnSettled: dispatchOptions.onTurnSettled } : {}),
         ...(dispatchOptions?.dispatchSource
           ? { dispatchSource: dispatchOptions.dispatchSource }
           : {}),

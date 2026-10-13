@@ -6,7 +6,7 @@ import type {
   OperationCompletionContent,
 } from '@lody/shared';
 
-export const INBOX_PROTOCOL_VERSION = 1;
+export const INBOX_PROTOCOL_VERSION = 2;
 export const INBOX_PREVIEW_BYTES = 64 * 1024;
 export type InboxScope = { workspaceId: string; sessionId: string; userId: string };
 export type InboxInput = InboxScope & {
