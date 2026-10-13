@@ -54,7 +54,10 @@ export function stepOrchestrationModel(before: InboxModel, event: InboxEvent): I
   };
   switch (event) {
     case 'result':
-      if (s.next <= 3) s.queue.push(s.next++);
+      if (s.next <= 3) {
+        s.queue.push(s.next++);
+        if (s.active === 'none' && !s.paused && !s.blocked && !s.human) s.pending = [...s.queue];
+      }
       break;
     case 'human':
       s.human = true;
@@ -71,7 +74,7 @@ export function stepOrchestrationModel(before: InboxModel, event: InboxEvent): I
         s.boundary = undefined;
       } else if (s.pending.length) {
         s.active = 'automatic';
-        s.batch = s.pending.filter((n) => s.queue.includes(n));
+        s.batch = [...s.queue];
         s.pending = [];
         s.boundary = undefined;
         if (!s.batch.length) release();
@@ -123,7 +126,7 @@ export function stepOrchestrationModel(before: InboxModel, event: InboxEvent): I
       }
       break;
     case 'duplicate_release':
-      break; // immutable boundary never acquires late results
+      break; // duplicate release cannot create another intent
   }
   assertOrchestrationModelSafety(s);
   return s;

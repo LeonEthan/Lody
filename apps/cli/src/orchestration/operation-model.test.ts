@@ -11,14 +11,15 @@ describe('current Inbox scheduling contract', () => {
   it('exhaustively preserves nonempty at-most-once batches over bounded interleavings', () => {
     expect(enumerateOrchestrationModel(9).length).toBeGreaterThan(100);
   });
-  it('result arrival alone cannot wake an idle conversation', () => {
+  it('wakeable results coalesce before an idle conversation is scheduled', () => {
     expect(trace('result', 'result', 'schedule')).toMatchObject({
-      active: 'none',
+      active: 'automatic',
+      batch: [1, 2],
       queue: [1, 2],
       receipts: [],
     });
   });
-  it('normal release snapshots queued results and duplicate events never include late data', () => {
+  it('claim includes late results without duplicate release creating another wake', () => {
     expect(
       trace(
         'human',
@@ -33,7 +34,12 @@ describe('current Inbox scheduling contract', () => {
         'schedule',
         'submit'
       )
-    ).toMatchObject({ active: 'automatic', batch: [1, 2], receipts: [[1, 2]], queue: [1, 2, 3] });
+    ).toMatchObject({
+      active: 'automatic',
+      batch: [1, 2, 3],
+      receipts: [[1, 2, 3]],
+      queue: [1, 2, 3],
+    });
   });
   it('Stop blocks automatic work until fresh human input, which carries saved results', () => {
     expect(

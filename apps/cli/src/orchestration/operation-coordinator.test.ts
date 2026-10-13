@@ -48,6 +48,7 @@ const makeHarness = async (options?: {
   configurationSyncSucceeds?: boolean;
   configurationSync?: () => Promise<boolean>;
   beforeTurnClaim?: () => Promise<void>;
+  afterTurnComplete?: () => void;
   beforeTargetMetaRead?: () => Promise<void>;
   now?: () => number;
   machineAgentConfig?: AgentConfigMeta;
@@ -229,23 +230,39 @@ const makeHarness = async (options?: {
   };
   let pendingUser = options?.pendingUser ?? false;
   let busy = options?.busy ?? false;
-  const continueSession = vi.fn(async (message: unknown) => {
-    const typedMessage = message as { sessionId: SessionId; userTurnId: string };
-    await options?.beforeTurnClaim?.();
-    const assistantTurnId = `assistant:${typedMessage.userTurnId}`;
-    histories.set(typedMessage.sessionId, [
-      ...(histories.get(typedMessage.sessionId) ?? []),
-      {
-        id: assistantTurnId,
-        role: 'assistant',
-        userTurnId: typedMessage.userTurnId,
-        timestamp: '2026-07-20T00:00:01.000Z',
-        items: [{ type: 'text', text: 'continued' }],
-        fileDiff: [],
-        finished: true,
-      },
-    ]);
-  });
+  const continueSession = vi.fn(
+    async (message: unknown, dispatch?: { inboxBatch?: import('./inbox/model').InboxBatch }) => {
+      const typedMessage = message as { sessionId: SessionId; userTurnId: string };
+      await options?.beforeTurnClaim?.();
+      const assistantTurnId = `assistant:${typedMessage.userTurnId}`;
+      const batch = dispatch?.inboxBatch;
+      const executionStore = batch
+        ? new LodyOperationStore(storePath, () => TEST_NOW_MS)
+        : undefined;
+      if (batch && executionStore) {
+        expect(executionStore.inbox.begin(batch, assistantTurnId)).toBe(true);
+        expect(executionStore.inbox.fence(batch, assistantTurnId)).toBe(true);
+      }
+      histories.set(typedMessage.sessionId, [
+        ...(histories.get(typedMessage.sessionId) ?? []),
+        {
+          id: assistantTurnId,
+          role: 'assistant',
+          userTurnId: typedMessage.userTurnId,
+          timestamp: '2026-07-20T00:00:01.000Z',
+          items: [{ type: 'text', text: 'continued' }],
+          fileDiff: [],
+          finished: true,
+        },
+      ]);
+      if (batch && executionStore) {
+        executionStore.inbox.settle(batch, 'settled');
+        executionStore.inbox.release({ ...batch, executionId: assistantTurnId, outcome: 'normal' });
+        executionStore.close();
+      }
+      options?.afterTurnComplete?.();
+    }
+  );
   const logger = { warn: vi.fn(), debug: vi.fn() };
   const syncMachineFlockDoc = vi.fn(
     async () =>
@@ -928,7 +945,9 @@ describe('LodyOperationCoordinator', () => {
   )(
     'reconciles target $terminal after root $reason, delivery and daemon restart without another continuation',
     async ({ reason, terminal }) => {
+      const completed = Promise.withResolvers<void>();
       const harness = await makeHarness({
+        afterTurnComplete: () => completed.resolve(),
         operationKind: 'session_create',
         deadlineAt: reason === 'deadline' ? '2026-07-19T23:59:59.000Z' : '2026-07-21T00:00:00.000Z',
       });
@@ -986,12 +1005,13 @@ describe('LodyOperationCoordinator', () => {
       expect(status()).toBe('running');
       expect(read().pending).toHaveLength(1);
       harness.metas.set(harness.targetSessionId, meta);
+      await completed.promise;
       const rootResult = read().completion;
       const requesterBefore = harness.histories.get(harness.requesterSessionId) ?? [];
       const continuationIds = requesterBefore
         .filter((row) => row.role === 'assistant')
         .map((row) => row.id);
-      expect(continuationIds).toHaveLength(0);
+      expect(continuationIds).toHaveLength(1);
       await harness.coordinator.stop();
       // Opening the same SQLite store must restore observation even with no active Operation or runnable intent.
       harness.coordinator.start();

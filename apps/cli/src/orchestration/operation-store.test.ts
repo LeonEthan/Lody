@@ -113,7 +113,7 @@ describe('LodyOperationStore', () => {
           expect(connection.raw.prepare('SELECT sequence FROM inbox_results').all()).toEqual([
             { sequence: 1 },
           ]);
-          expect(yield* inbox.pending(input.workspaceId)).toEqual([]);
+          expect(yield* inbox.pending(input.workspaceId)).toHaveLength(1);
           expect(() =>
             connection.withImmediate((() => {
               connection.raw.exec("UPDATE operations SET state='active'");
@@ -221,13 +221,13 @@ describe('LodyOperationStore', () => {
       expect(db.prepare('SELECT operation_id FROM inbox_results').all()).toEqual([
         { operation_id: active.operationId },
       ]);
-      expect(store.inbox.pending('workspace-1')).toEqual([]);
+      expect(store.inbox.pending('workspace-1')).toHaveLength(1);
     } finally {
       store.close();
     }
   });
 
-  it('keeps passive results idle, but counts an authorized intent and retained execution as work', async () => {
+  it('counts wakeable queued receipts and retained execution as work; pause makes receipts passive', async () => {
     const store = await makeStore();
     const op = baseInput();
     const input = {
@@ -244,7 +244,7 @@ describe('LodyOperationStore', () => {
       expect(store.hasPendingWorkForRequester(op.workspaceId, op.requesterSessionId)).toBe(true);
       store.finish(op.requesterSessionId, op.operationId, { type: 'cancelled' });
       expect(queuedResults(store, op.workspaceId)).toHaveLength(1);
-      expect(store.hasPendingWorkForRequester(op.workspaceId, op.requesterSessionId)).toBe(false);
+      expect(store.hasPendingWorkForRequester(op.workspaceId, op.requesterSessionId)).toBe(true);
       store.inbox.accept(input);
       store.inbox.begin(input, 'execution');
       expect(store.hasPendingWorkForRequester(op.workspaceId, op.requesterSessionId)).toBe(true);

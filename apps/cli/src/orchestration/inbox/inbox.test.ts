@@ -88,21 +88,94 @@ async function runInboxChild(root: string, source: string): Promise<string> {
 }
 
 describe('durable Operation inbox', () => {
-  it('records an empty boundary; late completion and duplicate release never create a wake', () => {
+  it('an idle wakeable receipt survives reopen and duplicate release creates no second intent', () => {
     const f = fixture();
     f.start();
     f.release();
+    expect(f.sql.pending('workspace')).toEqual([]);
     f.add('late');
     f.release();
-    expect(f.sql.pending('workspace')).toEqual([]);
+    expect(f.sql.pending('workspace')).toHaveLength(1);
     const second = new LodyOperationStore(f.filename);
     stores.push(second);
     second.inbox.activate('workspace', 'replacement');
-    expect(second.inbox.pending('workspace')).toEqual([]);
-    const input = { ...f.input, inputId: 'fresh' };
-    second.inbox.accept(input);
-    expect(second.inbox.prepare(input, 'replacement')?.memberCount).toBe(1);
+    const [intent] = second.inbox.pending('workspace');
+    const batch = second.inbox.prepare(intent.input, 'replacement', intent.intentId)!;
+    expect(second.inbox.members(batch).map((m) => m.operationId)).toEqual(['late']);
   });
+  it('idle wake-intent failure rolls back completion and duplicate completion cannot create another batch', () => {
+    const f = fixture();
+    const db = new Database(f.filename);
+    db.exec(
+      "CREATE TRIGGER fail_idle_intent BEFORE INSERT ON inbox_intents BEGIN SELECT RAISE(ABORT,'intent outage'); END;"
+    );
+    expect(() => f.add('wake')).toThrow('intent outage');
+    expect(f.store.get('A' as SessionId, 'wake').state).toBe('active');
+    expect(db.prepare('SELECT COUNT(*) AS n FROM inbox_results').get()).toEqual({ n: 0 });
+    expect(f.sql.pending('workspace')).toEqual([]);
+    db.exec('DROP TRIGGER fail_idle_intent');
+    f.add('wake');
+    f.add('wake');
+    expect(f.sql.pending('workspace')).toHaveLength(1);
+    const [intent] = f.sql.pending('workspace');
+    const batch = f.sql.prepare(intent.input, 'owner', intent.intentId)!;
+    expect(batch.memberCount).toBe(1);
+    f.sql.begin(batch, 'auto');
+    f.sql.fence(batch, 'auto');
+    f.sql.settle(batch, 'unknown');
+    f.sql.release({ ...batch, executionId: 'auto', outcome: 'failed' });
+    f.add('wake');
+    expect(f.sql.pending('workspace')).toEqual([]);
+    db.close();
+  });
+  it('one wakeable receipt carries passive results and claim fixes membership across workers', () => {
+    const f = fixture();
+    f.start();
+    f.add('passive');
+    const db = new Database(f.filename);
+    db.exec('UPDATE inbox_results SET automatic_eligible=0');
+    f.release();
+    expect(f.sql.pending('workspace')).toEqual([]);
+    f.add('wake');
+    f.add('coalesced');
+    const [intent] = f.sql.pending('workspace');
+    expect(f.sql.pending('workspace')).toHaveLength(1);
+    const batch = f.sql.prepare(intent.input, 'owner', intent.intentId)!;
+    f.add('after-claim');
+    const other = new LodyOperationStore(f.filename);
+    stores.push(other);
+    expect(other.inbox.prepare(intent.input, 'owner', intent.intentId)?.batchId).toBe(
+      batch.batchId
+    );
+    expect(f.sql.members(batch).map((m) => m.operationId)).toEqual([
+      'passive',
+      'wake',
+      'coalesced',
+    ]);
+    expect(f.sql.begin(batch, 'auto')).toBe(true);
+    expect(f.sql.fence(batch, 'auto')).toBe(true);
+    f.sql.settle(batch, 'settled');
+    f.sql.release({ ...batch, executionId: 'auto', outcome: 'normal' });
+    const [next] = f.sql.pending('workspace');
+    expect(
+      f.sql.members(f.sql.prepare(next.input, 'owner', next.intentId)!).map((m) => m.operationId)
+    ).toEqual(['after-claim']);
+    db.close();
+  });
+  it.each(['user_stop', 'unreleased'] as const)(
+    'late wakeable receipts cannot bypass %s, including restart',
+    (outcome) => {
+      const f = fixture();
+      f.start();
+      if (outcome === 'user_stop') expect(f.sql.pause(f.input, 'execution-1')).toBe(true);
+      f.release(outcome);
+      f.add('late');
+      const other = new LodyOperationStore(f.filename);
+      stores.push(other);
+      other.inbox.activate('workspace', 'replacement');
+      expect(other.inbox.pending('workspace')).toEqual([]);
+    }
+  );
   it('keeps eight arrivals passive until one normal release and one fixed batch', () => {
     const f = fixture();
     f.start();
@@ -110,9 +183,9 @@ describe('durable Operation inbox', () => {
     expect(f.sql.pending('workspace')).toEqual([]);
     f.release();
     const [intent] = f.sql.pending('workspace');
+    const batch = f.sql.prepare(intent.input, 'owner', intent.intentId)!;
     f.add('late-nine');
     f.release();
-    const batch = f.sql.prepare(intent.input, 'owner', intent.intentId)!;
     expect(batch.memberCount).toBe(8);
     expect(f.sql.members(batch).map((x) => x.operationId)).toEqual(
       Array.from({ length: 8 }, (_, n) => `result-${n}`)
@@ -136,7 +209,7 @@ describe('durable Operation inbox', () => {
     f.sql.release({ ...b, executionId: 'auto', outcome: 'normal' });
     expect(f.sql.pending('workspace')).toEqual([]);
   });
-  it('reopens a pending released intent without any new event and excludes the ninth', () => {
+  it('reopens a pending intent and includes arrivals before claim', () => {
     const f = fixture();
     f.start();
     f.add('one');
@@ -147,7 +220,7 @@ describe('durable Operation inbox', () => {
     other.inbox.activate('workspace', 'new-owner');
     const [intent] = other.inbox.pending('workspace');
     const b = other.inbox.prepare(intent.input, 'new-owner', intent.intentId)!;
-    expect(other.inbox.members(b).map((x) => x.operationId)).toEqual(['one']);
+    expect(other.inbox.members(b).map((x) => x.operationId)).toEqual(['one', 'late']);
   });
   it('atomically settles an intent that lost its eligible members without creating an empty batch', () => {
     const f = fixture();
@@ -341,7 +414,7 @@ describe('durable Operation inbox', () => {
     expect(replacement.memberCount).toBe(1);
     expect(f.sql.getBatch(automatic.batchId, automatic)?.state).toBe('superseded');
   });
-  it('startup native worker recovers one fixed batch without injecting any new event', async () => {
+  it('startup native worker coalesces pending arrivals without injecting any new event', async () => {
     const f = fixture();
     f.start();
     for (let n = 0; n < 8; n++) f.add(`saved-${n}`);
@@ -377,7 +450,10 @@ describe('durable Operation inbox', () => {
             yield* Deferred.await(done);
           }).pipe(Effect.provide(layer));
           expect(received).toHaveLength(1);
-          expect(received[0].ids).toEqual(Array.from({ length: 8 }, (_, n) => `saved-${n}`));
+          expect(received[0].ids).toEqual([
+            ...Array.from({ length: 8 }, (_, n) => `saved-${n}`),
+            'late-nine',
+          ]);
         })
       )
     );
@@ -923,7 +999,7 @@ it('Stop at the normal-release gap supersedes the fixed intent before an extra e
   expect(f.sql.accept({ ...f.input, kind: 'task', inputId: 'reply' })).toBe(false);
 });
 
-it('retries a failed normal-release write with its first watermark, excluding late arrivals', async () => {
+it('retries release recording and snapshots all queued arrivals at claim', async () => {
   const f = fixture();
   const db = new Database(f.filename);
   const deps = Layer.merge(
@@ -963,7 +1039,7 @@ it('retries a failed normal-release write with its first watermark, excluding la
     );
     const intent = f.sql.pending('workspace')[0]!;
     const batch = f.sql.prepare(intent.input, 'owner', intent.intentId)!;
-    expect(f.sql.members(batch).map((m) => m.operationId)).toEqual(['first']);
+    expect(f.sql.members(batch).map((m) => m.operationId)).toEqual(['first', 'late']);
   } finally {
     db.close();
   }
@@ -1107,7 +1183,7 @@ it('expires consumed copied payloads with Operations, retaining unconsumed resul
   db.close();
 });
 
-it('an OS child recovers the fixed eight-member intent without any new event', async () => {
+it('an OS child recovers the wake intent and claims all nine queued receipts', async () => {
   const f = fixture();
   f.start();
   for (let i = 0; i < 8; i++) f.add(`result-${i}`);
@@ -1145,16 +1221,16 @@ it('an OS child recovers the fixed eight-member intent without any new event', a
     store.close(); process.stdout.write(JSON.stringify(received));
   `
   );
-  expect(JSON.parse(stdout)).toEqual([Array.from({ length: 8 }, (_, i) => `result-${i}`)]);
+  expect(JSON.parse(stdout)).toEqual([
+    [...Array.from({ length: 8 }, (_, i) => `result-${i}`), 'late-nine'],
+  ]);
   const reopened = new LodyOperationStore(f.filename);
   stores.push(reopened);
   reopened.inbox.activate('workspace', 'parent');
   expect(reopened.inbox.pending('workspace')).toEqual([]);
   const fresh = { ...f.input, inputId: 'fresh' };
   reopened.inbox.accept(fresh);
-  expect(
-    reopened.inbox.members(reopened.inbox.prepare(fresh, 'parent')!).map((m) => m.operationId)
-  ).toEqual(['late-nine']);
+  expect(reopened.inbox.prepare(fresh, 'parent')).toBeUndefined();
 });
 
 it('persists recovery blocking when a repeated release contradicts its original receipt', () => {

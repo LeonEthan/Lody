@@ -49,9 +49,9 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
   paths must not add blocking waits on top of the driver's `busy_timeout`.
 - `operation-model.ts` is the reduced executable race model. Update its bounded
   exploration and concrete traces whenever scheduling semantics change.
-- Inbox result arrival only persists. Automatic dispatch requires a unique normal-release
-  boundary with fixed watermark and nonempty eligible members; empty and duplicate boundaries
-  never resnapshot or wake. Late results wait for fresh input or another normal boundary.
+- Inbox receipts carry wake eligibility. Idle/unpaused/released Sessions persist one coalesced
+  wake intent in the completion transaction; busy Sessions wait for normal release. At claim,
+  require a wakeable result and freeze all unconsumed/unclaimed queue members. Post-claim arrivals wait; pause, empty queues and duplicates cannot wake.
 - `inbox/service.ts` is native Effect v4. Scope owns its signal/fibers and repository connection;
   one per-Session admission covers Stop, trusted human acceptance and actual transport start.
   Core imports no platform/consumers; registered bridges execute. Submit/settle through execution owners.

@@ -153,7 +153,7 @@ export class InboxSqlite {
     }).immediate();
   }
 
-  /** Called inside the Operation completion transaction; arrival grants no execution. */
+  /** Persist the receipt and idle wake intent in the same Operation completion transaction. */
   indexCompletion(operation: StoredLodyOperation): void {
     if (!operation.completion || !operation.finishedAt) throw new Error('Missing completion');
     if (
@@ -182,6 +182,67 @@ export class InboxSqlite {
         operation.finishedAt,
         operation.initiatorChainDepth,
         JSON.stringify(operation.completion)
+      );
+    this.requestAutomatic(
+      {
+        workspaceId: operation.workspaceId,
+        sessionId: operation.requesterSessionId,
+        userId: operation.requesterUserId,
+      },
+      operation.frozenContinuationConfig.inputConfig ?? {},
+      `completion:${value}`
+    );
+  }
+  private requestAutomatic(
+    scope: InboxScope,
+    config: InboxInput['config'],
+    executionId: string
+  ): void {
+    this.ensure(scope);
+    if (
+      this.db
+        .prepare(
+          'SELECT 1 FROM inbox_sessions WHERE workspace_id=? AND session_id=? AND (paused=1 OR blocked=1 OR active_execution IS NOT NULL)'
+        )
+        .get(scope.workspaceId, scope.sessionId)
+    )
+      return;
+    if (
+      this.db
+        .prepare(
+          'SELECT 1 FROM inbox_inputs WHERE workspace_id=? AND session_id=? AND canceled=0 AND finished=0'
+        )
+        .get(scope.workspaceId, scope.sessionId)
+    )
+      return;
+    if (
+      this.db
+        .prepare(
+          "SELECT 1 FROM inbox_intents WHERE workspace_id=? AND session_id=? AND state IN ('pending','prepared')"
+        )
+        .get(scope.workspaceId, scope.sessionId)
+    )
+      return;
+    const watermark = this.watermark(scope);
+    if (!this.available(scope, watermark, true).length) return;
+    const input: InboxInput = {
+      ...scope,
+      config,
+      kind: 'automatic',
+      inputId: `inbox:${executionId}`,
+    };
+    this.db
+      .prepare(
+        "INSERT INTO inbox_intents(intent_id,workspace_id,session_id,user_id,execution_id,watermark,input_json,state) VALUES(?,?,?,?,?,?,?,'pending')"
+      )
+      .run(
+        randomUUID(),
+        scope.workspaceId,
+        scope.sessionId,
+        scope.userId,
+        executionId,
+        watermark,
+        JSON.stringify(input)
       );
   }
   hasRunnableWork(workspaceId: string, sessionId: string): boolean {
@@ -687,21 +748,7 @@ export class InboxSqlite {
         (accepted ?? prepared)?.revision !== current.revision
       )
         return;
-      const members = this.available(event, watermark, true);
-      if (!members.length) return;
-      this.db
-        .prepare(
-          "INSERT INTO inbox_intents(intent_id,workspace_id,session_id,user_id,execution_id,watermark,input_json,state) VALUES(?,?,?,?,?,?,?,'pending')"
-        )
-        .run(
-          randomUUID(),
-          event.workspaceId,
-          event.sessionId,
-          event.userId,
-          event.executionId,
-          watermark,
-          JSON.stringify({ ...event, kind: 'automatic', inputId: `inbox:${event.executionId}` })
-        );
+      this.requestAutomatic(event, event.config, event.executionId);
     });
   }
   registerResources(
@@ -913,9 +960,24 @@ export class InboxSqlite {
           .get(input.workspaceId, input.sessionId, input.inputId, input.userId)
       )
         return undefined;
-      if (input.kind === 'automatic' && (!intent || current.active_execution)) return undefined;
-      const watermark = intent?.watermark ?? this.watermark(input);
-      const members = this.available(input, watermark, input.kind === 'automatic');
+      if (
+        input.kind === 'automatic' &&
+        (!intent ||
+          current.active_execution ||
+          this.db
+            .prepare(
+              'SELECT 1 FROM inbox_inputs WHERE workspace_id=? AND session_id=? AND canceled=0 AND finished=0'
+            )
+            .get(input.workspaceId, input.sessionId))
+      )
+        return undefined;
+      // Wake eligibility triggers admission; membership includes the whole available queue.
+      // Freeze the watermark only when the batch is claimed, never at intent creation.
+      const watermark = this.watermark(input);
+      const members =
+        input.kind === 'automatic' && !this.available(input, watermark, true).length
+          ? []
+          : this.available(input, watermark, false);
       if (!members.length) {
         if (intentId)
           this.db
@@ -967,8 +1029,10 @@ export class InboxSqlite {
       }
       if (intentId)
         this.db
-          .prepare("UPDATE inbox_intents SET state='prepared',batch_id=? WHERE intent_id=?")
-          .run(batchId, intentId);
+          .prepare(
+            "UPDATE inbox_intents SET state='prepared',batch_id=?,watermark=? WHERE intent_id=?"
+          )
+          .run(batchId, watermark, intentId);
       return this.getBatch(batchId, input);
     });
   }

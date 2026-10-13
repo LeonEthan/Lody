@@ -98,7 +98,7 @@ independent retry entry. Old coordinator handoff and per-result execution APIs a
 an independent connection to retry only settlement/release/pause writes. The original
 failed close receipt remains unchanged; requests are never resubmitted.
 
-Only a confirmed normal release can grant an automatic intent. Inbox-aware Stop cancels queued
+A wakeable receipt grants an automatic intent when idle; normal release grants one for queued wakeable receipts. Inbox-aware Stop cancels queued
 human execution eligibility and pauses automatic work. Fresh human input carries saved
 results, and a failed/unreleased execution cannot manufacture another wake. See the
 [contract](../../../../specs/session-orchestration.md#idempotent-message-consumption).
@@ -117,8 +117,9 @@ Batch membership is immutable. History projection is an idempotent stable-ID wri
 | Transition | Atomic write set and conditions |
 | --- | --- |
 | Operation completion → queued | Existing completion row plus idempotent result index; never depend on post-commit notification |
-| First normal release → boundary record/pending intent | Require verified normal release and no existing record; atomically save the unique release record and fixed watermark. Create pending intent only with eligible results through that watermark; otherwise terminate here. Duplicates cannot resnapshot |
-| Pending intent → prepared/settled_empty | Conditionally claim intent and query all eligible results through its watermark. Only nonempty results atomically create fixed batch/members, live claims and input binding. Empty results atomically settle intent as terminal settled_empty without batch/execution or reactivation. Pending human input prevents this automatic branch |
+| Completion → queued receipt/pending intent | Persist result and wake eligibility in the completion transaction. If idle, unpaused, unblocked, without accepted input or an existing live intent, record one pending intent. Busy/paused results stay queued |
+| First normal release → boundary record/pending intent | Atomically save the unique release record. Create one pending intent only if wakeable results remain and no queued input takes priority. Duplicate releases never grant another intent |
+| Pending intent → prepared/settled_empty | Conditionally claim intent, snapshot the current queue watermark, require a wakeable result and include all unconsumed/unclaimed results through that watermark. Only nonempty results atomically create fixed batch/members, live claims and input binding. Empty results atomically settle intent as terminal settled_empty without batch/execution or reactivation. Pending human input prevents this automatic branch |
 | Human input → prepared/original batch-free path | With results, bind trusted input receipt to a nonempty batch; without results, create no batch and retain the ordinary human-input path. Freeze original prompt/attachments/configuration |
 | Unsubmitted automatic batch → yield to human | Require old batch still prepared; supersede old intent/batch, transfer all live claims, create new fixed membership and human-input binding in one transaction. Failure rolls everything back; never release and bind in separate transactions |
 | Prepared → submitting | Under the shared gate, conditionally update owner/pause/acceptance sequence/execution identity/claim/binding, also verify automatic batch memberCount > 0, and persist unique submission token; immediately start transport afterward |
@@ -126,13 +127,13 @@ Batch membership is immutable. History projection is an idempotent stable-ID wri
 | Submitting → submitted/unknown | Persist receipt and retain non-resubmittable members. Unknown never returns to prepared/queued. Proven non-invocation records not_submitted for the recovery entry, without automatic replay |
 | Submitted/unknown → settled | Update settlement/consumption and Cause only; duplicate settlement is idempotent and invokes no provider. Settled uncertainty is not confirmed model success |
 
-Use `BEGIN IMMEDIATE` for claims. Automatic batches use their intent's saved watermark; human preparation snapshots the current watermark. The replacement batch may include newly available results; old membership history stays unchanged. Post-claim arrivals remain queued. History failure is pre-submission; uncertainty beyond the fence remains unknown and rebuilding history cannot restore submission eligibility.
+Use `BEGIN IMMEDIATE` for claims. All batches snapshot the current watermark at claim. Wake eligibility grants admission, not a membership filter. The replacement batch may include newly available results; old membership history stays unchanged. Post-claim arrivals remain queued. History failure is pre-submission; uncertainty beyond the fence remains unknown and rebuilding history cannot restore submission eligibility.
 
 ### Storage and retirement
 
 Operation completion writes directly into `inbox_results` in the same transaction;
 there is no Delivery table, insert trigger or separate per-result execution claim.
-A persistent sequence counter survives deletion so late results cannot enter an old watermark.
+A persistent sequence counter survives deletion so post-claim results cannot enter a fixed batch.
 Settlement records consumption time; consumed payloads expire after seven days, while
 unfinished creation progress keeps its Operation until projection is settled. Retired
 Operation IDs still prevent replay. Pending result data is passive, not busy work;

@@ -8,13 +8,13 @@ Translation: current
 
 ## Abstract
 
-Per-result continuations and reverse task chat could repeatedly restart conversations. Results now persist without waking an idle Session; confirmed normal release delivers one fixed, nonempty batch, while Stop defers results until fresh human input. A native Effect kernel owns durable scheduling and admission, with an explicitly temporary Session/ACP adapter. This PR candidate is implemented, but independent re-review, Spec approval and model/desktop acceptance remain outstanding.
+Per-result continuations and reverse task chat could repeatedly restart conversations. Wakeable completion receipts now resume idle, unpaused Sessions through one coalesced queue batch; busy Sessions wait for normal release, while Stop defers results until fresh human input. A native Effect kernel owns durable scheduling and admission, with an explicitly temporary Session/ACP adapter. This PR candidate is implemented, but independent re-review, Spec approval and model/desktop acceptance remain outstanding.
 
 ## Decision and rationale
 
 The [Session orchestration Spec](../../../../specs/session-orchestration.md) owns behavior; the [orchestration README](../../../../apps/cli/src/orchestration/README.md#completion-consumption) owns implementation and transaction contracts. This record consolidates the former investigation, reverse-chat note, design and implementation plan; their earlier revisions remain in Git history.
 
-- Result arrival grants no execution permission. Actual normal release records one immutable watermark, including empty boundaries; only eligible, nonempty membership grants an automatic intent. Restart recovers that intent without a new event. Late results and duplicate releases cannot enlarge it.
+- Wakeable completion receipts persist an idle scheduling intent atomically with completion. Busy Sessions defer until normal release. Claim snapshots all available queue members, including passive results; only post-claim membership is immutable. Restart recovers unsubmitted intents; duplicates and empty queues cannot restart work.
 - Inbox-aware Stop persists pause before cancellation. Pre-Stop queued inputs retain their history but lose execution eligibility; fresh human input carries result data, not canceled instructions. Human text, configuration and causal depth remain unchanged. Agent-authored tasks cannot clear pause.
 - Stop, trusted human acceptance and actual transport start share admission. Unknown submission never replays, including user-plus-batch stale-ACP recovery; only settlement retries. Scope closure or canceled waiting does not prove resource release.
 - B cannot chat back to A while A's exact Agent-authored input drives B. Single, batch and legacy paths reject before new work with `REVERSE_CHAT_FORBIDDEN`; subsequent independent input replaces that scope. This avoids a new task graph or task/note tools, but does not guarantee prevention of longer cycles or repeated outbound delegation.
@@ -178,3 +178,9 @@ Tests observe full provider inputs, durable rows and actual release with Deferre
 The revised candidate requires independent re-review; the Spec stays draft. Once all Lody endpoints and Agent adapters fully support ACP steer, reconsider batched delivery during execution with application, pause, cancellation and unknown-delivery tests. This is a future maintenance condition, not current behavior or a scheduled reminder.
 
 [PR #1523](https://github.com/LodyAI/Lody/pull/1523).
+
+## Receipt-driven idle wake revision (2026-10-13)
+
+Human testing found that A delegates to B and finishes before B: the prior passive-arrival contract strands the expected continuation. The user approved a queue-based wake marker. Existing `automatic_eligible` now grants scheduling eligibility, not a membership filter. Completion creates a coalesced durable intent when idle, unpaused, unblocked and without accepted input. Preparation snapshots the current queue and claims both wakeable and passive results atomically. Prepared/submitted/unknown batches retain fixed membership and non-replay; queued human input and Stop retain priority. The Spec remains draft.
+
+Tests retain real SQLite rollback, dual-connection claims, process reopen, physical release and no-replay coverage. Prior fixed-release-watermark expectations are replaced by claim-time coalescing; post-claim arrivals still form a separate batch. Coordinator fixtures now settle the real submission receipt rather than merely append mock output. The changed intersection passes 4 suites / 158 cases in the author worktree, including atomic intent failure, passive-plus-wakeable batching, post-claim isolation, paused/unreleased restart, and duplicate/unknown non-replay. Direct CLI types, root check:quick, format and docs pass. Root pnpm check stops at the existing Claude source/installed SDK mismatch; this is not full-root acceptance. Cloud integration and interactive desktop behavior remain separate validation boundaries.

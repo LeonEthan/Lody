@@ -146,19 +146,27 @@ not promise simultaneous cancellation or rollback of already performed work.
 
 ## Idempotent message consumption
 
-Result arrival only persists; it never starts a model. Normal completion and actual
-release atomically record one immutable boundary and queue watermark. Only nonempty
-eligible results within that watermark create an intent. Submit all members in one
-input without waiting for an expected total. Empty/duplicate boundaries and late
-results cannot grant additional wakes. Reopen recovers recorded, provably unsubmitted
-intents; a backlog alone cannot create one.
+Operation completion receipts enter the durable Inbox with wake eligibility. If a
+Session is idle, unpaused and has no unreleased resources or accepted queued input,
+one wakeable receipt grants a persistent automatic intent. Busy Sessions defer
+consumption until normal completion and actual release. Stop blocks receipt-driven
+wakes until fresh trusted human input. Result persistence and wake intent creation
+share the completion transaction; reopen recovers an unsubmitted intent without a new event.
+
+Wake eligibility is distinct from membership: one wakeable receipt carries all
+unconsumed, unclaimed results in the same Session/User queue, including passive
+results. Snapshot the queue watermark and freeze members only when claiming the
+batch. Arrivals before claim coalesce; arrivals after claim stay queued for a later
+batch. Duplicate receipts/releases never create duplicate execution; empty queues
+never start a model. Submitted or unknown members never re-enter another batch.
 
 Stop, trusted human acceptance and actual transport initiation share Session admission.
 Inbox-aware Stop persists pause before cancellation and cancels pre-Stop queued input eligibility
 while retaining history. Fresh human input carries saved results; old instructions
 require a new send. Agent chat, role, userId and author cannot clear pause. Failed exits
 never auto-continue; unreleased resources block all successors. Normal future human
-turns resume the same normal-release rule.
+turns resume the same receipt-driven scheduling rule. A failed exit alone grants no
+wake, but a later wakeable receipt may grant one after physical resource release.
 
 Missing or incomplete recovery journals must remain visible and recoverable. A local
 operator may explicitly attest that all old resources, including unrecorded ones,
