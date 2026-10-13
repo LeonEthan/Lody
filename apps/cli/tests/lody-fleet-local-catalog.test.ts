@@ -1,19 +1,20 @@
-import { describe, expect, it, vi } from 'vitest';
-import { Effect } from 'effect';
+import { createLocalCloudPort, type CloudPort } from '@lody/platform';
 import {
   type LocalSessionControlRequest,
   type LocalSessionControlResponse,
   type MachineId,
   type SessionId,
 } from '@lody/shared';
-import { LodyFleet } from '../src/lib/lody-fleet';
+import { Effect } from 'effect';
+import { describe, expect, it, vi } from 'vitest';
 import {
   CatalogPermissionError,
   type LocalWorkspaceCatalogService,
   type LocalWorkspaceCatalogSnapshot,
 } from '../src/lib/local-workspace-catalog';
+import { Lody } from '../src/lib/lody';
+import { LodyFleet } from '../src/lib/lody-fleet';
 import type { Logger } from '../src/utils/logger';
-import { createLocalCloudPort, type CloudPort } from '@lody/platform';
 
 const createTestCloudPort = (
   watchWorkspaceAccess?: CloudPort['access']['watchWorkspaceAccess']
@@ -473,4 +474,59 @@ it('retains the failed workspace owner and retries only its unresolved cleanup p
     'resource released',
     'poller released',
   ]);
+});
+
+it('production startup retry recovers the retained owner before attempting another workspace', async () => {
+  vi.useFakeTimers();
+  const trace: string[] = [];
+  let releaseFails = true;
+  const create = vi.spyOn(Lody, 'create').mockImplementation(async () => {
+    trace.push('create');
+    if (trace.filter((step) => step === 'create').length > 1)
+      throw new Error('next startup reached');
+    return {
+      start: async () => {
+        trace.push('start failed');
+        throw new Error('startup failed');
+      },
+      cleanup: async () => {
+        trace.push(releaseFails ? 'release failed' : 'released');
+        if (releaseFails) throw new Error('temporary release failure');
+      },
+    } as never;
+  });
+  const fleet = createFleetHarness(createCatalogStub(() => Effect.succeed(catalogSnapshot({}))))
+    .fleet as unknown as {
+    desiredWorkspaces: Map<string, unknown>;
+    startupCleanupOwners: Map<string, unknown>;
+    retryTimers: Map<string, ReturnType<typeof setTimeout>>;
+    startWorkspace(workspace: never): Promise<void>;
+    stopped: boolean;
+  };
+  // This harness normally replaces startup; restore the production entry.
+  delete (fleet as unknown as { startWorkspace?: unknown }).startWorkspace;
+  const workspace = { id: 'recovery', name: 'Recovery', slug: 'recovery', role: 'owner' };
+  fleet.desiredWorkspaces.set(workspace.id, workspace);
+  try {
+    await fleet.startWorkspace(workspace as never);
+    expect(fleet.startupCleanupOwners.has(workspace.id)).toBe(true);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(trace).toEqual(['create', 'start failed', 'release failed', 'release failed']);
+    releaseFails = false;
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(trace).toEqual([
+      'create',
+      'start failed',
+      'release failed',
+      'release failed',
+      'released',
+      'create',
+    ]);
+    expect(fleet.startupCleanupOwners.has(workspace.id)).toBe(false);
+  } finally {
+    fleet.stopped = true;
+    for (const timer of fleet.retryTimers.values()) clearTimeout(timer);
+    create.mockRestore();
+    vi.useRealTimers();
+  }
 });

@@ -1,8 +1,3 @@
-import { updateTestHistory } from './history-port-fixture';
-import { withHistoryPort } from './history-port-fixture';
-import { describe, expect, it, vi } from 'vitest';
-import { Loro } from 'loro-crdt';
-import { Mirror } from 'loro-mirror';
 import {
   getSessionRoomId,
   sessionDocSchema,
@@ -10,16 +5,22 @@ import {
   type SessionId,
   type StoredLodyOperation,
 } from '@lody/shared';
+import { Loro } from 'loro-crdt';
+import { Mirror } from 'loro-mirror';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
 import { LodyOperationCoordinator } from '../src/orchestration/operation-coordinator';
 import { LodyOperationStore } from '../src/orchestration/operation-store';
-import { mkdtempSync, rmSync } from 'node:fs';
-import path from 'node:path';
-import os from 'node:os';
+import { updateTestHistory, withHistoryPort } from './history-port-fixture';
 
 // Use real Mirror notifications: an array-only history mock hides this feedback loop.
 describe('nested operation progress feedback', () => {
   it('quiesces for A -> B -> C and still publishes subsequent child completion', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const directory = mkdtempSync(path.join(os.tmpdir(), 'lody-progress-inbox-'));
     const actualStore = new LodyOperationStore(path.join(directory, 'operations.sqlite3'), () =>
       Date.parse('2026-01-01T01:00:00Z')
@@ -103,6 +104,7 @@ describe('nested operation progress feedback', () => {
     const logger = { warn: vi.fn(), debug: vi.fn() };
     const store = {
       inbox: actualStore.inbox,
+      takeConnectionOwnership: () => actualStore.takeConnectionOwnership(),
       listActive: () => {
         // Deterministic safety guard makes the broken version fail, never hang the runner.
         if (++scans === 20) void coordinator.stop();

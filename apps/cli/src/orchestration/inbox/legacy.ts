@@ -1,10 +1,14 @@
-import { withTimeout } from '@/lib/loro/timeout-utils';
-import { Exit } from 'effect';
-import { InboxRecoveryProbe } from './recovery';
-import { Effect, Layer, ManagedRuntime } from 'effect';
-import { InboxExecution, OperationInbox, inboxRepositoryLayer } from './service';
-import type { InboxSqlite } from './sqlite';
+import { Effect, Exit, Layer, ManagedRuntime } from 'effect';
+import { executionJournalLayer } from '../platform/execution-journal';
+import { makeInboxQueries } from '../platform/inbox-queries';
+import { inboxRepositoryLayer, recoveryRepositoryLayer } from '../platform/inbox-repository';
+import { inboxRecoveryProbeLayer } from '../platform/recovery-probe';
+import { makeInboxCloseOwner } from './close-owner';
+import { makeExecutionOwner, type ExecutionResource } from './execution-owner';
 import type { InboxBatch, InboxInput, InboxRelease, InboxScope } from './model';
+import { InboxRecoveryProbe } from './recovery';
+import { InboxExecution, InboxRepository, OperationInbox } from './service';
+import type { InboxSqlite } from './sqlite';
 
 export type OperationInboxLegacy = ReturnType<typeof operationInboxLegacy>;
 /** One host-lease bridge. Consumers: coordinator; dispatch, Stop, prompt and release hooks. */
@@ -12,6 +16,7 @@ export const operationInboxLegacy = (options: {
   workspaceId: string;
   owner: string;
   sql: InboxSqlite;
+  ownsConnection?: boolean;
   ready(batch: InboxBatch): boolean;
   admit(batch: InboxBatch): boolean;
   launch(batch: InboxBatch): Promise<void>;
@@ -19,8 +24,12 @@ export const operationInboxLegacy = (options: {
   quiesce?(): void;
   openRecoveryRepository?(): { sql: InboxSqlite; close(): void };
 }) => {
+  const queries = makeInboxQueries(options.sql);
   const dependencies = Layer.merge(
-    inboxRepositoryLayer(options.sql, true),
+    Layer.merge(
+      inboxRepositoryLayer(options.sql, options.ownsConnection !== false),
+      executionJournalLayer(options.sql)
+    ),
     Layer.succeed(InboxExecution, {
       ready: options.ready,
       quiesce: options.quiesce,
@@ -31,13 +40,12 @@ export const operationInboxLegacy = (options: {
     })
   );
   const runtime = ManagedRuntime.make(
-    OperationInbox.layer(options.workspaceId, options.owner).pipe(Layer.provide(dependencies))
+    OperationInbox.layer(options.workspaceId, options.owner).pipe(Layer.provideMerge(dependencies))
   );
   const service = runtime.runPromise(OperationInbox);
   void service.catch(options.report);
   let shutdown: Promise<void> | undefined;
   let recoveredClose: Promise<void> | undefined;
-  let closingRaw: Promise<void> | undefined;
   const recovery = runtime.runPromise(
     Effect.gen(function* () {
       const probe = yield* InboxRecoveryProbe;
@@ -51,10 +59,82 @@ export const operationInboxLegacy = (options: {
             catch: (cause) => cause,
           });
       }
-    }).pipe(Effect.provide(InboxRecoveryProbe.layer))
+    }).pipe(Effect.provide(inboxRecoveryProbeLayer))
   );
   void recovery.catch(options.report);
+  const closeOwner = Effect.runSync(
+    makeInboxCloseOwner({
+      dispose: Effect.tryPromise({
+        try: () => recovery.catch(options.report),
+        catch: (cause) => cause,
+      }).pipe(Effect.andThen(runtime.disposeEffect)),
+      recover: Effect.scoped(
+        Effect.gen(function* () {
+          const inbox = yield* Effect.tryPromise({ try: () => service, catch: (cause) => cause });
+          const repository = yield* InboxRepository;
+          yield* inbox.recoverSettlements(repository.settle, repository.release, repository.pause);
+        }).pipe(
+          Effect.provide(
+            recoveryRepositoryLayer(() => {
+              const store = options.openRecoveryRepository?.();
+              if (!store) throw new Error('Inbox recovery repository is unavailable');
+              return store;
+            })
+          )
+        )
+      ),
+    })
+  );
+  const runClose = (program: Effect.Effect<void, unknown>, message: string) =>
+    Effect.runPromiseExit(program).then((exit) => {
+      if (Exit.isFailure(exit)) throw new Error(message, { cause: exit.cause });
+    });
   return {
+    preferredHumanInput: (w: string, s: string) =>
+      Effect.runSync(queries.preferredHumanInput(w, s)),
+    inputCanceled: (w: string, s: string, id: string) =>
+      Effect.runSync(queries.inputCanceled(w, s, id)),
+    inputKind: (s: InboxScope, id: string) => Effect.runSync(queries.inputKind(s, id)),
+    pauseTarget: (w: string, s: string, id: string) =>
+      Effect.runSync(queries.pauseTarget(w, s, id)),
+    abandonInput: (w: string, s: string, id: string) =>
+      runtime.runPromise(Effect.flatMap(OperationInbox, (inbox) => inbox.abandon(w, s, id))),
+    openExecution: async (input: InboxInput, id: string, batch?: InboxBatch) => {
+      const owner = await runtime.runPromise(makeExecutionOwner(input, id, batch));
+      return {
+        get input() {
+          return owner.input;
+        },
+        get batch() {
+          return owner.batch;
+        },
+        id,
+        get failure() {
+          return owner.failure;
+        },
+        members: () => runtime.runPromise(owner.members),
+        adopt: (next: InboxInput, update: () => void) =>
+          runtime.runPromise(owner.adopt(next, update)),
+        register: (resource: ExecutionResource) => runtime.runPromise(owner.register(resource)),
+        track: (raw: Promise<void>) =>
+          runtime.runSync(
+            owner.track(Effect.tryPromise({ try: () => raw, catch: (cause) => cause }))
+          ),
+        steer: <A>(start: () => A) => runtime.runPromise(owner.steer(start)),
+        submit: <A>(start: () => A) => runtime.runPromise(owner.submit(start)),
+        finish: (outcome: InboxRelease['outcome'], cause?: unknown) =>
+          runtime.runPromise(owner.finish(outcome, cause)),
+        detach: () => runtime.runSync(owner.detach),
+        retain: (resource: ExecutionResource) => runtime.runSync(owner.retain(resource)),
+        recover: (prepare: () => Promise<void>, beforeRelease: () => Promise<void>) =>
+          runtime.runPromise(
+            owner.recover(
+              Effect.tryPromise({ try: prepare, catch: (cause) => cause }),
+              Effect.tryPromise({ try: beforeRelease, catch: (cause) => cause })
+            )
+          ),
+      };
+    },
     adopt: (p: InboxInput, n: InboxInput, id: string, update: () => void) =>
       runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.adopt(p, n, id, update))),
     quiesce: () => runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.quiesce)),
@@ -76,42 +156,8 @@ export const operationInboxLegacy = (options: {
     settle: (batch: InboxBatch, outcome: 'submitted' | 'unknown' | 'settled', cause?: string) =>
       runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.settle(batch, outcome, cause))),
     recoverClose: () => {
-      if (!closingRaw) return Promise.resolve();
       if (recoveredClose) return recoveredClose;
-      const attempt = (async () => {
-        await withTimeout(
-          closingRaw!.catch(() => undefined),
-          10_000,
-          'Inbox Scope release remains unresolved'
-        );
-        const recoveryStore = options.openRecoveryRepository?.();
-        if (!recoveryStore) throw new Error('Inbox recovery repository is unavailable');
-        try {
-          const inbox = await service;
-          await Effect.runPromise(
-            inbox.recoverSettlements(
-              (batch, outcome, receiptCause) =>
-                Effect.try({
-                  try: () => recoveryStore.sql.settle(batch, outcome, receiptCause),
-                  catch: (failure) => failure,
-                }),
-              (event) =>
-                Effect.try({
-                  try: () => recoveryStore.sql.release(event),
-                  catch: (cause) => cause,
-                }),
-              (scope, id, ids, cancelId) =>
-                Effect.try({
-                  try: () => recoveryStore.sql.pause(scope, id, ids, cancelId),
-                  catch: (cause) => cause,
-                })
-            )
-          );
-        } finally {
-          recoveryStore.close();
-        }
-        options.sql.closeConnection();
-      })();
+      const attempt = runClose(closeOwner.recover, 'Inbox Scope recovery failed');
       recoveredClose = attempt;
       void attempt.catch(() => {
         if (recoveredClose === attempt) recoveredClose = undefined;
@@ -119,14 +165,6 @@ export const operationInboxLegacy = (options: {
       return attempt;
     },
     close: () =>
-      recoveredClose ??
-      (shutdown ??= (async () => {
-        await recovery.catch(options.report);
-        closingRaw = Effect.runPromiseExit(runtime.disposeEffect).then((exit) => {
-          if (Exit.isFailure(exit))
-            throw new Error('Inbox Scope release failed', { cause: exit.cause });
-        });
-        await withTimeout(closingRaw, 10_000, 'Inbox Scope release timed out');
-      })()),
+      recoveredClose ?? (shutdown ??= runClose(closeOwner.close, 'Inbox Scope release failed')),
   };
 };

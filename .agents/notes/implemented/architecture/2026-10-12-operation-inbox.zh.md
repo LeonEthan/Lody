@@ -25,7 +25,7 @@ Translation: current
 
 ## 所有权、恢复与兼容
 
-Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fiber；`operationInboxLegacy` 是唯一登记的主流程桥接。整个 Session／ACP／历史迁移尚未完成，边界见 [Effect 台账](../../proposed/architecture/2026-09-27-effect-lifecycle-migration-roadmap.zh.md#单元台账)。
+Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fiber；`operationInboxLegacy` 桥接 Session 输入；`operation-coordinator.ts` 与 `workspace-cleanup-legacy.ts` 是登记的应用入口，platform 资源观察器同步桥接创建前的登记回调。整个 Session／ACP／历史迁移尚未完成，边界见 [Effect 台账](../../proposed/architecture/2026-09-27-effect-lifecycle-migration-roadmap.zh.md#单元台账)。
 
 `40ef5c29cbe496f28f17ab10297cf37c3c48030f` 的审核发现三个 adapter 缺口，修订落实以下契约：
 
@@ -41,19 +41,25 @@ Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest
 
 与主分支 `d76690b62` 合并后，保留原始 ACP 排空 → presence 清除 → turn／Inbox 移交的顺序。presence 清理失败仍保留旧执行所有者；daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。依赖维持合并后的锁定版本，包括 Streams 0.17.0、Effect 4.0.2。能力注册同时保留 Inbox v2 和主分支新增的 Magpie／DSH 能力，不互相覆盖。
 
+## 原生编排单元的落实
+
+Coordinator 的协调、合并唤醒和重试已经迁到原生 Effect workflow；应用入口只负责组合与交接。纯规则与 platform 实现分离，边界检查禁止内核直接访问 SQL、Session、进程、Promise workflow 和运行时。SQLite Service 统一持有连接；Operation 与 Inbox 在同一连接中同步完成语义事务，事务回调禁止返回 Effect／Promise。内存 Layer 使用相同实现，仍属于副作用，不称为纯函数。Session 行无消费者的配置读写已删除，schema 不变。
+
+ExecutionOwner 收拢输入、batch、资源和原始请求，负责提交、结算、真实释放与独立恢复；Session 不再直接访问 Inbox SQL。关闭所有者保留共享失败回执和完整 Cause，恢复只重试结算。Fleet 启动失败与正常停止共用阶段所有者，生产自动重试会先恢复旧所有者。Session／ACP／历史能力仍为登记的临时 adapter，不能据此声称依赖链全部迁移。
+
 ## 验证与剩余边界
 
 作者验证使用锁定依赖的隔离源码副本，并核对改动源码字节一致；不是独立 base/head 审核。以下范围有交集，不能累加；以前的完整测试记录保留在 Git 历史中。
 
-| 范围 | 本次清理的证据 |
+| 范围 | 本轮实现证据 |
 | --- | --- |
-| 最终合并后的 CLI 交集 | 10 个 suite，466 项通过；Store／Coordinator／Inbox／执行／进度投影、Watcher／supervisor／注册和 Magpie 启动配置；覆盖旧库删除、事务回滚、当前状态保留、消费保留期与序号不重用 |
-| 作者恢复／命令／MCP | 4 个 suite，248 项通过；SQLite 重开、真实 create 准备／chat 历史、缺失来源拒绝，以及恢复后反向请求不创建 Operation |
-| 执行入口／Watcher／supervisor／注册／命令／MCP | 7 个 suite，509 项通过；旧宿主拒绝、batch 准入与反向 chat |
-| Shared 消息／组件关系展示 | 各 3／2 个 suite，28／28 项通过 |
-| 类型、lint、格式与 `check:quick` | 通过；保留现有边界检查，并禁止旧 API、逐条派发来源和结算回调回流 |
-| 完整 `pnpm check` | 最终作者修复的完整检查：CLI 4085 项通过、4 项跳过；未修改的 Git transport 一项 `context_unreadable`／remote helper aborted，未独立复现基线，不宣称全仓全绿 |
-| 文档检查 | 82 项已有错误，无 Inbox 错误 |
+| 原生编排相关交集 | 6 suites，401 项通过；包含真实 Coordinator／Mirror、执行服务、Fleet 自动重试、SQLite 与 Inbox |
+| 准入反证 | 两个确定性竞争位置：隔离副本移除提交锁均失败，恢复后均通过；保留未知提交禁止重发断言 |
+| SQLite／所有权 | 内存共享连接的完成事务、失败回滚、异步事务拒绝；磁盘重开、资源释放和共享关闭恢复沿用行为覆盖 |
+| 类型／静态／格式 | 全仓类型及 lint、format、check:quick 通过；新增 guard 禁止内核依赖具体 I/O 或自建 runtime |
+| pnpm check | 已执行但未全绿：沙盒中出现进程／端口相关失败，递归检查还被 e2ee-core 无测试文件终止；CLI 另在沙盒外重跑，不以本轮结果宣称全仓验收 |
+| 文档 | 与既有错误数组相同的 82 项；无 Inbox 错误 |
+
 
 测试通过 Deferred、注入时钟、fake timers 和故障触发器检查完整模型输入、持久行与真实释放。覆盖八项合批、空边界、迟到第九项、无新事件重开、暂停／未知不重发，以及当前调度所有权与资源释放。旧协调器 fixture 的早期移交测试随被退役的契约删除，不能充当新版验收。资源测试使用真实独立进程组，进程表为注入快照。不宣称真实模型、完整系统进程表、桌面端到端、合入或发布验收。
 

@@ -25,7 +25,7 @@ The 2026-10-12 research borrowed durable queuing, separate admission and batched
 
 ## Ownership, recovery and compatibility
 
-Effect remains locked at 4.0.2. `inbox/service.ts` owns the repository, signals and scoped fibers; `operationInboxLegacy` is the single registered host bridge. Whole Session/ACP/history migration remains unfinished, as recorded in the [Effect ledger](../../proposed/architecture/2026-09-27-effect-lifecycle-migration-roadmap.md#unit-ledger).
+Effect remains locked at 4.0.2. `inbox/service.ts` owns the repository, signals and scoped fibers; `operationInboxLegacy` bridges Session input; `operation-coordinator.ts` and `workspace-cleanup-legacy.ts` are registered application entries. Platform Session resource observers bridge acquisition callbacks synchronously before spawn. Whole Session/ACP/history migration remains unfinished, as recorded in the [Effect ledger](../../proposed/architecture/2026-09-27-effect-lifecycle-migration-roadmap.md#unit-ledger).
 
 Review of `40ef5c29cbe496f28f17ab10297cf37c3c48030f` found three adapter defects, addressed by the following contracts:
 
@@ -41,19 +41,37 @@ Stop request details now live in one replaceable `cancelRequest` control-documen
 
 Integration with main `d76690b62` preserves raw ACP drain → presence clear → Turn/Inbox handoff. Presence cleanup failure retains the old execution owner. Daemon shutdown cancels history-owned work and drains/recover-closes Inbox. Merged dependency pins remain unchanged, including Streams 0.17.0 and Effect 4.0.2. Capability registration retains Inbox v2 alongside main’s new Magpie/DSH capabilities.
 
+## Native orchestration unit
+
+Coordinator reconciliation, coalesced wake tickets and retry fibers now run as native
+Effect workflows; the application facade only composes and hands off owners. Pure
+rules are separate from platform effects. Static checks forbid direct SQL, Session,
+process, Promise-workflow and runtime access from the native core. A scoped SQLite
+Service owns the shared Operation/Inbox connection. Semantic transactions are
+synchronous and reject Effect/Promise returns. The memory Layer uses the same real
+implementation and remains effectful. Unused session configuration I/O is removed
+without changing the schema.
+
+ExecutionOwner contains input, batch, resources and raw requests, and owns submission,
+settlement, actual release and independent recovery. Session no longer accesses Inbox
+SQL. A native close owner retains shared failed receipts and full Cause; recovery only
+retries settlement. Fleet startup failure and normal stop share a phased owner, and
+production automatic retry recovers that owner before replacement. Session/ACP/history
+remain registered temporary adapters; this does not complete their dependency chains.
+
 ## Verification and remaining limits
 
 Author validation uses a separate source copy with pinned dependencies and matching changed-source bytes, not an independent base/head review. These scopes overlap and must not be added; earlier complete matrices remain in Git history.
 
-| Scope | Cleanup evidence |
+| Scope | Current implementation evidence |
 | --- | --- |
-| Final merged CLI intersection | 10 suites, 466 passed; store/coordinator/Inbox/execution/progress, watcher/supervisor/registration and Magpie launch configuration; old-store deletion, transaction rollback, native evidence preservation, retention and monotonic sequence |
-| Author recovery/commands/MCP | 4 suites, 248 passed; SQLite reopen, actual create preparation/chat history, missing-source rejection and no new Operation from recovered reverse chat |
-| Execution/watcher/supervisor/registration/commands/MCP | 7 suites, 509 passed; old-host rejection, batch admission and reverse chat |
-| Shared messages/component relations | 3/2 suites, 28/28 passed |
-| Types, lint, format and `check:quick` | Passed; existing guards retained, retired APIs/per-Delivery dispatch/settlement callbacks forbidden |
-| Complete `pnpm check` | Complete check of the final author fix: CLI 4085 passed, 4 skipped, one unchanged Git transport failure: `context_unreadable`/remote helper aborted; no independent baseline reproduction or full-root green claim |
-| Documentation check | 82 pre-existing errors, no Inbox errors |
+| Native orchestration intersection | 6 suites, 401 passed: actual Coordinator/Mirror, execution service, Fleet automatic retry, SQLite and Inbox |
+| Admission ablation | Both deterministic competition positions fail when the submission lock is removed in the isolated copy, and pass when restored; unknown-submission non-replay assertions retained |
+| SQLite / ownership | Shared in-memory completion transaction, rollback and asynchronous-callback rejection; disk reopen, actual release and shared-close recovery behavior retained |
+| Types / static / format | Root types and lint, format and check:quick pass; extended guard forbids concrete I/O and nested runtime access in the native core |
+| pnpm check | Attempted, not green: sandbox process/port failures and recursive termination at e2ee-core with no test files. CLI is rerun outside the sandbox separately; no full-root acceptance claim |
+| Documentation | Same pre-existing array of 82 errors; no Inbox errors |
+
 
 Tests observe full provider inputs, durable rows and actual release with Deferred, injected clocks, fake timers and failure triggers. They cover eight-result batching, empty boundaries, late ninth results, event-free restart, paused/unknown non-replay, and current scheduler ownership/resource release. Earlier legacy-fixture handoff tests were retired with their contract and are not v2 acceptance. Resource tests use real independent process groups with injected process-table snapshots. No live model, complete system process-table, desktop end-to-end, merge or release acceptance is claimed.
 

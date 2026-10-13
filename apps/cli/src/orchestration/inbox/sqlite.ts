@@ -1,8 +1,8 @@
 import type { StoredLodyOperation } from '@lody/shared';
-import type { InboxResourceIdentity } from './recovery';
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import type { OrchestrationConnection } from '../platform/database';
 import {
   batchDepth,
   type InboxBatch,
@@ -11,6 +11,8 @@ import {
   type InboxRelease,
   type InboxScope,
 } from './model';
+import type { InboxResourceIdentity } from './recovery';
+import { canFenceBatch, inputAcceptance } from './rules';
 
 const StateRow = z.object({
   revision: z.number(),
@@ -18,7 +20,6 @@ const StateRow = z.object({
   blocked: z.number(),
   active_execution: z.string().nullable(),
   active_input: z.string().nullable(),
-  config_json: z.string().nullable(),
 });
 const BatchRow = z.object({
   batch_id: z.string(),
@@ -55,7 +56,8 @@ const MemberRow = z.object({
 export class InboxSqlite {
   constructor(
     private readonly db: Database.Database,
-    private readonly now: () => string = () => new Date().toISOString()
+    private readonly now: () => string = () => new Date().toISOString(),
+    private readonly connection?: OrchestrationConnection
   ) {}
 
   static migrate(db: Database.Database): void {
@@ -232,7 +234,9 @@ export class InboxSqlite {
     }
   }
   private transaction<A>(f: () => A): A {
-    return this.db.transaction(f).immediate();
+    return this.connection
+      ? (this.connection.withImmediate(f as () => never) as A)
+      : this.db.transaction(f).immediate();
   }
   private ensure(s: InboxScope): void {
     this.db
@@ -246,7 +250,7 @@ export class InboxSqlite {
     return StateRow.parse(
       this.db
         .prepare(
-          'SELECT revision,paused,blocked,active_execution,active_input,config_json FROM inbox_sessions WHERE workspace_id=? AND session_id=? AND user_id=?'
+          'SELECT revision,paused,blocked,active_execution,active_input FROM inbox_sessions WHERE workspace_id=? AND session_id=? AND user_id=?'
         )
         .get(s.workspaceId, s.sessionId, s.userId)
     );
@@ -304,8 +308,12 @@ export class InboxSqlite {
           'SELECT canceled FROM inbox_inputs WHERE workspace_id=? AND session_id=? AND input_id=?'
         )
         .get(input.workspaceId, input.sessionId, input.inputId) as { canceled: number } | undefined;
-      if (old) return old.canceled === 0;
-      if (input.kind === 'task' && current.paused) return false;
+      const decision = inputAcceptance(
+        input.kind,
+        !!current.paused,
+        old ? old.canceled !== 0 : undefined
+      );
+      if (decision !== 'accept') return decision === 'duplicate';
       this.db
         .prepare(
           'UPDATE inbox_sessions SET revision=revision+1 WHERE workspace_id=? AND session_id=? AND user_id<>?'
@@ -323,16 +331,9 @@ export class InboxSqlite {
         .run(input.workspaceId, input.sessionId, input.userId, input.inputId, input.kind, revision);
       this.db
         .prepare(
-          "UPDATE inbox_sessions SET revision=?,paused=CASE WHEN ?='human' THEN 0 ELSE paused END,config_json=? WHERE workspace_id=? AND session_id=? AND user_id=?"
+          "UPDATE inbox_sessions SET revision=?,paused=CASE WHEN ?='human' THEN 0 ELSE paused END WHERE workspace_id=? AND session_id=? AND user_id=?"
         )
-        .run(
-          revision,
-          input.kind,
-          JSON.stringify(input.config),
-          input.workspaceId,
-          input.sessionId,
-          input.userId
-        );
+        .run(revision, input.kind, input.workspaceId, input.sessionId, input.userId);
       const replaceAutomatic = !!this.db
         .prepare(
           "SELECT 1 FROM inbox_batches WHERE workspace_id=? AND session_id=? AND kind='automatic' AND state='prepared'"
@@ -928,23 +929,22 @@ export class InboxSqlite {
   fence(batch: InboxBatch, executionId: string): boolean {
     return this.transaction(() => {
       const current = this.state(batch);
-      if (
-        !this.currentOwner(batch.workspaceId, batch.owner) ||
-        current.paused ||
-        current.blocked ||
-        (batch.kind === 'automatic'
-          ? current.revision !== batch.revision
-          : this.inputCanceled(batch.workspaceId, batch.sessionId, batch.inputId)) ||
-        current.active_input !== batch.inputId ||
-        current.active_execution !== executionId
-      )
-        return false;
       const count = (
         this.db
           .prepare('SELECT COUNT(*) AS value FROM inbox_results WHERE claim=? AND consumed=0')
           .get(batch.batchId) as { value: number }
       ).value;
-      if (count === 0 || count !== batch.memberCount) return false;
+      if (
+        !canFenceBatch(
+          current,
+          batch,
+          executionId,
+          this.currentOwner(batch.workspaceId, batch.owner),
+          this.inputCanceled(batch.workspaceId, batch.sessionId, batch.inputId),
+          count
+        )
+      )
+        return false;
       return (
         this.db
           .prepare(

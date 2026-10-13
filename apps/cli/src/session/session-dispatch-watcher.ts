@@ -2981,7 +2981,7 @@ export class SessionDispatchWatcher {
               ['handled', 'failed', 'canceled', 'delivery_unknown'].includes(e.status ?? '')
           ))
       ) {
-        this.deps.executionService.abandonInboxInput?.(meta.id, preferred);
+        await this.deps.executionService.abandonInboxInput?.(meta.id, preferred);
         preferred = this.deps.executionService.getPreferredInboxHumanInput?.(meta.id);
       }
       const turn = preferred

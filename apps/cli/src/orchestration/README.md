@@ -21,12 +21,38 @@ current history so a preflight snapshot cannot overwrite an intervening update.
 The real-Mirror regression is in
 [operation-progress-feedback.test.ts](../../tests/operation-progress-feedback.test.ts).
 
+## Effect and transaction ownership
+
+The native coordinator lives in `coordinator-workflow.ts`; `coordinator-model.ts`
+contains pure decisions. `coordinator-activity.ts` owns the scoped queue, coalesced
+wake tickets and retry fibers. The old coordinator class is a registered application
+entry point, not a second reconciliation loop. Concrete Session/history/OS effects
+are in `platform/`; these upstream Promise adapters still require their own migration.
+
+`OrchestrationDatabase` owns one scoped SQLite connection. Disk and `:memory:` Layers
+use the same schema, SQL and repositories. In-memory SQLite is still mutable I/O,
+not a pure function; it makes isolated tests reproducible without changing semantics.
+Operation and Inbox repositories borrow the same connection. A semantic repository
+operation runs one synchronous `BEGIN IMMEDIATE` transaction: reads, conditions and
+writes commit together. Transaction callbacks reject Promise and Effect returns;
+transport, history writes and waits happen outside the transaction. SQL failures keep
+the original cause and a busy/storage/invariant classification. Reopen and multi-Worker
+behavior still require disk tests. Session configuration is frozen in intents/batches;
+the unused session-row configuration read/write is removed without a schema migration.
+
+`inbox/execution-owner.ts` hides input/batch identity, resource registration, raw
+requests, submission, settlement and release recovery. Session callers use this
+handle rather than SQL. `inbox/close-owner.ts` retains the original close receipt and
+a raw disposal fiber; independent recovery repairs receipts without repeating requests.
+Fleet startup and normal stop use the same phased cleanup owner. Automatic startup
+retry first recovers retained resources, then starts a replacement.
+
 ## Completion consumption
 
 `inbox/sqlite.ts` indexes results in the existing completion transaction, fixes release
 watermarks and persists input/batch/resource receipts. `inbox/service.ts` owns coalesced
 signals, scoped workers and the shared admission gate. `inbox/legacy.ts` registers the
-single host runtime and the unfinished Session adapter. `inbox/recovery.ts` proves
+single host runtime and the unfinished Session adapter. `inbox/recovery.ts` supplies the pure disappearance rule; the process probe is a platform capability. It proves
 resource disappearance conservatively; unsupported or missing identities remain blocked.
 
 `session-execution-service.ts` calls the actual prompt primitive while holding admission.

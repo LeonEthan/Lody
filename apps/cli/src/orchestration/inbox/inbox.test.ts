@@ -1,14 +1,16 @@
-import { afterEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import type { MachineId, SessionId, WorkspaceId } from '@lody/shared';
+import Database from 'better-sqlite3';
+import { Context, Deferred, Effect, Fiber, Layer, Scheduler } from 'effect';
 import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import Database from 'better-sqlite3';
-import { Context, Deferred, Effect, Fiber, Layer } from 'effect';
+import { fileURLToPath } from 'node:url';
+import { promisify } from 'node:util';
+import { afterEach, describe, expect, it } from 'vitest';
 import { LodyOperationStore } from '../operation-store';
-import { InboxExecution, InboxRepository, OperationInbox, inboxRepositoryLayer } from './service';
+import { inboxRepositoryLayer } from '../platform/inbox-repository';
+import { ExecutionJournal, makeExecutionOwner } from './execution-owner';
 import {
   batchDepth,
   batchPreview,
@@ -16,7 +18,7 @@ import {
   type InboxInput,
   type InboxRelease,
 } from './model';
-import type { MachineId, SessionId, WorkspaceId } from '@lody/shared';
+import { InboxExecution, InboxRepository, OperationInbox } from './service';
 
 const roots: string[] = [];
 const stores: LodyOperationStore[] = [];
@@ -725,44 +727,6 @@ it('reads an oversized member in bounded fragments without dropping any result b
   expect(JSON.parse(restored)).toEqual(member);
 });
 
-it('holds the same admission gate from durable fence to transport start', async () => {
-  const f = fixture();
-  f.add('one');
-  const received: string[] = [];
-  const deps = Layer.merge(
-    inboxRepositoryLayer(f.sql),
-    Layer.succeed(InboxExecution, {
-      ready: () => true,
-      admit: () => true,
-      launch: () => Effect.void,
-      report: () => Effect.void,
-    })
-  );
-  await Effect.runPromise(
-    Effect.scoped(
-      Effect.gen(function* () {
-        const inbox = yield* OperationInbox;
-        yield* inbox.accept(f.input);
-        yield* inbox.begin(f.input, 'exec');
-        const batch = (yield* inbox.prepare(f.input))!;
-        let stop: Promise<boolean> | undefined;
-        yield* inbox.submit(batch, f.input, 'exec', () => {
-          stop = Effect.runPromise(inbox.pause(f.input, 'exec'));
-          received.push('actual transport received user+batch');
-        });
-        yield* Effect.promise(() => stop!);
-        expect(received).toEqual(['actual transport received user+batch']);
-        const retry = yield* Effect.exit(
-          inbox.submit(batch, f.input, 'exec', () => received.push('replay'))
-        );
-        expect(retry._tag).toBe('Failure');
-        expect(received).toEqual(['actual transport received user+batch']);
-        expect(f.sql.getBatch(batch.batchId, batch)?.state).toBe('submitting');
-      }).pipe(Effect.provide(OperationInbox.layer('workspace', 'owner').pipe(Layer.provide(deps))))
-    )
-  );
-});
-
 it('a later queued human input does not invalidate the human execution already being prepared', () => {
   const f = fixture();
   f.start();
@@ -781,6 +745,119 @@ it('a fresh human can clear pause without reviving the execution canceled by Sto
   expect(f.sql.pause(f.input, 'execution-1')).toBe(true);
   expect(f.sql.accept({ ...f.input, inputId: 'post-stop-human' })).toBe(true);
   expect(f.sql.canSubmit(f.input, 'execution-1', 'owner')).toBe(false);
+});
+
+it('execution owner retains resources and serializes recovery without resubmitting the batch', async () => {
+  const f = fixture();
+  f.add('owned');
+  f.sql.accept(f.input);
+  const received: string[] = [];
+  let alive = true;
+  let detached = false;
+  await Effect.runPromise(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const terminating = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let emit:
+          | ((identity: {
+              roots: readonly number[];
+              complete: boolean;
+            }) => Effect.Effect<void, unknown>)
+          | undefined;
+        const journal = Layer.succeed(ExecutionJournal, {
+          record: (input, id, identity) =>
+            Effect.try(() => f.sql.registerResources(input, id, identity)),
+          confirm: (input, id) => Effect.try(() => f.sql.confirmReleased(input, id)),
+          members: (batch) => Effect.try(() => f.sql.members(batch)),
+          identity: (resourceRoots, complete) => ({
+            platform: 'darwin',
+            roots: [77, ...resourceRoots],
+            complete,
+          }),
+        });
+        const dependencies = Layer.mergeAll(
+          inboxRepositoryLayer(f.sql),
+          journal,
+          Layer.succeed(InboxExecution, {
+            ready: () => false,
+            admit: () => true,
+            launch: () => Effect.void,
+            report: () => Effect.void,
+          })
+        );
+        yield* Effect.gen(function* () {
+          const owner = yield* makeExecutionOwner(f.input, 'owned-execution');
+          yield* owner.register({
+            key: {},
+            observesAcquisitions: true,
+            observe: (update) =>
+              Effect.sync(() => {
+                emit = update;
+                return Effect.sync(() => {
+                  detached = true;
+                });
+              }),
+            terminate: Deferred.succeed(terminating, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(
+                Effect.sync(() => {
+                  alive = false;
+                })
+              )
+            ),
+          });
+          expect(
+            JSON.parse(
+              (f.store as unknown as { db: Database.Database }).db
+                .prepare('SELECT identity_json FROM inbox_resources')
+                .get().identity_json
+            ).complete
+          ).toBe(false);
+          yield* emit!({ roots: [91], complete: true });
+          expect(
+            JSON.parse(
+              (f.store as unknown as { db: Database.Database }).db
+                .prepare('SELECT identity_json FROM inbox_resources')
+                .get().identity_json
+            )
+          ).toEqual({
+            platform: 'darwin',
+            roots: [77, 91],
+            complete: true,
+          });
+          yield* owner.submit(() => received.push(owner.batch!.batchId));
+          yield* owner.finish('user_stop', new Error('resource release failed'));
+          expect(owner.phase).toBe('blocked');
+          const first = yield* owner
+            .recover(Effect.void, Effect.void)
+            .pipe(Effect.forkScoped({ startImmediately: true }));
+          yield* Deferred.await(terminating);
+          const second = yield* owner
+            .recover(Effect.void, Effect.void)
+            .pipe(Effect.forkScoped({ startImmediately: true }));
+          expect(second.pollUnsafe()).toBeUndefined();
+          expect(alive).toBe(true);
+          expect(detached).toBe(false);
+          expect(f.sql.begin({ ...f.input, inputId: 'successor' }, 'successor')).toBe(false);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(first);
+          yield* Fiber.join(second);
+          yield* owner.awaitReleased;
+          expect(alive).toBe(false);
+          expect(detached).toBe(true);
+          expect(owner.phase).toBe('released');
+          expect(f.sql.getBatch(owner.batch!.batchId, owner.input)?.state).toBe('unknown');
+          expect(received).toEqual([owner.batch!.batchId]);
+          expect(f.sql.pending('workspace')).toEqual([]);
+        }).pipe(
+          Effect.provide(
+            OperationInbox.layer('workspace', 'owner').pipe(Layer.provideMerge(dependencies))
+          )
+        );
+      })
+    )
+  );
 });
 
 it('keeps the original shared failed shutdown receipt and recovers settlement through a new repository', async () => {
@@ -1037,7 +1114,8 @@ it('an OS child recovers the fixed eight-member intent without any new event', a
     f.root,
     `
     import {LodyOperationStore} from ${JSON.stringify(storePath)};
-    import {OperationInbox,InboxExecution,inboxRepositoryLayer} from ${JSON.stringify(servicePath)};
+    import {OperationInbox,InboxExecution} from ${JSON.stringify(servicePath)};
+    import {inboxRepositoryLayer} from ${JSON.stringify(fileURLToPath(new URL('../platform/inbox-repository.ts', import.meta.url)))};
     import {Effect,Layer,Deferred} from ${JSON.stringify(fileURLToPath(new URL('../../../node_modules/effect/dist/index.js', import.meta.url)))};
     const store=new LodyOperationStore(${JSON.stringify(f.filename)});
     store.inbox.activate('workspace','child');
@@ -1101,7 +1179,8 @@ it.each(['check', 'fence'] as const)(
         Effect.gen(function* () {
           const entered = yield* Deferred.make<void>();
           const proceed = yield* Deferred.make<void>();
-          const attempted = yield* Deferred.make<void>();
+          const scheduler = new Scheduler.MixedScheduler('sync');
+          const dispatcher = scheduler.makeDispatcher();
           const base = yield* Effect.provide(InboxRepository, inboxRepositoryLayer(f.sql));
           const barrier = Effect.gen(function* () {
             yield* Deferred.succeed(entered, undefined);
@@ -1135,19 +1214,34 @@ it.each(['check', 'fence'] as const)(
               .pipe(Effect.forkScoped);
             yield* Deferred.await(entered);
             const stopping = yield* Effect.gen(function* () {
-              yield* Deferred.succeed(attempted, undefined);
               expect(yield* inbox.pause(f.input, 'execution-1')).toBe(true);
               received.push('stop-confirmed');
-            }).pipe(Effect.forkScoped);
-            yield* Deferred.await(attempted);
-            expect(f.sql.inputCanceled('workspace', 'A', f.input.inputId)).toBe(false);
-            yield* Deferred.succeed(proceed, undefined);
+            }).pipe(
+              Effect.provideService(Scheduler.Scheduler, {
+                executionMode: 'sync',
+                shouldYield: () => false,
+                makeDispatcher: () => dispatcher,
+              }),
+              Effect.forkScoped({ startImmediately: true })
+            );
+            dispatcher.flush();
+            try {
+              expect(stopping.pollUnsafe()).toBeUndefined();
+              expect(f.sql.inputCanceled('workspace', 'A', f.input.inputId)).toBe(false);
+            } finally {
+              yield* Deferred.succeed(proceed, undefined);
+            }
             yield* Fiber.join(submitting);
             yield* Fiber.join(stopping);
             expect(received).toEqual(['transport-started', 'stop-confirmed']);
             yield* inbox.settle(batch!, 'unknown');
             yield* inbox.release({ ...f.input, executionId: 'execution-1', outcome: 'user_stop' });
             expect(f.sql.pending('workspace')).toEqual([]);
+            const replay = yield* Effect.exit(
+              inbox.submit(batch, f.input, 'execution-1', () => received.push('replay'))
+            );
+            expect(replay._tag).toBe('Failure');
+            expect(received).toEqual(['transport-started', 'stop-confirmed']);
           }).pipe(
             Effect.provide(OperationInbox.layer('workspace', 'owner').pipe(Layer.provide(deps)))
           );
@@ -1177,7 +1271,8 @@ it.each(['unknown', 'paused'] as const)(
       f.root,
       `
     import {LodyOperationStore} from ${JSON.stringify(fileURLToPath(new URL('../operation-store.ts', import.meta.url)))};
-    import {OperationInbox,InboxRepository,InboxExecution,inboxRepositoryLayer} from ${JSON.stringify(fileURLToPath(new URL('./service.ts', import.meta.url)))};
+    import {OperationInbox,InboxRepository,InboxExecution} from ${JSON.stringify(fileURLToPath(new URL('./service.ts', import.meta.url)))};
+    import {inboxRepositoryLayer} from ${JSON.stringify(fileURLToPath(new URL('../platform/inbox-repository.ts', import.meta.url)))};
     import {Effect,Layer,Deferred} from ${JSON.stringify(fileURLToPath(new URL('../../../node_modules/effect/dist/index.js', import.meta.url)))};
     const store=new LodyOperationStore(${JSON.stringify(f.filename)});store.inbox.activate('workspace','child');
     const received=[];

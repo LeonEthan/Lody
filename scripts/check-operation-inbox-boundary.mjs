@@ -60,12 +60,27 @@ for (const relative of [
   };
   visit(file);
 }
-for (const name of fs
-  .readdirSync(dir)
-  .filter((n) => n.endsWith('.ts') && !n.endsWith('.test.ts') && n !== 'legacy.ts')) {
+const nativeFiles = [
+  ...fs
+    .readdirSync(dir)
+    .filter(
+      (n) => n.endsWith('.ts') && !n.endsWith('.test.ts') && !['legacy.ts', 'sqlite.ts'].includes(n)
+    )
+    .map((n) => 'apps/cli/src/orchestration/inbox/' + n),
+  ...[
+    'coordinator-activity.ts',
+    'coordinator-workflow.ts',
+    'coordinator-model.ts',
+    'coordinator-ports.ts',
+    'operation-repository.ts',
+    'storage-error.ts',
+  ].map((n) => 'apps/cli/src/orchestration/' + n),
+  'apps/cli/src/lib/workspace-cleanup-owner.ts',
+];
+for (const name of nativeFiles) {
   const file = ts.createSourceFile(
     name,
-    fs.readFileSync(path.join(dir, name), 'utf8'),
+    fs.readFileSync(path.join(root, name), 'utf8'),
     ts.ScriptTarget.Latest,
     true
   );
@@ -76,18 +91,26 @@ for (const name of fs
   const visit = (node) => {
     if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier)) {
       const spec = node.moduleSpecifier.text;
-      if (/operation-coordinator|session-manager|inbox\/legacy/u.test(spec))
-        bad(node, 'native Inbox cannot depend on its legacy consumer');
+      if (
+        /operation-coordinator|operation-store|inbox\/legacy|\/platform\/|^@\/(session|lib\/loro)|^(node:)?(fs|child_process|os)$|better-sqlite3/u.test(
+          spec
+        )
+      )
+        bad(node, 'native workflow depends on a concrete platform or upstream implementation');
     }
     if (ts.isCallExpression(node)) {
-      const text = node.expression.getText(file);
-      if (/^(Effect\.run|ManagedRuntime\.make|setTimeout|setInterval)/u.test(text))
-        bad(node, 'execution runtime or timer escapes native Scope');
-      if (text === 'Effect.tryPromise' && name !== 'recovery.ts')
-        bad(node, 'register unfinished Promise orchestration only in the named adapter');
+      const expression = node.expression.getText(file);
+      if (
+        /^(Effect\.run|ManagedRuntime\.make|setTimeout|setInterval|Date\.now|Math\.random|randomUUID)/u.test(
+          expression
+        )
+      )
+        bad(node, 'runtime, clock, random source or timer escapes the native capability boundary');
+      if (expression === 'Effect.tryPromise')
+        bad(node, 'unfinished Promise orchestration must stay in a named platform adapter');
     }
     if (ts.isNewExpression(node) && node.expression.getText(file) === 'Promise')
-      bad(node, 'native Inbox must compose Effects instead of new Promise');
+      bad(node, 'native workflow must compose Effects');
     ts.forEachChild(node, visit);
   };
   visit(file);

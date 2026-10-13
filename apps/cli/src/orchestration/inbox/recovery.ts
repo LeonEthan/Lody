@@ -1,6 +1,5 @@
-import { Context, Effect, Layer } from 'effect';
 import type { ProcessTableSnapshot } from '@/monitor/process-table';
-import { readProcessTable } from '@/monitor/process-table';
+import { Context, Effect } from 'effect';
 
 export type InboxResourceIdentity = {
   platform: NodeJS.Platform;
@@ -25,14 +24,4 @@ export class InboxRecoveryProbe extends Context.Service<
   {
     released(identity: InboxResourceIdentity): Effect.Effect<boolean, unknown>;
   }
->()('lody/orchestration/InboxRecoveryProbe') {
-  static layer = Layer.succeed(InboxRecoveryProbe, {
-    released: Effect.fn('InboxRecoveryProbe.released')(function* (identity: InboxResourceIdentity) {
-      const snapshot = yield* Effect.tryPromise({
-        try: () => readProcessTable(identity.platform),
-        catch: (cause) => cause,
-      });
-      return provesResourcesGone(identity, snapshot);
-    }),
-  });
-}
+>()('lody/orchestration/InboxRecoveryProbe') {}

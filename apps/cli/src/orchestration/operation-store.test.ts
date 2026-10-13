@@ -1,22 +1,27 @@
 import { buildAgentMessageAuthor } from '@lody/shared';
+import { Effect, Layer } from 'effect';
 import { chmod, mkdtemp, rm, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { InboxRepository } from './inbox/service';
+import { OperationRepository } from './operation-repository';
+import { OrchestrationDatabase } from './platform/database';
+import { orchestrationRepositoriesLayer } from './platform/operations';
 
-import Database from 'better-sqlite3';
-import { afterEach, describe, expect, it } from 'vitest';
 import {
   resolveEffectiveSessionCreateDispatchConfig,
   type ResolvedTurnDispatchConfig,
 } from '@/commands/session';
 import { FlockSyncTimeoutError } from '@/lib/loro/timeout-utils';
+import Database from 'better-sqlite3';
+import { afterEach, describe, expect, it } from 'vitest';
 
 import {
   LODY_OPERATION_COMPLETION_MAX_BYTES,
   type AcpCapabilityCacheEntry,
+  type MachineId,
   type SessionId,
   type WorkspaceId,
-  type MachineId,
 } from '@lody/shared';
 
 import {
@@ -73,6 +78,72 @@ afterEach(async () => {
 });
 
 describe('LodyOperationStore', () => {
+  it('memory repositories share the completion transaction and reject asynchronous transaction callbacks', async () => {
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const connection = yield* OrchestrationDatabase;
+          const operations = yield* OperationRepository;
+          const inbox = yield* InboxRepository;
+          const input = baseInput();
+          yield* operations.accept(input);
+          connection.raw.exec(
+            "CREATE TRIGGER fail_result BEFORE INSERT ON inbox_results BEGIN SELECT RAISE(ABORT,'outage'); END"
+          );
+          const failed = yield* Effect.exit(
+            operations.finish(input.requesterSessionId, input.operationId, {
+              type: 'result',
+              value: { items: [] },
+            })
+          );
+          expect(failed._tag).toBe('Failure');
+          expect((yield* operations.get(input.requesterSessionId, input.operationId)).state).toBe(
+            'active'
+          );
+          expect(
+            connection.raw
+              .prepare("SELECT value FROM orchestration_meta WHERE key='inbox_sequence'")
+              .get()
+          ).toEqual({ value: '0' });
+          connection.raw.exec('DROP TRIGGER fail_result');
+          yield* operations.finish(input.requesterSessionId, input.operationId, {
+            type: 'result',
+            value: { items: [] },
+          });
+          expect(connection.raw.prepare('SELECT sequence FROM inbox_results').all()).toEqual([
+            { sequence: 1 },
+          ]);
+          expect(yield* inbox.pending(input.workspaceId)).toEqual([]);
+          expect(() =>
+            connection.withImmediate((() => {
+              connection.raw.exec("UPDATE operations SET state='active'");
+              return Promise.resolve();
+            }) as never)
+          ).toThrow('ASYNC_SQLITE_TRANSACTION_FORBIDDEN');
+          expect((yield* operations.get(input.requesterSessionId, input.operationId)).state).toBe(
+            'finished'
+          );
+          expect(() =>
+            connection.withImmediate((() => {
+              connection.raw.exec("UPDATE operations SET state='active'");
+              return Effect.void;
+            }) as never)
+          ).toThrow('ASYNC_SQLITE_TRANSACTION_FORBIDDEN');
+          expect((yield* operations.get(input.requesterSessionId, input.operationId)).state).toBe(
+            'finished'
+          );
+        }).pipe(
+          Effect.provide(
+            orchestrationRepositoriesLayer.pipe(
+              // Both consumers receive the same scoped service, not separate memory databases.
+              Layer.provideMerge(OrchestrationDatabase.layer({ kind: 'memory' }))
+            )
+          )
+        )
+      )
+    );
+  });
+
   it('does not infer an Agent source from the requester Session alone', async () => {
     const store = await makeStore();
     try {

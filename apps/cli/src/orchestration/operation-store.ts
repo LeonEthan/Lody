@@ -1,25 +1,26 @@
-import { InboxSqlite } from './inbox/sqlite';
 import { SessionInputAttachmentsSchema } from '@/lib/session-input-content';
 import {
-  MemoryBindingSchema,
-  buildAgentMessageAuthor,
   AgentMessageAuthorSchema,
   AgentRoleSnapshotSchema,
+  buildAgentMessageAuthor,
+  MemoryBindingSchema,
 } from '@lody/shared';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { InboxSqlite } from './inbox/sqlite';
 
-import Database from 'better-sqlite3';
+import type Database from 'better-sqlite3';
 import { z } from 'zod';
+import { OrchestrationConnection } from './platform/database';
 
+import { discoveryCursor, DiscoveryPageShape } from '@/lib/discovery-query';
 import {
   LODY_OPERATION_COMMAND_MAX_BYTES,
   LODY_OPERATION_COMPLETION_MAX_BYTES,
-  LodyOperationItemSchema as OperationItemSchema,
-  LodyOperationCompletionSchema as OperationCompletionSchema,
   LodyOperationIdSchema,
+  LodyOperationCompletionSchema as OperationCompletionSchema,
+  LodyOperationItemSchema as OperationItemSchema,
   type FrozenOperationContinuationConfig,
   type LodyError,
   type LodyOperationCompletion,
@@ -32,7 +33,6 @@ import {
   type WorkspaceId,
 } from '@lody/shared';
 import { getLodyDataDir } from '@lody/shared/node/installation-profile';
-import { discoveryCursor, DiscoveryPageShape } from '@/lib/discovery-query';
 
 export const OperationListQuerySchema = z
   .object({
@@ -324,6 +324,8 @@ export type AcceptOperationOptions = {
 
 export class LodyOperationStore {
   private readonly db: Database.Database;
+  private readonly connection: OrchestrationConnection;
+  private ownsConnection: boolean;
   readonly inbox: InboxSqlite;
 
   /**
@@ -335,31 +337,43 @@ export class LodyOperationStore {
   constructor(
     dbPath: string,
     private readonly now: () => number = Date.now,
-    options: { maintenance?: boolean } = {}
+    options: { maintenance?: boolean; connection?: OrchestrationConnection } = {}
   ) {
-    const storeDirectory = path.dirname(dbPath);
-    mkdirSync(storeDirectory, { recursive: true, mode: 0o700 });
-    chmodSync(storeDirectory, 0o700);
-    this.db = new Database(dbPath);
-    // Operations contain canonical prompts and bounded assistant output. Keep
-    // both the database and SQLite sidecars private to the local account.
-    chmodSync(dbPath, 0o600);
-    this.db.pragma('busy_timeout = 5000');
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
+    this.ownsConnection = !options.connection;
+    this.connection =
+      options.connection ??
+      new OrchestrationConnection(
+        dbPath === ':memory:' ? { kind: 'memory' } : { kind: 'disk', path: dbPath }
+      );
+    this.db = this.connection.raw;
     try {
       this.migrate();
       InboxSqlite.migrate(this.db);
-      this.inbox = new InboxSqlite(this.db, () => new Date(this.now()).toISOString());
+      this.inbox = new InboxSqlite(
+        this.db,
+        () => new Date(this.now()).toISOString(),
+        this.connection
+      );
       if (options.maintenance !== false) this.cleanupExpired(false);
     } catch (cause) {
-      this.db.close();
+      if (this.ownsConnection) this.connection.close();
       throw cause;
     }
   }
 
+  private transaction<A>(body: () => A) {
+    return { immediate: () => this.connection.withImmediate(body as () => never) as A };
+  }
+
+  /** Platform composition transfers the sole close authority into a scoped Database Layer. */
+  takeConnectionOwnership(): OrchestrationConnection {
+    if (!this.ownsConnection) throw new Error('Database ownership already transferred');
+    this.ownsConnection = false;
+    return this.connection;
+  }
+
   close(): void {
-    if (this.db.open) this.db.close();
+    if (this.ownsConnection) this.connection.close();
   }
 
   accept(
@@ -388,7 +402,7 @@ export class LodyOperationStore {
     ) {
       throw new Error('Operation author does not match its source turn.');
     }
-    const transaction = this.db.transaction(
+    const transaction = this.transaction(
       (): { created: boolean; operation: StoredLodyOperation; claimedItemIndexes: number[] } => {
         const existing = this.getStored(input.requesterSessionId, input.operationId);
         if (existing)
@@ -608,19 +622,17 @@ export class LodyOperationStore {
   }
 
   settleProgress(requesterSessionId: SessionId, operationId: string): void {
-    this.db
-      .transaction(() => {
-        this.db
-          .prepare(
-            `INSERT OR IGNORE INTO operation_progress_settlements
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO operation_progress_settlements
         (requester_session_id, operation_id)
         SELECT requester_session_id, operation_id FROM operations
         WHERE requester_session_id = ? AND operation_id = ? AND state = 'finished'
           AND kind IN ('session_create', 'session_create_many')`
-          )
-          .run(requesterSessionId, operationId);
-      })
-      .immediate();
+        )
+        .run(requesterSessionId, operationId);
+    }).immediate();
   }
 
   updateItems(
@@ -648,35 +660,33 @@ export class LodyOperationStore {
     claimToken: string,
     claimDurationMs = MATERIALIZATION_CLAIM_MS
   ): { claimed: boolean; retryAtMs?: number } {
-    return this.db
-      .transaction(() => {
-        const operation = this.get(requesterSessionId, operationId);
-        const item = operation.items[itemIndex];
-        if (!item || item.status !== 'active' || item.inputDurable) return { claimed: false };
-        const row = this.db
-          .prepare(
-            `SELECT claim_token, claimed_at_ms FROM operation_item_materializations
+    return this.transaction(() => {
+      const operation = this.get(requesterSessionId, operationId);
+      const item = operation.items[itemIndex];
+      if (!item || item.status !== 'active' || item.inputDurable) return { claimed: false };
+      const row = this.db
+        .prepare(
+          `SELECT claim_token, claimed_at_ms FROM operation_item_materializations
            WHERE requester_session_id = ? AND operation_id = ? AND item_index = ?`
-          )
-          .get(requesterSessionId, operationId, itemIndex) as
-          | { claim_token: string; claimed_at_ms: number }
-          | undefined;
-        const nowMs = this.now();
-        if (row && row.claim_token !== claimToken && row.claimed_at_ms + claimDurationMs > nowMs) {
-          return { claimed: false, retryAtMs: row.claimed_at_ms + claimDurationMs };
-        }
-        this.db
-          .prepare(
-            `INSERT INTO operation_item_materializations (
+        )
+        .get(requesterSessionId, operationId, itemIndex) as
+        | { claim_token: string; claimed_at_ms: number }
+        | undefined;
+      const nowMs = this.now();
+      if (row && row.claim_token !== claimToken && row.claimed_at_ms + claimDurationMs > nowMs) {
+        return { claimed: false, retryAtMs: row.claimed_at_ms + claimDurationMs };
+      }
+      this.db
+        .prepare(
+          `INSERT INTO operation_item_materializations (
              requester_session_id, operation_id, item_index, claim_token, claimed_at_ms
            ) VALUES (?, ?, ?, ?, ?)
            ON CONFLICT(requester_session_id, operation_id, item_index)
            DO UPDATE SET claim_token = excluded.claim_token, claimed_at_ms = excluded.claimed_at_ms`
-          )
-          .run(requesterSessionId, operationId, itemIndex, claimToken, nowMs);
-        return { claimed: true };
-      })
-      .immediate();
+        )
+        .run(requesterSessionId, operationId, itemIndex, claimToken, nowMs);
+      return { claimed: true };
+    }).immediate();
   }
 
   markItemInputDurable(
@@ -685,40 +695,38 @@ export class LodyOperationStore {
     itemIndex: number,
     claimToken?: string
   ): StoredLodyOperation {
-    return this.db
-      .transaction(() => {
-        const operation = this.get(requesterSessionId, operationId);
-        const item = operation.items[itemIndex];
-        if (!item || item.status !== 'active' || item.inputDurable) return operation;
-        if (claimToken) {
-          const claim = this.db
-            .prepare(
-              `SELECT claim_token FROM operation_item_materializations
+    return this.transaction(() => {
+      const operation = this.get(requesterSessionId, operationId);
+      const item = operation.items[itemIndex];
+      if (!item || item.status !== 'active' || item.inputDurable) return operation;
+      if (claimToken) {
+        const claim = this.db
+          .prepare(
+            `SELECT claim_token FROM operation_item_materializations
              WHERE requester_session_id = ? AND operation_id = ? AND item_index = ?`
-            )
-            .get(requesterSessionId, operationId, itemIndex) as { claim_token: string } | undefined;
-          if (claim?.claim_token !== claimToken) return operation;
-        }
-        const items = operation.items.map((candidate, index) =>
-          index === itemIndex && candidate.status === 'active'
-            ? { ...candidate, inputDurable: true }
-            : candidate
-        );
-        this.db
-          .prepare(
-            `UPDATE operations SET items_json = ?
+          )
+          .get(requesterSessionId, operationId, itemIndex) as { claim_token: string } | undefined;
+        if (claim?.claim_token !== claimToken) return operation;
+      }
+      const items = operation.items.map((candidate, index) =>
+        index === itemIndex && candidate.status === 'active'
+          ? { ...candidate, inputDurable: true }
+          : candidate
+      );
+      this.db
+        .prepare(
+          `UPDATE operations SET items_json = ?
            WHERE requester_session_id = ? AND operation_id = ? AND state = 'active'`
-          )
-          .run(JSON.stringify(items), requesterSessionId, operationId);
-        this.db
-          .prepare(
-            `DELETE FROM operation_item_materializations
+        )
+        .run(JSON.stringify(items), requesterSessionId, operationId);
+      this.db
+        .prepare(
+          `DELETE FROM operation_item_materializations
            WHERE requester_session_id = ? AND operation_id = ? AND item_index = ?`
-          )
-          .run(requesterSessionId, operationId, itemIndex);
-        return this.get(requesterSessionId, operationId);
-      })
-      .immediate();
+        )
+        .run(requesterSessionId, operationId, itemIndex);
+      return this.get(requesterSessionId, operationId);
+    }).immediate();
   }
 
   finish(
@@ -728,7 +736,7 @@ export class LodyOperationStore {
     finishedAt = new Date(this.now()).toISOString()
   ): StoredLodyOperation {
     const bounded = this.assertCompletionBound(completion);
-    const transaction = this.db.transaction(() => {
+    const transaction = this.transaction(() => {
       const current = this.getStored(requesterSessionId, operationId);
       if (!current) {
         throw new LodyOperationStoreError(
@@ -767,7 +775,7 @@ export class LodyOperationStore {
     requesterSessionId: SessionId,
     operationId: string
   ): { operation: StoredLodyOperation; didCancel: boolean } {
-    const transaction = this.db.transaction(() => {
+    const transaction = this.transaction(() => {
       const current = this.get(requesterSessionId, operationId);
       if (current.state === 'finished') {
         return { operation: current, didCancel: false };
@@ -785,14 +793,12 @@ export class LodyOperationStore {
   }
 
   deleteRequesterSession(requesterSessionId: SessionId): void {
-    this.db
-      .transaction(() => {
-        this.inbox.deleteSession(requesterSessionId);
-        this.db
-          .prepare('DELETE FROM operations WHERE requester_session_id = ?')
-          .run(requesterSessionId);
-      })
-      .immediate();
+    this.transaction(() => {
+      this.inbox.deleteSession(requesterSessionId);
+      this.db
+        .prepare('DELETE FROM operations WHERE requester_session_id = ?')
+        .run(requesterSessionId);
+    }).immediate();
   }
 
   snapshot(operation: StoredLodyOperation): LodyOperationSnapshot {
@@ -987,11 +993,10 @@ export class LodyOperationStore {
       return;
     }
     const cutoff = new Date(nowMs - TERMINAL_RETENTION_MS).toISOString();
-    this.db
-      .transaction(() => {
-        this.db
-          .prepare(
-            `DELETE FROM operations
+    this.transaction(() => {
+      this.db
+        .prepare(
+          `DELETE FROM operations
            WHERE state = 'finished'
              AND (kind NOT IN ('session_create', 'session_create_many') OR EXISTS (
                SELECT 1 FROM operation_progress_settlements p
@@ -1004,63 +1009,61 @@ export class LodyOperationStore {
                  AND r.operation_id=operations.operation_id
                  AND r.consumed=1 AND r.consumed_at < ?
              )`
-          )
-          .run(cutoff);
-        this.inbox.cleanupExpired();
-        this.db
-          .prepare(
-            `INSERT INTO orchestration_meta (key, value) VALUES ('last_cleanup_at_ms', ?)
+        )
+        .run(cutoff);
+      this.inbox.cleanupExpired();
+      this.db
+        .prepare(
+          `INSERT INTO orchestration_meta (key, value) VALUES ('last_cleanup_at_ms', ?)
            ON CONFLICT(key) DO UPDATE SET value = excluded.value`
-          )
-          .run(String(nowMs));
-      })
-      .immediate();
+        )
+        .run(String(nowMs));
+    }).immediate();
   }
 
   private migrate(): void {
     if (!this.isMigrationRequired()) return;
 
-    this.db
-      .transaction(() => {
-        const tables = new Set(
+    this.transaction(() => {
+      const tables = new Set(
+        (
+          this.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {
+            name: string;
+          }[]
+        ).map((r) => r.name)
+      );
+      const hasInbox = tables.has('inbox_sessions');
+      let sequence = 0;
+      if (tables.has('sqlite_sequence')) {
+        sequence =
           (
-            this.db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as {
-              name: string;
-            }[]
-          ).map((r) => r.name)
-        );
-        const hasInbox = tables.has('inbox_sessions');
-        let sequence = 0;
-        if (tables.has('sqlite_sequence')) {
-          sequence =
-            (
-              this.db.prepare("SELECT seq FROM sqlite_sequence WHERE name='deliveries'").get() as
-                | { seq: number }
-                | undefined
-            )?.seq ?? 0;
+            this.db.prepare("SELECT seq FROM sqlite_sequence WHERE name='deliveries'").get() as
+              | { seq: number }
+              | undefined
+          )?.seq ?? 0;
+      }
+      // Retire old-only stores, never restore their unfinished tasks or receipts.
+      // A previous Inbox keeps its current ownership, pause and no-replay evidence.
+      if (tables.has('operations') && !hasInbox) {
+        for (const table of [
+          'operation_item_materializations',
+          'operation_progress_settlements',
+          'operation_authors',
+          'operation_inputs',
+          'delivery_execution_state',
+          'deliveries',
+          'operations',
+          'operation_retired_ids',
+          'orchestration_meta',
+        ]) {
+          this.db.exec(`DROP TABLE IF EXISTS ${table}`);
         }
-        // Retire old-only stores, never restore their unfinished tasks or receipts.
-        // A previous Inbox keeps its current ownership, pause and no-replay evidence.
-        if (tables.has('operations') && !hasInbox) {
-          for (const table of [
-            'operation_item_materializations',
-            'operation_progress_settlements',
-            'operation_authors',
-            'operation_inputs',
-            'delivery_execution_state',
-            'deliveries',
-            'operations',
-            'operation_retired_ids',
-            'orchestration_meta',
-          ]) {
-            this.db.exec(`DROP TABLE IF EXISTS ${table}`);
-          }
-          sequence = 0;
-        }
-        this.db.exec(
-          'DROP TRIGGER IF EXISTS inbox_results_insert; DROP TRIGGER IF EXISTS inbox_reject_legacy_submission; DROP TRIGGER IF EXISTS deliveries_insert_execution_state; DROP TABLE IF EXISTS delivery_execution_state; DROP TABLE IF EXISTS deliveries;'
-        );
-        this.db.exec(`
+        sequence = 0;
+      }
+      this.db.exec(
+        'DROP TRIGGER IF EXISTS inbox_results_insert; DROP TRIGGER IF EXISTS inbox_reject_legacy_submission; DROP TRIGGER IF EXISTS deliveries_insert_execution_state; DROP TABLE IF EXISTS delivery_execution_state; DROP TABLE IF EXISTS deliveries;'
+      );
+      this.db.exec(`
       CREATE TABLE IF NOT EXISTS operations (
         workspace_id TEXT NOT NULL,
         owner_machine_id TEXT NOT NULL,
@@ -1149,35 +1152,34 @@ export class LodyOperationStore {
         value TEXT NOT NULL
       );
     `);
-        if (hasInbox) {
-          // Passive upgrade copies with no batch are legacy backlog, not new work.
-          this.db.exec(`DELETE FROM operations WHERE EXISTS(
+      if (hasInbox) {
+        // Passive upgrade copies with no batch are legacy backlog, not new work.
+        this.db.exec(`DELETE FROM operations WHERE EXISTS(
             SELECT 1 FROM inbox_results r WHERE r.session_id=operations.requester_session_id
             AND r.operation_id=operations.operation_id AND r.automatic_eligible=0
             AND NOT EXISTS(SELECT 1 FROM inbox_members m WHERE m.sequence=r.sequence));
             DELETE FROM inbox_results WHERE automatic_eligible=0
             AND NOT EXISTS(SELECT 1 FROM inbox_members m WHERE m.sequence=inbox_results.sequence);`);
-          sequence = Math.max(
-            sequence,
-            (
-              this.db
-                .prepare('SELECT COALESCE(MAX(sequence),0) AS value FROM inbox_results')
-                .get() as { value: number }
-            ).value
-          );
-        }
-        this.db
-          .prepare(
-            "INSERT INTO orchestration_meta VALUES('inbox_sequence',?) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)"
-          )
-          .run(String(sequence));
-        this.db
-          .prepare(
-            "INSERT INTO orchestration_meta VALUES('schema_version','2') ON CONFLICT(key) DO UPDATE SET value=excluded.value"
-          )
-          .run();
-      })
-      .immediate();
+        sequence = Math.max(
+          sequence,
+          (
+            this.db
+              .prepare('SELECT COALESCE(MAX(sequence),0) AS value FROM inbox_results')
+              .get() as { value: number }
+          ).value
+        );
+      }
+      this.db
+        .prepare(
+          "INSERT INTO orchestration_meta VALUES('inbox_sequence',?) ON CONFLICT(key) DO UPDATE SET value=CAST(MAX(CAST(value AS INTEGER),CAST(excluded.value AS INTEGER)) AS TEXT)"
+        )
+        .run(String(sequence));
+      this.db
+        .prepare(
+          "INSERT INTO orchestration_meta VALUES('schema_version','2') ON CONFLICT(key) DO UPDATE SET value=excluded.value"
+        )
+        .run();
+    }).immediate();
   }
 
   private isMigrationRequired(): boolean {

@@ -1,8 +1,7 @@
 import { Context, Effect, Layer, Queue, Semaphore } from 'effect';
-import type { InboxSqlite } from './sqlite';
 import {
-  inboxScopeKey,
   InboxAdmissionRejected,
+  inboxScopeKey,
   type InboxBatch,
   type InboxInput,
   type InboxRelease,
@@ -10,6 +9,7 @@ import {
 } from './model';
 
 type Repository = {
+  abandon(workspaceId: string, sessionId: string, id: string): Effect.Effect<void, unknown>;
   deactivate(workspaceId: string, owner: string): Effect.Effect<void, unknown>;
   cancelExecution(scope: InboxScope, id: string): Effect.Effect<boolean, unknown>;
   adopt(previous: InboxInput, next: InboxInput, id: string): Effect.Effect<boolean, unknown>;
@@ -41,32 +41,6 @@ type Repository = {
 export class InboxRepository extends Context.Service<InboxRepository, Repository>()(
   'lody/orchestration/InboxRepository'
 ) {}
-export const inboxRepositoryLayer = (sql: InboxSqlite, ownedConnection = false) => {
-  const io = <A>(f: () => A) => Effect.try({ try: f, catch: (cause) => cause });
-  const repository: Repository = {
-    deactivate: (w, o) => io(() => sql.deactivate(w, o)),
-    cancelExecution: (scope, id) => io(() => sql.cancelExecution(scope, id)),
-    adopt: (p, n, id) => io(() => sql.adoptExecution(p, n, id)),
-    canSubmit: (s, id, o) => io(() => sql.canSubmit(s, id, o)),
-    accept: (i) => io(() => sql.accept(i)),
-    begin: (s, id, owner) => io(() => sql.begin(s, id, owner)),
-    pause: (s, id, ids, cancelId) => io(() => sql.pause(s, id, ids, cancelId)),
-    release: (e) => io(() => sql.release(e)),
-    prepare: (i, o, id) => io(() => sql.prepare(i, o, id)),
-    fence: (b, id) => io(() => sql.fence(b, id)),
-    pending: (w) => io(() => sql.pending(w)),
-    settle: (b, o, c) => io(() => sql.settle(b, o, c)),
-  };
-  return ownedConnection
-    ? Layer.effect(
-        InboxRepository,
-        Effect.acquireRelease(Effect.succeed(repository), () =>
-          io(() => sql.closeConnection()).pipe(Effect.orDie)
-        )
-      )
-    : Layer.succeed(InboxRepository, repository);
-};
-
 /** Registered temporary adapter for the unfinished Session/ACP owner. */
 export class InboxExecution extends Context.Service<
   InboxExecution,
@@ -88,6 +62,7 @@ export class OperationInbox extends Context.Service<
       id: string,
       update: () => void
     ): Effect.Effect<void, unknown>;
+    abandon(workspaceId: string, sessionId: string, id: string): Effect.Effect<void, unknown>;
     wake: Effect.Effect<void>;
     quiesce: Effect.Effect<void, unknown>;
     cancelExecution(scope: InboxScope, id: string): Effect.Effect<boolean, unknown>;
@@ -262,6 +237,10 @@ export class OperationInbox extends Context.Service<
               )
             );
           }),
+          abandon: (targetWorkspaceId, sessionId, id) =>
+            gate({ workspaceId: targetWorkspaceId, sessionId, userId: '' }).withPermit(
+              repo.abandon(targetWorkspaceId, sessionId, id)
+            ),
           wake,
           quiesce: submissionGate.withPermit(
             Effect.uninterruptible(

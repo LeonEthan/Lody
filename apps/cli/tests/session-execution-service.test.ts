@@ -1,72 +1,72 @@
 import { createSessionBackend } from '@/session/session-backend';
-import { operationInboxLegacy } from '../src/orchestration/inbox/legacy';
-import { withHistoryPort } from './history-port-fixture';
-import { describe, expect, it, vi } from 'vitest';
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import type { LoroRepo } from 'loro-repo';
-import { Effect, Fiber } from 'effect';
 import {
   RequestError,
   type ContentBlock,
   type PromptRequest,
   type PromptResponse,
 } from '@agentclientprotocol/sdk';
-import type { Logger } from '../src/utils/logger';
 import {
-  SessionExecutionService,
-  type SessionExecutionServiceDeps,
-} from '../src/session/session-execution-service';
-import {
-  buildSessionTurnInputConfig,
-  inputBlocksToHistoryItems,
-  type AgentRoleId,
   ACP_CAPABILITY_CACHE_VERSION,
   ACP_CAPABILITY_REFRESH_CACHE_TTL_MS,
-  type AcpCapabilityCacheEntry,
+  buildSessionTurnInputConfig,
   getMachineRoomId,
   getSessionRoomId,
+  inputBlocksToHistoryItems,
   SessionStatusFactory,
+  type AcpCapabilityCacheEntry,
   type ACPSessionId,
-  type AgentConfigMeta,
   type AgentConfigId,
-  type MachineFlockKey,
+  type AgentConfigMeta,
+  type AgentRoleId,
   type ChatFailedReason,
   type LocalProjectId,
+  type MachineFlockKey,
   type MachineId,
   type SessionGoalMessage,
   type SessionHistoryInput,
   type SessionId,
-  type SessionMeta,
   type SessionInputBlock,
+  type SessionMeta,
   type SessionStatus,
   type WorkspaceId,
 } from '@lody/shared';
+import Database from 'better-sqlite3';
+import { Effect, Fiber } from 'effect';
+import type { LoroRepo } from 'loro-repo';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import { AcpAuthenticationManager } from '../src/agent/acp-authentication';
+import { AcpAuthenticationRequiredError, AgentClient } from '../src/agent/agent-client';
+import * as codexProfiles from '../src/agent/codex-profile-store';
+import * as piDiscovery from '../src/agent/pi-extensions';
+import { markAssistantTurnFinished } from '../src/lib/assistant-turn-finalize';
+import { MachineDocument, SessionDocument, type LoroDocumentManager } from '../src/lib/loro/doc';
 import {
   SessionActivePresenceController,
   type SessionActivePresencePhase,
 } from '../src/lib/loro/session-active-presence';
-import type { SessionManager } from '../src/session/session-manager';
-import { MachineDocument, SessionDocument, type LoroDocumentManager } from '../src/lib/loro/doc';
-import { composeTestSessionDoc } from './session-doc-fixture';
-import Database from 'better-sqlite3';
-import { Session } from '../src/session/session';
-import { SessionEditAndResendService } from '../src/session/session-edit-and-resend-service';
-import { AcpAuthenticationRequiredError, AgentClient } from '../src/agent/agent-client';
-import { AcpAuthenticationManager } from '../src/agent/acp-authentication';
-import * as piDiscovery from '../src/agent/pi-extensions';
-import * as codexProfiles from '../src/agent/codex-profile-store';
-import { GitExecutableNotFoundError } from '../src/session/worktree/git-process-error';
+import { operationInboxLegacy } from '../src/orchestration/inbox/legacy';
 import { LodyOperationStore } from '../src/orchestration/operation-store';
-import { markAssistantTurnFinished } from '../src/lib/assistant-turn-finalize';
-import {
-  resolveDispatchTurnInput,
-  findNextDispatchableUserTurn,
-} from '../src/session/session-dispatch-logic';
 import { applyAcpSessionRunConfig } from '../src/session/acp-session-config-applier';
+import { Session } from '../src/session/session';
+import {
+  findNextDispatchableUserTurn,
+  resolveDispatchTurnInput,
+} from '../src/session/session-dispatch-logic';
+import { SessionEditAndResendService } from '../src/session/session-edit-and-resend-service';
+import {
+  SessionExecutionService,
+  type SessionExecutionServiceDeps,
+} from '../src/session/session-execution-service';
+import type { SessionManager } from '../src/session/session-manager';
+import { GitExecutableNotFoundError } from '../src/session/worktree/git-process-error';
+import type { Logger } from '../src/utils/logger';
+import { withHistoryPort } from './history-port-fixture';
+import { composeTestSessionDoc } from './session-doc-fixture';
 
 const capabilityConfigId = 'config-1' as AgentConfigId;
 
@@ -10410,7 +10410,7 @@ describe('Operation Inbox execution boundary', () => {
       },
       report: () => {},
     });
-    service.setOperationInbox(bridge, store.inbox);
+    service.setOperationInbox(bridge);
     const message = {
       type: 'session/chat' as const,
       sessionId,

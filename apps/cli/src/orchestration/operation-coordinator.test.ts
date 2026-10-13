@@ -1,17 +1,17 @@
 import Database from 'better-sqlite3';
-import { withHistoryPort } from '../../tests/history-port-fixture';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { withHistoryPort } from '../../tests/history-port-fixture';
 
-import { afterEach, describe, expect, it, vi } from 'vitest';
 import { LoroDoc } from 'loro-crdt';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   getAgentConfigRoomId,
+  getSessionRoomId,
   machineFlockKeys,
   type AgentConfigMeta,
-  getSessionRoomId,
   type MachineId,
   type SessionHistoryInput,
   type SessionId,
@@ -464,7 +464,9 @@ describe('LodyOperationCoordinator', () => {
   });
 
   it('retries transient target materialization on its own bounded timer', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const harness = await makeHarness({
       targetInputDurable: false,
       materializationFailuresBeforeSuccess: 2,
@@ -511,7 +513,9 @@ describe('LodyOperationCoordinator', () => {
   });
 
   it('recognizes an ambiguous successful write before retrying materialization', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const harness = await makeHarness({
       targetInputDurable: false,
       materializationFailuresBeforeSuccess: 1,
@@ -540,7 +544,9 @@ describe('LodyOperationCoordinator', () => {
   });
 
   it('waits for cross-replica target catch-up before replaying a fixed turn', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const fixedTurn: SessionHistoryInput = {
       id: 'turn-1',
       role: 'user',
@@ -635,7 +641,9 @@ describe('LodyOperationCoordinator', () => {
   });
 
   it('replays when the fixed turn exists but its dispatch pointer was not written', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const harness = await makeHarness({
       targetInputDurable: false,
       materializationFailuresBeforeSuccess: 1,
@@ -691,7 +699,9 @@ describe('LodyOperationCoordinator', () => {
   });
 
   it('does not start materialization after the deadline passes during an evidence read', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const deadlineMs = TEST_NOW_MS + 1;
     let nowMs = TEST_NOW_MS;
     let releaseMetaReadSignal!: () => void;
@@ -735,7 +745,9 @@ describe('LodyOperationCoordinator', () => {
   });
 
   it('does not start materialization after the deadline passes during target catch-up', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const deadlineMs = TEST_NOW_MS + 1;
     let nowMs = TEST_NOW_MS;
     let releaseTargetSync!: () => void;
@@ -1083,7 +1095,9 @@ describe('LodyOperationCoordinator', () => {
   });
 
   it('retries failed terminal progress writes after delivery without needing another history event', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     const harness = await makeHarness({
       operationKind: 'session_create',
       deadlineAt: '2026-07-19T23:59:59.000Z',

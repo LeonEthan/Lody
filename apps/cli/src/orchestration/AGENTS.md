@@ -1,9 +1,9 @@
 # MCP Session orchestration
 
-Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behavior.
+Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
 
 - `operation-store.ts` is the shared machine-local WAL SQLite source of truth.
-  The key is `(requesterSessionId, operationId)`; foreign Session lookup must be
+  Key: `(requesterSessionId, operationId)`; foreign Session lookup must be
   indistinguishable from absence. Operation finalization and Inbox result insertion
   are one transaction. Cleanup retains retired ids; accepting them again is forbidden.
   Result/system-Turn ids include both key parts; never
@@ -36,14 +36,14 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
 - Reconciliation is level-checked. Loro subscriptions and SQLite directory
   watch events are hints; startup/lease acquisition scans active Operations and
   durable Inbox intents and unsettled progress once. The watcher never carries result data.
-- The coordinator holds ONE store connection from start to stop. Watch wakes are
+- Coordinator owns ONE connection from start to stop. Watch wakes are
   leading-edge coalesced; never do store work per raw fs event.
 - The MCP server holds ONE lazy store connection with `maintenance: false`.
   Current-schema detection is read-only; migration locks only when needed.
   The daemon owns open-time repair/cleanup. Never reopen per call.
-  See [connection and notification rationale](README.md).
-- WAL allows one writer machine-wide. Every writing store transaction runs
-  `BEGIN IMMEDIATE`. Subprocess
+  See [README](README.md).
+- One scoped connection is shared by repositories. Transactions are synchronous; never await
+  or return Effect/Promise inside them. WAL has one writer; writes use `BEGIN IMMEDIATE`. Subprocess
   boundaries wrap store calls in `runWithOperationStoreBusyRetry` (bounded
   async backoff; exhausted retries surface as retryable `STORE_BUSY`). Daemon
   paths must not add blocking waits on top of the driver's `busy_timeout`.
@@ -54,7 +54,7 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   never resnapshot or wake. Late results wait for fresh input or another normal boundary.
 - `inbox/service.ts` is native Effect v4. Scope owns its signal/fibers and repository connection;
   one per-Session admission covers Stop, trusted human acceptance and actual transport start.
-  Only `inbox/legacy.ts` creates the registered host runtime; the kernel never imports consumers.
+  Native workflows never import platform I/O or consumers. Registered entry bridges own runtimes.
 - Stop persists pause and cancels pre-Stop queued input eligibility while retaining history.
   Only trusted fresh human receipts clear pause; role/userId/author are insufficient. New human
   acceptance cannot revive a canceled execution or discard an already prepared human input.

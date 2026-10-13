@@ -1,85 +1,24 @@
-import { inboxFailureDiagnostic } from '@/orchestration/inbox/model';
-import { findProgressMessageId } from '@lody/shared/session-data';
-import type { OperationInboxLegacy } from '@/orchestration/inbox/legacy';
+import { type AcpLauncher, resolveAcpLauncher } from '@/agent/acp-analytics';
 import {
-  batchPreview,
-  batchHistoryMembers,
-  type InboxBatch,
-  type InboxInput,
-} from '@/orchestration/inbox/model';
-import type { InboxSqlite } from '@/orchestration/inbox/sqlite';
-import { isSessionCollaborationStopped } from '@lody/shared';
+  AcpAuthenticationManager,
+  type AcpAuthenticationProgressEvent,
+} from '@/agent/acp-authentication';
+import { AcpBinaryUnsupportedPlatformError, getAcpBinaryManager } from '@/agent/acp-binary-manager';
+import type { FetchAcpCapabilitiesOptions } from '@/agent/acp-capabilities';
+import { AcpAuthenticationRequiredError, type SteerOutcomeResult } from '@/agent/agent-client';
+import type { GoalPromptControl } from '@/agent/goal-control';
 import {
-  acpOwnsSessionTitleGeneration,
-  type AcpModelControls,
-  type ACPSessionId,
-  type AgentConfigId,
-  type AgentConfigCliType,
-  type AgentConfigMeta,
-  type ChatFailedCode,
-  type ChatFailedReason,
-  type SessionGoalAction,
-  type SessionGoalResponse,
-  type IssuePRMention,
-  type LocalProjectId,
-  type MachineAcpBinaryInstallRequestValidated,
-  type MachineAcpBinaryInstallResponse,
-  type MachineAcpBinaryProgressMessage,
-  type MachineAcpBinaryStatusRequestValidated,
-  type MachineAcpBinaryStatusResponse,
-  type MachineAcpCapabilitiesRefreshRequestValidated,
-  type MachineAcpCapabilitiesRefreshResponse,
-  type MachineAcpAuthMethodSummary,
-  type MachineAcpAuthenticateRequestValidated,
-  type MachineAcpAuthenticateResponse,
-  type MachineAcpAuthenticationProgressMessage,
-  type MachineId,
-  type MachinePiExtensionsResponse,
-  type MachinePingRequestValidated,
-  type MachinePingResponse,
-  type MachineLifecycleCapability,
-  REGISTRY_ACP_AGENTS,
-  type RegistryAcpAgent,
-  type MachineStatusRequestValidated,
-  type MachineStatusResponse,
-  type MachineResourceInfo,
-  type ProjectRef,
-  resolveBaseBranchPreference,
-  resolveProjectGitHubRepo,
-  getSessionRoomId,
-  type AcpCapabilityCacheEntry,
-  decideAcpCapabilityRefreshCache,
-  getServerNow,
-  SessionCreateRequestValidated,
-  SessionHistoryInput,
-  type SessionId,
-  type SessionInputBlock,
-  type SessionTurnInputConfig,
-  type SessionMeta,
-  type SessionSteerOperationRecord,
-  SessionStatusFactory,
-  SessionChatRequestValidated,
-  SessionCancelRequestValidated,
-  type SessionSteerResponse,
-  type WorkspaceId,
-  hasRecentResumeNotice,
-  buildReplayPromptFromHistory,
-  type ReplayPromptResult,
-  type AcpCommandSummary,
-  type AcpConfigOptionSummary,
-  type AcpConfigOptionValue,
-  type BuiltinRuntimeOverrides,
-  type CustomAcpLaunchSpec,
-  hasBuiltinRuntimeOverrideValues,
-  getManagedBuiltinRuntimeByAgentType,
-  getManagedBuiltinRuntimeByRuntimeName,
-  serializeCustomAcpLaunchSpec,
-  resolveSessionExecutionInputBlocks,
-} from '@lody/shared';
-import type { ContentBlock } from '@agentclientprotocol/sdk';
-import { createHash, randomUUID } from 'node:crypto';
-import type { ModelInfo } from '@lody/shared';
-import { Cause, Data, Effect, Exit, Fiber, Scope } from 'effect';
+  classifyManagedRuntimeFailureReason,
+  formatManagedRuntimeFailureMessage,
+  getManagedAgentRuntimeManager,
+  type ManagedRuntimeName,
+  type ManagedRuntimeProgressEvent,
+  ManagedRuntimeUnsupportedPlatformError,
+} from '@/agent/managed-agent-runtime';
+import { discoverManagedPiExtensions } from '@/agent/pi-extensions';
+import { getAcpCapabilitySourceVersion, resolveACPProcessLaunch } from '@/agent/setting';
+import { captureCli } from '@/lib/analytics/posthog';
+import { ConcurrentQueue } from '@/lib/concurrent-queue';
 import {
   captureGitWorkingTreeDiffBaseline,
   getCurrentCommitHash,
@@ -87,57 +26,104 @@ import {
   type GitWorkingTreeDiffBaseline,
 } from '@/lib/git/git-diff-stats';
 import { resolveWorkspaceLocalProjectRootPathWithRetry } from '@/lib/local-project-meta';
-import { readTimeoutEnv, withTimeout } from '@/lib/loro/timeout-utils';
-import { ConcurrentQueue } from '@/lib/concurrent-queue';
-import {
-  localProjectsLegacy,
-  createLocalProjectBranchSelector,
-} from '@lody/shared/node/local-project';
-import { getAcpCapabilitySourceVersion, resolveACPProcessLaunch } from '@/agent/setting';
-import { type AcpLauncher, resolveAcpLauncher } from '@/agent/acp-analytics';
-import { AcpBinaryUnsupportedPlatformError, getAcpBinaryManager } from '@/agent/acp-binary-manager';
-import {
-  classifyManagedRuntimeFailureReason,
-  formatManagedRuntimeFailureMessage,
-  getManagedAgentRuntimeManager,
-  ManagedRuntimeUnsupportedPlatformError,
-  type ManagedRuntimeProgressEvent,
-  type ManagedRuntimeName,
-} from '@/agent/managed-agent-runtime';
-import type { FetchAcpCapabilitiesOptions } from '@/agent/acp-capabilities';
-import { AcpAuthenticationRequiredError, type SteerOutcomeResult } from '@/agent/agent-client';
-import { discoverManagedPiExtensions } from '@/agent/pi-extensions';
-import type { GoalPromptControl } from '@/agent/goal-control';
-import {
-  AcpAuthenticationManager,
-  type AcpAuthenticationProgressEvent,
-} from '@/agent/acp-authentication';
-import { formatErrorMessage } from '@/utils/format-error';
-import type { Logger } from '@/utils/logger';
-import { startTraceSpan, traceAsync } from '@/utils/trace-span';
-import { captureCli } from '@/lib/analytics/posthog';
+import type { LoroDocumentManager, SessionDocument } from '@/lib/loro/doc';
+import { subscribeSessionChanges } from '@/lib/loro/doc';
 import type {
   SessionActivePresencePhase,
   SessionInitializationStall,
 } from '@/lib/loro/session-active-presence';
-import type { SessionConfig } from './types';
-import type { ISession, SessionManager } from './session-manager';
-import type { LoroDocumentManager, SessionDocument } from '@/lib/loro/doc';
-import { subscribeSessionChanges } from '@/lib/loro/doc';
-import { createSessionBackend, getSteerOperationId, type SessionBackend } from './session-backend';
-import { buildPrompt } from './session-execution-helpers';
-import { isAllocatedSessionBranchName } from './worktree/branch-name-allocation';
+import { readTimeoutEnv, withTimeout } from '@/lib/loro/timeout-utils';
 import type { MemoryPressureEvictionResult } from '@/lib/session-gc-manager';
+import type { OperationInboxLegacy } from '@/orchestration/inbox/legacy';
 import {
-  resolveDispatchAcpSessionId,
-  resolveResumableAcpSessionId,
-} from './session-dispatch-logic';
-import { resolveSessionLaunchConfig } from './session-launch-config-resolver';
-import type { MachineAccessVerification } from './session-access-retry';
+  batchHistoryMembers,
+  batchPreview,
+  type InboxBatch,
+  type InboxInput,
+} from '@/orchestration/inbox/model';
+import { sessionExecutionResource } from '@/orchestration/platform/session-resources';
+import { formatErrorMessage } from '@/utils/format-error';
+import type { Logger } from '@/utils/logger';
+import { startTraceSpan, traceAsync } from '@/utils/trace-span';
+import type { ContentBlock } from '@agentclientprotocol/sdk';
+import type { ModelInfo } from '@lody/shared';
 import {
-  GIT_EXECUTABLE_NOT_FOUND_CODE,
-  isGitExecutableNotFoundError,
-} from './worktree/git-process-error';
+  type AcpCapabilityCacheEntry,
+  type AcpCommandSummary,
+  type AcpConfigOptionSummary,
+  type AcpConfigOptionValue,
+  type AcpModelControls,
+  acpOwnsSessionTitleGeneration,
+  type ACPSessionId,
+  type AgentConfigCliType,
+  type AgentConfigId,
+  type AgentConfigMeta,
+  assertManagedCodexProfileConfig,
+  buildReplayPromptFromHistory,
+  type BuiltinRuntimeOverrides,
+  type ChatFailedCode,
+  type ChatFailedReason,
+  type CustomAcpLaunchSpec,
+  decideAcpCapabilityRefreshCache,
+  getManagedBuiltinRuntimeByAgentType,
+  getManagedBuiltinRuntimeByRuntimeName,
+  getServerNow,
+  getSessionRoomId,
+  hasBuiltinRuntimeOverrideValues,
+  hasRecentResumeNotice,
+  isSessionCollaborationStopped,
+  type IssuePRMention,
+  type LocalProjectId,
+  type MachineAcpAuthenticateRequestValidated,
+  type MachineAcpAuthenticateResponse,
+  type MachineAcpAuthenticationProgressMessage,
+  type MachineAcpAuthMethodSummary,
+  type MachineAcpBinaryInstallRequestValidated,
+  type MachineAcpBinaryInstallResponse,
+  type MachineAcpBinaryProgressMessage,
+  type MachineAcpBinaryStatusRequestValidated,
+  type MachineAcpBinaryStatusResponse,
+  type MachineAcpCapabilitiesRefreshRequestValidated,
+  type MachineAcpCapabilitiesRefreshResponse,
+  type MachineId,
+  type MachineLifecycleCapability,
+  type MachinePiExtensionsResponse,
+  type MachinePingRequestValidated,
+  type MachinePingResponse,
+  type MachineResourceInfo,
+  type MachineStatusRequestValidated,
+  type MachineStatusResponse,
+  type ProjectRef,
+  REGISTRY_ACP_AGENTS,
+  type RegistryAcpAgent,
+  type ReplayPromptResult,
+  resolveBaseBranchPreference,
+  resolveProjectGitHubRepo,
+  resolveSessionExecutionInputBlocks,
+  serializeCustomAcpLaunchSpec,
+  SessionCancelRequestValidated,
+  SessionChatRequestValidated,
+  SessionCreateRequestValidated,
+  type SessionGoalAction,
+  type SessionGoalResponse,
+  SessionHistoryInput,
+  type SessionId,
+  type SessionInputBlock,
+  type SessionMeta,
+  SessionStatusFactory,
+  type SessionSteerOperationRecord,
+  type SessionSteerResponse,
+  type SessionTurnInputConfig,
+  type WorkspaceId,
+} from '@lody/shared';
+import {
+  createLocalProjectBranchSelector,
+  localProjectsLegacy,
+} from '@lody/shared/node/local-project';
+import { findProgressMessageId } from '@lody/shared/session-data';
+import { Cause, Data, Effect, Exit, Fiber, Scope } from 'effect';
+import { createHash, randomUUID } from 'node:crypto';
+import { getCodexProfileStore, type ResolvedCodexProfile } from '../agent/codex-profile-store';
 import {
   getACPErrorUserMessage,
   isAgentDisconnectedError,
@@ -147,6 +133,21 @@ import {
   shouldRecoverStaleACPConnectionPrompt,
   shouldTerminateOnACPError,
 } from './acp-error-classification';
+import type { MachineAccessVerification } from './session-access-retry';
+import { createSessionBackend, getSteerOperationId, type SessionBackend } from './session-backend';
+import {
+  resolveDispatchAcpSessionId,
+  resolveResumableAcpSessionId,
+} from './session-dispatch-logic';
+import { buildPrompt } from './session-execution-helpers';
+import { resolveSessionLaunchConfig } from './session-launch-config-resolver';
+import type { ISession, SessionManager } from './session-manager';
+import type { SessionConfig } from './types';
+import { isAllocatedSessionBranchName } from './worktree/branch-name-allocation';
+import {
+  GIT_EXECUTABLE_NOT_FOUND_CODE,
+  isGitExecutableNotFoundError,
+} from './worktree/git-process-error';
 
 type FinalizeTurnContext = {
   sessionId: SessionId;
@@ -304,17 +305,7 @@ type TurnRuntimeState = {
   releaseFailure?: unknown;
   rawPromptCompletion?: Promise<void>;
   disconnectedTransport?: boolean;
-  inboxBatch?: InboxBatch;
-  inboxInput?: InboxInput;
-  inboxExecutionId?: string;
-  inboxResourceOwners?: Map<
-    ISession,
-    {
-      roots: readonly number[];
-      complete: boolean;
-      detach?: () => void;
-    }
-  >;
+  inboxOwner?: Awaited<ReturnType<OperationInboxLegacy['openExecution']>>;
   cancelFinalized: boolean;
   /** One drain deadline shared by Stop and the cancellation finalizer. */
   cancellationDrain?: Promise<void>;
@@ -831,15 +822,12 @@ export class SessionExecutionService {
       if (runtime.releaseFailure) await this.recoverInboxExecution(runtime.sessionId);
   }
   private operationInbox: OperationInboxLegacy | undefined;
-  private inboxSql: InboxSqlite | undefined;
   private onInboxReleased: ((sessionId: SessionId) => void) | undefined;
   setOperationInbox(
     inbox: OperationInboxLegacy | undefined,
-    sql: InboxSqlite | undefined,
     onReleased?: (sessionId: SessionId) => void
   ): void {
     this.operationInbox = inbox;
-    this.inboxSql = sql;
     this.onInboxReleased = onReleased;
   }
   async acceptInboxHumanInput(args: {
@@ -859,7 +847,7 @@ export class SessionExecutionService {
           (read.turn.role !== 'user' ||
             ['handled', 'failed', 'canceled', 'delivery_unknown'].includes(read.turn.status ?? '')))
       ) {
-        this.abandonInboxInput(args.sessionId, args.inputId);
+        await this.abandonInboxInput(args.sessionId, args.inputId);
         return;
       }
     }
@@ -877,14 +865,14 @@ export class SessionExecutionService {
       );
     }
   }
-  abandonInboxInput(sessionId: SessionId, inputId: string): void {
-    this.inboxSql?.abandonInput(this.deps.workspaceId, sessionId, inputId);
+  async abandonInboxInput(sessionId: SessionId, inputId: string): Promise<void> {
+    await this.operationInbox?.abandonInput(this.deps.workspaceId, sessionId, inputId);
   }
   getPreferredInboxHumanInput(sessionId: SessionId): string | undefined {
-    return this.inboxSql?.preferredHumanInput(this.deps.workspaceId, sessionId);
+    return this.operationInbox?.preferredHumanInput(this.deps.workspaceId, sessionId);
   }
   isInboxInputCanceled(sessionId: SessionId, inputId: string): boolean {
-    return this.inboxSql?.inputCanceled(this.deps.workspaceId, sessionId, inputId) ?? false;
+    return this.operationInbox?.inputCanceled(this.deps.workspaceId, sessionId, inputId) ?? false;
   }
   quiesceInboxExecutions(): void {
     for (const runtime of this.turnRuntimeBySession.values()) {
@@ -901,30 +889,29 @@ export class SessionExecutionService {
   async recoverInboxExecution(sessionId: SessionId): Promise<void> {
     const runtime = this.turnRuntimeBySession.get(sessionId);
     if (!runtime?.releaseFailure) return;
-    const owners = new Set(runtime.inboxResourceOwners?.keys());
-    if (runtime.session) owners.add(runtime.session);
-    if (owners.size)
-      await withTimeout(
-        Promise.all([...owners].map((owner) => owner.terminate(true))),
-        5_000,
-        'Execution recovery termination timed out'
-      );
-    await withTimeout(
-      Promise.allSettled([runtime.yieldedFinalization, ...(runtime.pendingSteerConfig ?? [])]).then(
-        () => undefined
-      ),
-      5_000,
-      'Execution finalization remains owned'
-    );
-    if (runtime.invocation?.requesterUserId)
-      this.inboxSql?.confirmReleased(
-        {
-          workspaceId: this.deps.workspaceId,
-          sessionId,
-          userId: runtime.invocation.requesterUserId,
+    if (runtime.inboxOwner) {
+      await runtime.inboxOwner.recover(
+        async () => {
+          const session = runtime.pendingSession
+            ? await withTimeout(
+                runtime.pendingSession,
+                5_000,
+                'Execution acquisition remains owned'
+              )
+            : runtime.session;
+          if (session) runtime.inboxOwner!.retain(sessionExecutionResource(session));
         },
-        runtime.inboxExecutionId ?? runtime.turnId
+        () =>
+          withTimeout(
+            Promise.allSettled([
+              runtime.yieldedFinalization,
+              ...(runtime.pendingSteerConfig ?? []),
+            ]).then(() => undefined),
+            5_000,
+            'Execution finalization remains owned'
+          )
       );
+    } else if (runtime.session) await runtime.session.terminate(true);
     runtime.releaseFailure = undefined;
     this.releaseTurnRuntime(sessionId, runtime.turnId);
     await this.operationInbox?.wake();
@@ -1970,15 +1957,8 @@ export class SessionExecutionService {
         return agentClient.steerPrompt(acpSessionId, promptBlocks);
       };
       const steerRun =
-        runtime.inboxInput && this.operationInbox
-          ? (
-              await this.operationInbox.submit(
-                undefined,
-                runtime.inboxInput,
-                runtime.inboxExecutionId ?? runtime.turnId,
-                startSteer
-              )
-            ).value
+        runtime.inboxOwner?.input && this.operationInbox
+          ? (await runtime.inboxOwner!.steer(startSteer)).value
           : startSteer();
       if (steerCapability.upstreamTurn === 'handoff') {
         const pendingOutcome = steerRun.outcome;
@@ -2095,13 +2075,13 @@ export class SessionExecutionService {
             inputConfig: options.inputConfig,
           };
         };
-        if (runtime.inboxInput && this.operationInbox) {
+        if (runtime.inboxOwner?.input && this.operationInbox) {
           const next: InboxInput = {
-            ...runtime.inboxInput,
+            ...runtime.inboxOwner?.input,
             userId: options.userId,
             inputId: options.userTurnId,
             kind:
-              this.inboxSql?.inputKind(
+              this.operationInbox?.inputKind(
                 {
                   workspaceId: this.deps.workspaceId,
                   sessionId: options.sessionId,
@@ -2112,15 +2092,7 @@ export class SessionExecutionService {
             config: options.inputConfig,
           };
           try {
-            await this.operationInbox.adopt(
-              runtime.inboxInput,
-              next,
-              runtime.inboxExecutionId!,
-              () => {
-                switchInvocation();
-                runtime.inboxInput = next;
-              }
-            );
+            await runtime.inboxOwner!.adopt(next, switchInvocation);
           } catch (cause) {
             switchInvocation();
             runtime.releaseFailure = cause;
@@ -2706,7 +2678,7 @@ export class SessionExecutionService {
     const runtime = this.turnRuntimeBySession.get(sessionId);
     const releasedOwner = runtime?.turnId === turnId;
     if (releasedOwner) {
-      for (const owner of runtime.inboxResourceOwners?.values() ?? []) owner.detach?.();
+      runtime.inboxOwner?.detach();
       this.turnRuntimeBySession.delete(sessionId);
     }
     // Safety net: drop per-turn analytics state if the turn ended without a
@@ -3940,7 +3912,7 @@ export class SessionExecutionService {
               userId: invocation.requesterUserId,
               inputId: invocation.sourceTurnId,
               kind:
-                this.inboxSql?.inputKind(
+                this.operationInbox?.inputKind(
                   {
                     workspaceId: this.deps.workspaceId,
                     sessionId,
@@ -3977,16 +3949,11 @@ export class SessionExecutionService {
       releaseConflict();
     }
     let inboxBatch = options.inboxBatch;
-    runtime.inboxInput = inboxInput;
-    runtime.inboxExecutionId = turnId;
     try {
-      if (inboxInput && !(await inbox!.begin(inboxInput, turnId))) {
-        this.releaseTurnRuntime(sessionId, turnId);
-        span.end({ outcome: 'inbox-blocked' });
-        return 'inbox-blocked';
+      if (inboxInput) {
+        runtime.inboxOwner = await inbox!.openExecution(inboxInput, turnId, inboxBatch);
+        inboxBatch = runtime.inboxOwner.batch;
       }
-      if (inboxInput && !inboxBatch) inboxBatch = await inbox!.prepare(inboxInput);
-      runtime.inboxBatch = inboxBatch;
     } catch (cause) {
       try {
         if (inboxInput)
@@ -4285,7 +4252,7 @@ export class SessionExecutionService {
                 }
 
                 if (inboxBatch && !runtime.promptStarted) {
-                  const members = self.inboxSql!.members(inboxBatch, 0, 50);
+                  const members = yield* self.tryPromise(() => runtime.inboxOwner!.members());
                   const historyMembers = batchHistoryMembers(inboxBatch, members);
                   const backend = yield* self.tryPromise(() => createSessionBackend(sessionDoc));
                   for (const member of historyMembers) {
@@ -4343,48 +4310,10 @@ export class SessionExecutionService {
                     { type: 'text', text: batchPreview(inboxBatch, members) },
                   ];
                 }
-                if (inboxInput && !runtime.inboxResourceOwners?.has(activeSession)) {
-                  // A one-time roots snapshot cannot prove completeness: tools
-                  // may spawn terminal groups later. Retain every Session owner
-                  // too, including a replacement ACP session within this execution.
-                  runtime.inboxResourceOwners ??= new Map();
-                  const owner: {
-                    roots: readonly number[];
-                    complete: boolean;
-                    detach?: () => void;
-                  } = {
-                    roots: [],
-                    complete: false,
-                  };
-                  runtime.inboxResourceOwners.set(activeSession, owner);
-                  const persistResources = () => {
-                    const owners = [...runtime.inboxResourceOwners!.values()];
-                    self.inboxSql!.registerResources(inboxInput, runtime.turnId, {
-                      platform: process.platform,
-                      // The producing host must be gone before restart can prove
-                      // that no future acquisition can extend this resource set.
-                      roots: [
-                        ...new Set([
-                          process.pid,
-                          ...owners.flatMap((resource) => [...resource.roots]),
-                        ]),
-                      ],
-                      complete: owners.every((resource) => resource.complete),
-                    });
-                  };
-                  persistResources();
-                  if (activeSession.watchInboxRecoveryResources)
-                    yield* self.tryPromise(async () => {
-                      const detach = await activeSession.watchInboxRecoveryResources!(
-                        (identity) => {
-                          owner.roots = identity.roots;
-                          owner.complete = identity.complete;
-                          persistResources();
-                        }
-                      );
-                      if (self.isTurnOwned(sessionId, runtime.turnId)) owner.detach = detach;
-                      else detach();
-                    });
+                if (runtime.inboxOwner) {
+                  yield* self.tryPromise(() =>
+                    runtime.inboxOwner!.register(sessionExecutionResource(activeSession))
+                  );
                 }
                 runtime.terminateSessionOnCancel = false;
                 self.deps.activateConversationTurnForACPUpdates(sessionId, runtime.turnId);
@@ -4421,15 +4350,11 @@ export class SessionExecutionService {
                                   runtime.disconnectedTransport = isAgentDisconnectedError(cause);
                                 }
                               );
+                              runtime.inboxOwner?.track(runtime.rawPromptCompletion!);
                               return raw;
                             };
                             const submitted = inboxInput
-                              ? await inbox!.submit(
-                                  inboxBatch,
-                                  runtime.inboxInput ?? inboxInput,
-                                  runtime.inboxExecutionId ?? runtime.turnId,
-                                  start
-                                )
+                              ? await runtime.inboxOwner!.submit(start)
                               : { value: start() };
                             const initialRun = self.createPromptHandoffRun({
                               turnId: runtime.turnId,
@@ -4550,21 +4475,6 @@ export class SessionExecutionService {
       span.end({ outcome, turnId });
     }
     if (inboxInput) {
-      // Prompt completion cannot release an in-flight sandbox acquisition.
-      // Retain every resource owner for physical cleanup/recovery instead.
-      if (
-        !runtime.releaseFailure &&
-        [...(runtime.inboxResourceOwners?.entries() ?? [])].some(
-          ([owner, identity]) => owner.watchInboxRecoveryResources && !identity.complete
-        )
-      )
-        runtime.releaseFailure = new Error('Inbox resource acquisition remains incomplete');
-      if (inboxBatch && runtime.promptStarted)
-        await inbox!.settle(
-          inboxBatch,
-          outcome === 'completed' && !runtime.promptFailed ? 'settled' : 'unknown',
-          runtime.releaseFailure ? inboxFailureDiagnostic(runtime.releaseFailure) : undefined
-        );
       if (inboxBatch)
         await (
           await createSessionBackend(sessionDoc)
@@ -4588,20 +4498,15 @@ export class SessionExecutionService {
             )
           );
       try {
-        await inbox!.release({
-          ...(runtime.inboxInput ?? inboxInput),
-          executionId: runtime.inboxExecutionId ?? runtime.turnId,
-          cause: runtime.releaseFailure
-            ? inboxFailureDiagnostic(runtime.releaseFailure)
-            : undefined,
-          outcome: runtime.releaseFailure
-            ? 'unreleased'
-            : runtime.cancelRequested || outcome === 'cancelled'
-              ? 'user_stop'
-              : outcome === 'completed' && !runtime.promptFailed && runtime.promptStarted
-                ? 'normal'
-                : 'failed',
-        });
+        await runtime.inboxOwner!.finish(
+          runtime.cancelRequested || outcome === 'cancelled'
+            ? 'user_stop'
+            : outcome === 'completed' && !runtime.promptFailed && runtime.promptStarted
+              ? 'normal'
+              : 'failed',
+          runtime.releaseFailure
+        );
+        if (runtime.inboxOwner!.failure) runtime.releaseFailure = runtime.inboxOwner!.failure;
       } catch (cause) {
         runtime.releaseFailure = cause;
         throw cause;
@@ -4754,7 +4659,8 @@ export class SessionExecutionService {
       !runtime ||
       runtime.cancelRequested ||
       runtime.releaseFailure ||
-      (runtime.inboxInput && this.isInboxInputCanceled(sessionId, runtime.inboxInput.inputId))
+      (runtime.inboxOwner?.input &&
+        this.isInboxInputCanceled(sessionId, runtime.inboxOwner?.input.inputId))
     ) {
       return undefined;
     }
@@ -5733,7 +5639,7 @@ export class SessionExecutionService {
                 if (
                   dispatchOptions?.dispatchSource === 'inbox' ||
                   Boolean(dispatchOptions?.inboxBatch) ||
-                  Boolean(ctx.runtime.inboxBatch) ||
+                  Boolean(ctx.runtime.inboxOwner?.batch) ||
                   runtime.turnId !== turnId ||
                   !shouldRecoverStaleACPConnectionPrompt({
                     error,
@@ -6706,7 +6612,7 @@ export class SessionExecutionService {
     const currentTurnId = activeTurnId ?? executionTurnId ?? runtimeTurnId;
     // Cancel is exact-match only: a stale stop request must not interrupt a newer assistant turn.
     if (!isPrompting && !isCurrentExecutionTurn) {
-      const target = this.inboxSql?.pauseTarget(this.deps.workspaceId, sessionId, turnId);
+      const target = this.operationInbox?.pauseTarget(this.deps.workspaceId, sessionId, turnId);
       if (
         this.operationInbox &&
         target &&
@@ -6722,7 +6628,7 @@ export class SessionExecutionService {
         );
         if (paused) {
           const successor = this.turnRuntimeBySession.get(sessionId);
-          if (successor?.inboxInput?.inputId === `inbox:${target.executionId}`)
+          if (successor?.inboxOwner?.input?.inputId === `inbox:${target.executionId}`)
             return this.cancelSession({ ...message, turnId: successor.turnId }, options);
           return { success: true };
         }
@@ -6814,7 +6720,7 @@ export class SessionExecutionService {
       try {
         const paused = await this.operationInbox.pause(
           scope,
-          stoppedRuntime.inboxExecutionId ?? turnId,
+          stoppedRuntime.inboxOwner?.id ?? turnId,
           pendingIds,
           message.cancelId
         );
@@ -6823,7 +6729,8 @@ export class SessionExecutionService {
         if (
           successor &&
           successor !== stoppedRuntime &&
-          successor.inboxInput?.inputId === `inbox:${stoppedRuntime.inboxExecutionId ?? turnId}`
+          successor.inboxOwner?.input?.inputId ===
+            `inbox:${stoppedRuntime.inboxOwner?.id ?? turnId}`
         )
           return this.cancelSession({ ...message, turnId: successor.turnId }, options);
       } catch (error) {
@@ -6836,13 +6743,13 @@ export class SessionExecutionService {
     }
     if (
       this.operationInbox &&
-      stoppedRuntime?.inboxInput &&
+      stoppedRuntime?.inboxOwner?.input &&
       (options.pauseInbox === false || message.pauseInbox === false)
     ) {
       if (
         !(await this.operationInbox.cancelExecution(
-          stoppedRuntime.inboxInput,
-          stoppedRuntime.inboxExecutionId ?? turnId
+          stoppedRuntime.inboxOwner!.input,
+          stoppedRuntime.inboxOwner?.id ?? turnId
         ))
       )
         return { success: false, error: 'Execution changed before cancellation.' };
@@ -8052,5 +7959,3 @@ const computeAcpRefreshDedupeKey = (
     : '';
   return `${configId}\x00${cliType}\x00${agentType}\x00${envSerialized}\x00${customSerialized}\x00${runtimeOverrideSerialized}\x00${magpieGatewayUrl ?? ''}`;
 };
-import { getCodexProfileStore, type ResolvedCodexProfile } from '../agent/codex-profile-store';
-import { assertManagedCodexProfileConfig } from '@lody/shared';
