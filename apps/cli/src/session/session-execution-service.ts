@@ -307,6 +307,14 @@ type TurnRuntimeState = {
   inboxBatch?: InboxBatch;
   inboxInput?: InboxInput;
   inboxExecutionId?: string;
+  inboxResourceOwners?: Map<
+    ISession,
+    {
+      roots: readonly number[];
+      complete: boolean;
+      detach?: () => void;
+    }
+  >;
   cancelFinalized: boolean;
   /** One drain deadline shared by Stop and the cancellation finalizer. */
   cancellationDrain?: Promise<void>;
@@ -896,9 +904,11 @@ export class SessionExecutionService {
   async recoverInboxExecution(sessionId: SessionId): Promise<void> {
     const runtime = this.turnRuntimeBySession.get(sessionId);
     if (!runtime?.releaseFailure) return;
-    if (runtime.session)
+    const owners = new Set(runtime.inboxResourceOwners?.keys());
+    if (runtime.session) owners.add(runtime.session);
+    if (owners.size)
       await withTimeout(
-        runtime.session.terminate(true),
+        Promise.all([...owners].map((owner) => owner.terminate(true))),
         5_000,
         'Execution recovery termination timed out'
       );
@@ -909,7 +919,6 @@ export class SessionExecutionService {
       5_000,
       'Execution finalization remains owned'
     );
-    runtime.releaseFailure = undefined;
     if (runtime.invocation?.requesterUserId)
       this.inboxSql?.confirmReleased(
         {
@@ -919,6 +928,7 @@ export class SessionExecutionService {
         },
         runtime.inboxExecutionId ?? runtime.turnId
       );
+    runtime.releaseFailure = undefined;
     this.releaseTurnRuntime(sessionId, runtime.turnId);
     await this.operationInbox?.wake();
     this.onInboxReleased?.(sessionId);
@@ -2722,6 +2732,7 @@ export class SessionExecutionService {
     const runtime = this.turnRuntimeBySession.get(sessionId);
     const releasedOwner = runtime?.turnId === turnId;
     if (releasedOwner) {
+      for (const owner of runtime.inboxResourceOwners?.values() ?? []) owner.detach?.();
       this.turnRuntimeBySession.delete(sessionId);
     }
     // Safety net: drop per-turn analytics state if the turn ended without a
@@ -3928,6 +3939,23 @@ export class SessionExecutionService {
 
     const inbox = this.operationInbox;
     const invocation = options.invocation;
+    try {
+      if (inbox && invocation?.requesterUserId && !options.inboxBatch) {
+        const control = await sessionDoc.getDocState();
+        const receipt = control?.humanInputReceipts?.[invocation.sourceTurnId];
+        if (receipt?.userId === invocation.requesterUserId)
+          await this.acceptInboxHumanInput({
+            sessionId,
+            inputId: invocation.sourceTurnId,
+            userId: receipt.userId,
+            config: invocation.inputConfig,
+          });
+      }
+    } catch (cause) {
+      releaseConflict();
+      span.end({ outcome: 'inbox-human-receipt-failed' });
+      throw cause;
+    }
     const inboxInput: InboxInput | undefined =
       inbox && invocation?.requesterUserId
         ? options.inboxBatch
@@ -4327,17 +4355,48 @@ export class SessionExecutionService {
                     { type: 'text', text: batchPreview(inboxBatch, members) },
                   ];
                 }
-                if (inboxInput && !runtime.promptStarted) {
-                  const roots = activeSession.getInboxRecoveryRoots
-                    ? yield* self
-                        .tryPromise(() => activeSession.getInboxRecoveryRoots!())
-                        .pipe(Effect.catch(() => Effect.succeed(undefined)))
-                    : undefined;
-                  self.inboxSql!.registerResources(
-                    inboxInput,
-                    runtime.turnId,
-                    roots ? { platform: process.platform, roots } : undefined
-                  );
+                if (inboxInput && !runtime.inboxResourceOwners?.has(activeSession)) {
+                  // A one-time roots snapshot cannot prove completeness: tools
+                  // may spawn terminal groups later. Retain every Session owner
+                  // too, including a replacement ACP session within this execution.
+                  runtime.inboxResourceOwners ??= new Map();
+                  const owner: {
+                    roots: readonly number[];
+                    complete: boolean;
+                    detach?: () => void;
+                  } = {
+                    roots: [],
+                    complete: false,
+                  };
+                  runtime.inboxResourceOwners.set(activeSession, owner);
+                  const persistResources = () => {
+                    const owners = [...runtime.inboxResourceOwners!.values()];
+                    self.inboxSql!.registerResources(inboxInput, runtime.turnId, {
+                      platform: process.platform,
+                      // The producing host must be gone before restart can prove
+                      // that no future acquisition can extend this resource set.
+                      roots: [
+                        ...new Set([
+                          process.pid,
+                          ...owners.flatMap((resource) => [...resource.roots]),
+                        ]),
+                      ],
+                      complete: owners.every((resource) => resource.complete),
+                    });
+                  };
+                  persistResources();
+                  if (activeSession.watchInboxRecoveryResources)
+                    yield* self.tryPromise(async () => {
+                      const detach = await activeSession.watchInboxRecoveryResources!(
+                        (identity) => {
+                          owner.roots = identity.roots;
+                          owner.complete = identity.complete;
+                          persistResources();
+                        }
+                      );
+                      if (self.isTurnOwned(sessionId, runtime.turnId)) owner.detach = detach;
+                      else detach();
+                    });
                 }
                 runtime.terminateSessionOnCancel = false;
                 self.deps.activateConversationTurnForACPUpdates(sessionId, runtime.turnId);
@@ -4525,6 +4584,15 @@ export class SessionExecutionService {
       await this.settleVisibleTurn(runtime, settlement);
     }
     if (inboxInput) {
+      // Prompt completion cannot release an in-flight sandbox acquisition.
+      // Retain every resource owner for physical cleanup/recovery instead.
+      if (
+        !runtime.releaseFailure &&
+        [...(runtime.inboxResourceOwners?.entries() ?? [])].some(
+          ([owner, identity]) => owner.watchInboxRecoveryResources && !identity.complete
+        )
+      )
+        runtime.releaseFailure = new Error('Inbox resource acquisition remains incomplete');
       if (inboxBatch && runtime.promptStarted)
         await inbox!.settle(
           inboxBatch,

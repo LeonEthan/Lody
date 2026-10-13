@@ -233,10 +233,12 @@ export class Session extends EventEmitter<SessionEvents> implements ISession {
     await this.sandbox.applyLimits(limits);
   }
 
-  getInboxRecoveryRoots(): Promise<readonly number[]> {
-    if (!this.sandbox.recoveryRoots)
-      return Promise.reject(new Error('Session resource identity is unavailable'));
-    return this.sandbox.recoveryRoots();
+  watchInboxRecoveryResources(
+    persist: (identity: import('./session-sandbox').SessionRecoveryResources) => void
+  ): Promise<() => void> {
+    if (!this.sandbox.watchRecoveryResources)
+      return Promise.reject(new Error('Complete Session resource ownership is unavailable'));
+    return this.sandbox.watchRecoveryResources(persist);
   }
   async getMonitorRuntimeInfo(): Promise<SessionMonitorRuntimeInfo> {
     let accounting: SessionMonitorRuntimeInfo['accounting'];

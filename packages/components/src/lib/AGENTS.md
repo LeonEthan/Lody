@@ -4,7 +4,7 @@ Rules bind callers too.
 Background: [components](../../../../.agents/docs/components-package.md),
 [files](../../../../.agents/docs/components-file-paths.md).
 
-- Send acceptance and RPC await local commits, never Repo-wide flush.
+- Send: local commits, never Repo flush. Persist `humanInputReceipts` before activation; RPC is redundant.
 
 ## Electron IPC types
 
@@ -119,4 +119,4 @@ Background: [components](../../../../.agents/docs/components-package.md),
 - Before creating top-level or child sessions, call `filterAcpSessionConfigOptionValues()`
   so cached values outside the current selector schema are neither dispatched nor persisted.
 
-Attachment transfer lifecycle changes follow [workspace ownership](../providers/AGENTS.md#attachment-transfer-ownership).
+Attachment lifetime: [workspace ownership](../providers/AGENTS.md#attachment-transfer-ownership).

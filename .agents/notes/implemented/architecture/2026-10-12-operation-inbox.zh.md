@@ -22,6 +22,8 @@ POSIX 重开恢复以非空根进程身份及进程组不存在为释放证明�
 
 本次基于 `3ac76bad10f46720517a2ca6929f03de4ef5bb9b`，实现作为 PR 候选，尚未合入或发布。验证使用隔离源码副本和锁定依赖；最后检查确认改动的源码与副本字节一致。Effect 为 4.0.2，没有升级 catalog／lockfile。
 
+下表保留最初 `40ef5c29c` 的作者验证证据；本次修订结果单独列在后面。
+
 | 验证范围 | 结果 |
 | --- | --- |
 | 收件箱、当前／兼容模型、协调器、编辑重发、MCP、历史及本地平台专项 | 11 个 suite，201 项通过 |
@@ -37,6 +39,12 @@ POSIX 重开恢复以非空根进程身份及进程组不存在为释放证明�
 
 手动 Stop 的 RPC 与持久兜底共用 cancelId；失败写盘保留每份请求身份，先补记再接受新用户输入，避免旧队列复活。内部取消只撤销执行资格，不持久暂停。已消费结果的完整副本随 Operation 保留期限清理，永久删除 Session 同时删除收件箱副本。重开只修复历史回执，不重放提交。
 
-独立 review、Spec 人工批准、真实模型和桌面端到端产品验收尚未完成。POSIX 身份缺失、Windows 或无法证明旧资源结束时继续阻塞，不能用用户新消息绕过它。整体 Session／ACP／历史原生迁移不在此次完成声明内。
+`40ef5c29cbe496f28f17ab10297cf37c3c48030f` 的 review 发现三个 adapter 交接缺口。本次修订持续登记 sandbox 的每次资源创建：spawn 前先落盘“不完整”，再合入后来的终端 roots；执行保留全部 Session 所有者以及发起它们的 host PID，不能仅凭最初 ACP roots 消失就认定集合已闭合。缺少完整性标记或登记中断时继续阻塞。renderer 和非委派 CLI 用户入口在激活／入队前持久写入独立的 `humanInputReceipts` 控制回执；历史兜底恢复匹配的授权，无需 RPC。Agent／普通历史写入、用户不匹配的回执、已取消／已结束的 ID 都不能解除暂停。协调器 `recoverStop` 接入独立的 `recoverClose`，保留原失败，只补写持久回执，绝不重发请求。
+
+本次专项回归：7 个 CLI suite，676 项通过；4 个用户发送／配置 suite，117 项通过。覆盖真实独立进程组＋SQLite 重开（进程表使用注入快照）、并发创建的不完整栅栏、发起 host 仍存活、实际执行 adapter 登记、prompt 结束但创建未完成、释放回执写盘失败重试、已确认释放后的全新资源代际、CRDT 重开后的匹配／缺失／用户不符／已取消回执、RPC 丢失／大输入，以及协调器级结算写盘故障恢复且无重发。它们与上表有交集，不能累加。
+
+本次 Shared／组件完整测试分别为 1428／5141 项通过。完整类型检查、最终 CLI 类型检查、lint（零 error）、格式、Inbox／进程／平台／public／i18n guard 均通过。复跑 root `pnpm check` 到 CLI 4065 项通过／4 项跳过，仍因未修改的 Git transport `context_unreadable` 失败；最后的创建／清理栅栏和 fixture 调整以 676 项交集、最终类型／lint／格式及源码字节核对验证，不宣称又一次完整 root 全绿。docs check 与 `40ef5c29c` 的 82 项错误数组完全一致，无 Inbox 错误。不宣称真实模型、完整系统进程表或桌面端到端验收。
+
+`40ef5c29c` 的独立 review 有三个 P1；修订后的候选仍待独立复审。Spec 人工批准、真实模型和桌面端到端产品验收尚未完成。POSIX 身份缺失、Windows 或无法证明旧资源结束时继续阻塞，不能用用户新消息绕过它。整体 Session／ACP／历史原生迁移不在此次完成声明内。
 
 [设计](../../proposed/architecture/2026-10-12-turn-scoped-operation-inbox.zh.md)、[实施计划](../../proposed/architecture/2026-10-12-operation-inbox-effect-implementation-plan.zh.md)、[Spec](../../../../specs/session-orchestration.zh.md)。

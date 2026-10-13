@@ -1353,6 +1353,10 @@ export const sessionDocSchema = schema({
   session: sessionSchema,
   history: schema.LoroList(sessionHistorySchema, (item) => item.id),
   mq: schema.LoroMovableList(messageQueueItemSchema, (item) => item.$cid, { required: false }),
+  /** Explicit human-send outbox. Never inferred from user role or Agent authors. */
+  humanInputReceipts: schema
+    .LoroMap({}, { required: false })
+    .catchall(schema.LoroMap({ userId: schema.String() })),
   /** Temporary durable state for an asynchronous Session fork. Removed on success. */
   forkOperation: sessionForkOperationDocSchema,
   preview: sessionPreviewDocSchema,

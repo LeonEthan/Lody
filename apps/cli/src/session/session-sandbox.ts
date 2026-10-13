@@ -105,6 +105,9 @@ export interface SessionSandbox {
   applyLimits(limits: SessionSandboxLimits): Promise<void>;
   readResourceAccounting(): Promise<SessionResourceAccounting>;
   recoveryRoots?(): Promise<readonly number[]>;
+  watchRecoveryResources?(
+    persist: (identity: SessionRecoveryResources) => void
+  ): Promise<() => void>;
   spawn(
     command: string,
     args: string[],
@@ -115,6 +118,8 @@ export interface SessionSandbox {
   cleanup(): Promise<void>;
   recoverCleanup?(): Promise<void>;
 }
+
+export type SessionRecoveryResources = { roots: readonly number[]; complete: boolean };
 
 export type SessionSandboxFactory = (sessionId: SessionId) => Promise<SessionSandbox>;
 
@@ -271,6 +276,15 @@ function createNoopSandbox(
 class ContainerSessionSandbox implements SessionSandbox {
   private cleanupReceipt: Promise<void> | undefined;
   private recoveryReceipt: Promise<void> | undefined;
+  private pendingSpawns = 0;
+  private readonly spawnedRoots = new Set<number>();
+  private uncertainResources = false;
+  private readonly recoveryObservers = new Set<{
+    roots: Set<number>;
+    initialized: boolean;
+    uncertain: boolean;
+    persist: (identity: SessionRecoveryResources) => void;
+  }>();
   constructor(
     private container: ProcessContainer,
     private scope: Scope.Closeable,
@@ -294,6 +308,43 @@ class ContainerSessionSandbox implements SessionSandbox {
       return Promise.reject(new Error('Resource identity is unavailable'));
     return this.run(this.container.recoveryRoots);
   }
+  async watchRecoveryResources(
+    persist: (identity: SessionRecoveryResources) => void
+  ): Promise<() => void> {
+    if (this.scope.state._tag === 'Closed') await this.ensureOpenContainer();
+    const observer = {
+      roots: new Set(this.spawnedRoots),
+      initialized: false,
+      uncertain: this.uncertainResources,
+      persist,
+    };
+    this.recoveryObservers.add(observer);
+    try {
+      // Incomplete is durable before the asynchronous initial snapshot. Spawns
+      // in that interval are already observed and unioned with existing roots.
+      this.publishRecoveryResources();
+      for (const pid of await this.recoveryRoots()) observer.roots.add(pid);
+      observer.initialized = true;
+      this.publishRecoveryResources();
+      return () => this.recoveryObservers.delete(observer);
+    } catch (cause) {
+      this.recoveryObservers.delete(observer);
+      throw cause;
+    }
+  }
+  private publishRecoveryResources(): void {
+    for (const observer of this.recoveryObservers) {
+      try {
+        observer.persist({
+          roots: [...observer.roots],
+          complete: observer.initialized && !observer.uncertain && this.pendingSpawns === 0,
+        });
+      } catch (cause) {
+        observer.uncertain = true;
+        throw cause;
+      }
+    }
+  }
   async applyLimits(limits: SessionSandboxLimits): Promise<void> {
     await this.run(this.container.applyLimits(limits));
   }
@@ -302,11 +353,7 @@ class ContainerSessionSandbox implements SessionSandbox {
     return await this.run(this.container.readAccounting);
   }
 
-  async spawn(
-    command: string,
-    args: string[],
-    options: SessionSpawnOptions
-  ): Promise<SessionProcessHandle> {
+  private async ensureOpenContainer(): Promise<void> {
     if (this.scope.state._tag === 'Closed' && this.reopen) {
       // Keep the failed generation reachable until all its trees are gone.
       const retired = this.container;
@@ -319,22 +366,54 @@ class ContainerSessionSandbox implements SessionSandbox {
         this.scope = fresh.scope;
         this.cleanupReceipt = undefined;
         this.recoveryReceipt = undefined;
+        // This generation starts only after verified termination of the old
+        // container. Keep uncertainty on old observers, not on future owners.
+        this.spawnedRoots.clear();
+        this.uncertainResources = false;
       }
     }
+  }
+
+  async spawn(
+    command: string,
+    args: string[],
+    options: SessionSpawnOptions
+  ): Promise<SessionProcessHandle> {
     const { captureOutput, ...spawnOptions } = options;
     let events: ProcessEvents | undefined;
-    const contained = await this.run(
-      this.container.spawn({
-        command,
-        args,
-        options: spawnOptions,
-        onSpawned: (child) => {
-          events = attachProcessEvents(child, { captureOutput, logger: this.logger });
-        },
-      })
-    ).catch((error: unknown) => {
-      throw unwrapSpawnFailure(error);
-    });
+    this.pendingSpawns++;
+    const contained = await (async () => {
+      try {
+        // Fence recovery BEFORE a process can exist without a recorded PID.
+        // Failure here prevents spawn; failure later retains incomplete identity.
+        this.publishRecoveryResources();
+        if (this.scope.state._tag === 'Closed') await this.ensureOpenContainer();
+        return await this.run(
+          this.container.spawn({
+            command,
+            args,
+            options: spawnOptions,
+            onSpawned: (child) => {
+              events = attachProcessEvents(child, { captureOutput, logger: this.logger });
+              if (child.pid && child.pid > 0) this.spawnedRoots.add(child.pid);
+              else this.uncertainResources = true;
+              for (const observer of this.recoveryObservers) {
+                if (child.pid && child.pid > 0) observer.roots.add(child.pid);
+                else observer.uncertain = true;
+              }
+              this.publishRecoveryResources();
+            },
+          })
+        );
+      } catch (cause) {
+        this.uncertainResources = true;
+        for (const observer of this.recoveryObservers) observer.uncertain = true;
+        throw unwrapSpawnFailure(cause);
+      } finally {
+        this.pendingSpawns--;
+        this.publishRecoveryResources();
+      }
+    })();
     if (!events) {
       throw new Error(`Process events were not attached for ${command}`);
     }

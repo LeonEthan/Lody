@@ -52,6 +52,7 @@ Promise entries share one host-lease runtime through one registered `operationIn
 
 - `completeAndIndex(tx, operationKey)`: insert the result index inside the existing Operation completion transaction. Post-commit notifications trigger reads, never index repair.
 - `acceptHumanInput(receipt)`: an authenticated UI/CLI human entry registers unforgeable provenance, input ID, acceptance sequence, user, frozen configuration and original causal identity. Agent chat, results and system events cannot invoke this recovery entry. `role: user`, a human `userId`, history author and model parameters do not establish fresh human authorization.
+  Human entry persists a separate idempotent control-document receipt before activation/queue. Ordinary history recovery consumes it when RPC is lost or skipped for large inputs; generic history writes/imports and Agent materialization never author this outbox. Canceled and terminal input IDs remain ineligible.
 - `pause(sessionId, expectedExecutionId)`: target the actual running execution, not the latest accepted input, using the admission protocol below.
 - `executionReleased(executionId, receipt)`: report actual release and `normal | user_stop | failed`. Uncertain release returns an unreleased-resource recovery handle, never a normal-completion intent.
 - `prepareInput(sessionId)`: choose waiting, user-plus-results or an automatic batch without bypassing the user queue.
@@ -64,6 +65,8 @@ The execution adapter returns three separate things. One Promise finishing canno
 | Submission `not_submitted` / `submitted` / `unknown` | Whether input reached transport; missing output is not non-submission. Batch storage retains the outcome and full Cause |
 | Actual release receipt | Raw prompt, steer/config requests and associated processes/resources have ended; the execution slot may transfer. `InboxExecution` verifies this before publication |
 | Unreleased-resource recovery handle | Execution ID, owner epoch, raw request handle, cleanup state and full Cause. A daemon-level recovery service owns the resources beyond Session closure |
+
+Identity covers resource acquisitions throughout execution, including later TerminalManager groups and replacement ACP Sessions. Persist an incomplete fence before each spawn, then durably union its root. Reopen requires explicit completeness and absence of every recorded group. Legacy snapshots or interrupted journaling remain blocked. Coordinator shutdown recovery invokes `recoverClose` after failed close; retry only durable receipts, preserving the original failure, without transport replay.
 
 Register resource ownership before starting requests. Cancellation requests cancellation; interrupted Effect waiting, an aborted signal or a closed Scope do not prove raw release. Adapter `shutdownOnce` memoizes one shutdown task and completion receipt; concurrent callers await that receipt instead of separately relying on `Scope.close`. Shutdown waiting is bounded: timeout/cleanup failure returns an unreleased handle, keeps the execution slot blocked and neither stalls global shutdown forever nor admits a successor.
 
@@ -173,6 +176,9 @@ Independent acceptance covers these cases. Absence of new input must be observed
 | Atomicity/failure | Real SQLite and two Workers. Failure/interruption at each yield transaction write reopens with complete old or new binding, no dual/orphan live claims. Completion committed with lost notification still has its index. Duplicate settlement never resends |
 | Unknown submission | Provider records full user-plus-batch input then disconnects; unknown persists and child-process reopen does not resend. Submitting crash without proof also never resends. Ordinary batch-free input retains recovery |
 | Raw resource lifetime | Uncooperative raw request outlives cancelled waiter without admitting successor. Concurrent shutdown shares receipt. Failed cleanup retains Cause/owner; repeated Scope.close is not recovery. Independent recover releases before successor; timeout cannot stall global shutdown |
+| Complete resource identity | Initial ACP exit plus a surviving later terminal group cannot release the slot. Concurrent/incomplete acquisitions remain fenced; producing-host presence prevents proving a closed set. Prompt completion with incomplete acquisition and failed release persistence retain the recovery owner |
+| Durable human authorization | Lost/skipped oversized RPC still recovers the persisted human receipt with its input/results after reopen. Absent/foreign/canceled receipts cannot clear pause; generic history writes create no authorization |
+| Coordinator close recovery | Fail settlement and finalizer persistence, restore storage, then use coordinator recovery without manually calling the bridge. Complete settlement once; never replay transport |
 | Cutover/compatibility | Run real legacy coordinator gated before check, past fence and during raw request. Old stop returning does not enable new execution; drain/confirmed termination precedes handoff. Unknown old work blocks. Unsupported downgrade fails before write ownership |
 | Reads/existing vetoes | Oversized preview retains all members and paged reads without extra model turns. Archive/deletion/tree Stop/identity mismatch veto dispatch |
 

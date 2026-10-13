@@ -670,7 +670,9 @@ export class InboxSqlite {
   ): void {
     this.db
       .prepare(
-        'INSERT OR IGNORE INTO inbox_resources(workspace_id,session_id,user_id,execution_id,identity_json) VALUES(?,?,?,?,?)'
+        `INSERT INTO inbox_resources(workspace_id,session_id,user_id,execution_id,identity_json) VALUES(?,?,?,?,?)
+         ON CONFLICT(workspace_id,session_id,execution_id) DO UPDATE SET identity_json=excluded.identity_json
+         WHERE inbox_resources.user_id=excluded.user_id AND inbox_resources.state IN ('active','unreleased')`
       )
       .run(
         scope.workspaceId,
@@ -714,6 +716,7 @@ export class InboxSqlite {
               'netbsd',
             ]),
             roots: z.array(z.number().int().positive()),
+            complete: z.boolean().optional(),
           })
           .parse(JSON.parse(r.identity_json));
         return {

@@ -577,9 +577,19 @@ describe('Inbox recovery and retained settlement', () => {
 it('requires proof of resource disappearance and never treats PID reuse or empty roots as release', async () => {
   const { provesResourcesGone } = await import('./recovery');
   const snapshot = { sampledAtMs: 0, memoryKind: 'rss-sum' as const, entries: [], warnings: [] };
-  expect(provesResourcesGone({ platform: 'darwin', roots: [123] }, snapshot)).toBe(true);
-  expect(provesResourcesGone({ platform: 'darwin', roots: [] }, snapshot)).toBe(false);
-  expect(provesResourcesGone({ platform: 'win32', roots: [123] }, snapshot)).toBe(false);
+  expect(provesResourcesGone({ platform: 'darwin', roots: [123], complete: true }, snapshot)).toBe(
+    true
+  );
+  expect(provesResourcesGone({ platform: 'darwin', roots: [], complete: true }, snapshot)).toBe(
+    false
+  );
+  expect(provesResourcesGone({ platform: 'win32', roots: [123], complete: true }, snapshot)).toBe(
+    false
+  );
+  expect(provesResourcesGone({ platform: 'darwin', roots: [123] }, snapshot)).toBe(false);
+  expect(provesResourcesGone({ platform: 'darwin', roots: [123], complete: false }, snapshot)).toBe(
+    false
+  );
   const child = {
     pid: 456,
     parentPid: 1,
@@ -589,12 +599,95 @@ it('requires proof of resource disappearance and never treats PID reuse or empty
     memoryBytes: 1,
   };
   expect(
-    provesResourcesGone({ platform: 'darwin', roots: [123] }, { ...snapshot, entries: [child] })
+    provesResourcesGone(
+      { platform: 'darwin', roots: [123], complete: true },
+      { ...snapshot, entries: [child] }
+    )
   ).toBe(false);
   expect(
-    provesResourcesGone({ platform: 'darwin', roots: [456] }, { ...snapshot, entries: [child] })
+    provesResourcesGone(
+      { platform: 'darwin', roots: [456], complete: true },
+      { ...snapshot, entries: [child] }
+    )
   ).toBe(false);
 });
+
+it.skipIf(process.platform === 'win32')(
+  'persists terminal groups added after prompt start and blocks reopen until all groups are gone',
+  async () => {
+    const { createSessionSandboxFactory } = await import('@/session/session-sandbox');
+    const { provesResourcesGone } = await import('./recovery');
+    const sandbox = await createSessionSandboxFactory({
+      logger: { debug: () => {}, warn: () => {} } as import('@/utils/logger').Logger,
+      // Exercise the same POSIX noop groups on macOS/Linux without depending on
+      // whether the test machine grants cgroup administration.
+      deps: { platform: 'darwin', configureExecutionProcess: async () => {} },
+    })('resource-reopen' as SessionId);
+    const launch = async () => {
+      const handle = await sandbox.spawn(
+        process.execPath,
+        ['-e', 'process.stdin.resume();process.stdout.write("ready")'],
+        { captureOutput: true }
+      );
+      await new Promise<void>((resolve) => handle.onStdout(() => resolve()));
+      return handle;
+    };
+    const f = fixture();
+    f.start();
+    const acp = await launch();
+    const detach = await sandbox.watchRecoveryResources!((identity) =>
+      f.sql.registerResources(f.input, 'execution-1', {
+        platform: process.platform,
+        ...identity,
+        roots: [process.pid, ...identity.roots],
+      })
+    );
+    try {
+      const terminal = await launch();
+      const exited = new Promise<void>((resolve) => acp.onExit(() => resolve()));
+      acp.child.stdin!.end();
+      await exited;
+      const second = new LodyOperationStore(f.filename);
+      stores.push(second);
+      second.inbox.activate('workspace', 'replacement');
+      const [handle] = second.inbox.unreleased('workspace');
+      expect(handle!.identity).toMatchObject({ complete: true });
+      expect(handle!.identity.roots).toEqual(
+        expect.arrayContaining([acp.child.pid, terminal.child.pid])
+      );
+      // A real independently spawned group remains after the ACP leader exits.
+      expect(process.kill(-terminal.child.pid!, 0)).toBe(true);
+      const snapshot = {
+        sampledAtMs: 0,
+        memoryKind: 'rss-sum' as const,
+        warnings: [],
+        entries: [
+          {
+            pid: terminal.child.pid!,
+            parentPid: process.pid,
+            processGroupId: terminal.child.pid!,
+            startedAtMs: 0,
+            cpuTimeMicros: 0,
+            memoryBytes: 0,
+          },
+        ],
+      };
+      expect(provesResourcesGone(handle!.identity, snapshot)).toBe(false);
+      const fresh = { ...f.input, inputId: 'successor-input' };
+      second.inbox.accept(fresh);
+      expect(second.inbox.begin(fresh, 'successor', 'replacement')).toBe(false);
+      await sandbox.terminate(true);
+      const host = { ...snapshot.entries[0]!, pid: process.pid, processGroupId: process.pid };
+      expect(provesResourcesGone(handle!.identity, { ...snapshot, entries: [host] })).toBe(false);
+      expect(provesResourcesGone(handle!.identity, { ...snapshot, entries: [] })).toBe(true);
+      second.inbox.confirmReleased(handle!.scope, handle!.executionId);
+      expect(second.inbox.begin(fresh, 'successor', 'replacement')).toBe(true);
+    } finally {
+      detach();
+      await sandbox.cleanup();
+    }
+  }
+);
 
 it('reads an oversized member in bounded fragments without dropping any result bytes', async () => {
   const { batchPage, INBOX_READ_BYTES } = await import('./batch-page');

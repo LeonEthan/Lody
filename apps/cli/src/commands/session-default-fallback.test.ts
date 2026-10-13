@@ -17,8 +17,9 @@ import {
   type SessionMeta,
   type WorkspaceId,
 } from '@lody/shared';
-import { createLoroSessionData, type SessionTurn } from '@lody/shared/session-data';
-import type { LoroDocumentManager, SessionDocument } from '@/lib/loro/doc';
+import type { SessionTurn } from '@lody/shared/session-data';
+import { type LoroDocumentManager, SessionDocument } from '@/lib/loro/doc';
+import { composeTestSessionDoc } from '../../tests/session-doc-fixture';
 import { FlockSyncTimeoutError } from '@/lib/loro/timeout-utils';
 import { applyAgentRoleCreateTarget, resolveAgentRoleCreate } from '@/lib/agent-role-create';
 import {
@@ -164,17 +165,12 @@ function createFixture(agentType: 'codex' | 'claude', capability?: AcpCapability
     getOrCreateSessionDoc: async (id: SessionId) => {
       const existing = sessions.get(id);
       if (existing) return existing;
-      const sessionData = createLoroSessionData({ doc: new LoroDoc(), sessionId: id });
-      const sessionDoc = {
-        sessionId: id,
-        sessionData,
-        subscribeControl: () => () => undefined,
-        getMetaState: async () => metadata.get(getSessionRoomId(id)) as SessionMeta | undefined,
-        appendUserTurn: async (entry: SessionHistoryInput) => {
-          await sessionData.commands.appendTurn(entry as unknown as SessionTurn);
-        },
-        waitUntilSynced: async () => true,
-      } as unknown as SessionDocument;
+      const sessionDoc = new SessionDocument(manager.repo, id, async () => {});
+      composeTestSessionDoc(sessionDoc, { doc: new LoroDoc() });
+      sessionDoc.appendUserTurn = async (entry: SessionHistoryInput) => {
+        await sessionDoc.sessionData.commands.appendTurn(entry as unknown as SessionTurn);
+      };
+      sessionDoc.waitUntilSynced = async () => true;
       sessions.set(id, sessionDoc);
       return sessionDoc;
     },
@@ -383,6 +379,8 @@ describe.each(['create', 'chat'] as const)('%s with failed Machine Flock freshne
         latestUserMsgId: userTurnId,
       });
       expect(fixture.dispatched).toEqual(await fixture.history());
+      const doc = await fixture.manager.getOrCreateSessionDoc(sessionId);
+      expect((await doc.getDocState())?.humanInputReceipts?.[userTurnId]).toMatchObject({ userId });
     }
   );
 

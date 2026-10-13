@@ -464,3 +464,14 @@ persists pause and cancels pre-Stop queued eligibility. Fresh human entry may re
 retained physical cleanup, but cannot dispatch until proof of release. Runtime ownership
 lasts through durable release/settlement, so a Stop during final release can veto the
 automatic intent. Post-fence human-plus-batch input cannot use stale-ACP replay.
+
+Human send authorization also lives in the Session control document's
+`humanInputReceipts` map. UI and non-delegated CLI entry points stamp it before
+activation; execution restores the matching receipt through ordinary history dispatch.
+RPC is redundant, including for large inputs. Generic history imports and Agent chat
+do not stamp this map, and canceled/terminal input IDs cannot clear a later pause.
+
+The Session sandbox persists incomplete identity before spawn and continuously adds
+ACP/terminal process roots. Execution retains every attached Session owner until release,
+including replacements within one turn. Restart probes require explicit completeness and
+absence of every root/group; an initial snapshot alone is insufficient.

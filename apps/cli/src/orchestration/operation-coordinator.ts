@@ -369,6 +369,9 @@ export class LodyOperationCoordinator {
         await this.quiesceReceipt;
       }
       await this.options.executionService.recoverUnreleasedInboxExecutions?.();
+      // close() deliberately preserves its original failure receipt. Retry only
+      // retained durable receipts through the independent recovery owner.
+      await this.inbox?.recoverClose();
       await this.finishStop();
     })();
     this.shutdownRecovery = recovery;

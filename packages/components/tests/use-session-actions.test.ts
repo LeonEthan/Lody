@@ -832,7 +832,8 @@ describe('useSessionActions', () => {
         },
       },
     ];
-    const setState = vi.fn();
+    const control: { humanInputReceipts?: Record<string, { userId: string }> } = {};
+    const setState = (update: (draft: typeof control) => void) => update(control);
     const waitUntilSynced = vi.fn(async () => undefined);
     const upsertDocMeta = vi.fn(() => metaWrite.promise);
     const requestSessionDispatchTurn = vi.fn(async () => ({
@@ -871,7 +872,7 @@ describe('useSessionActions', () => {
     expect(upsertDocMeta).toHaveBeenCalledWith(getSessionRoomId(sessionId), {
       latestUserMsgId: userTurnId,
     });
-    expect(setState).not.toHaveBeenCalled();
+    expect(control.humanInputReceipts?.[userTurnId]).toEqual({ userId: 'user-1' });
     expect(waitUntilSynced).toHaveBeenCalledTimes(1);
 
     metaWrite.resolve();

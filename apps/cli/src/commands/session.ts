@@ -3823,6 +3823,8 @@ export async function createSessionResult(
         status: SessionStatusFactory.idle(),
       } satisfies Partial<SessionMeta>);
     }
+    if (!options.delegatedRequester)
+      sessionDoc.recordHumanInputReceipt(userTurnId, requesterUserId);
     await commitPreparedSessionDispatch(manager, prepared);
     dispatched = true;
     await confirmDispatchSyncedBestEffort({
@@ -4075,6 +4077,7 @@ export async function sendSessionChatResult(
   let dispatched = false;
   try {
     await updateSessionActivityTimestampsBestEffort(manager, sessionId);
+    if (!delegatedRequester) sessionDoc.recordHumanInputReceipt(userTurnId, requesterUserId);
     await writeDispatchPointer({ manager, sessionId, userTurnId });
     dispatched = true;
     await confirmDispatchSyncedBestEffort({

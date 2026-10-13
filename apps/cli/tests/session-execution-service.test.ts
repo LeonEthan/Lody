@@ -52,6 +52,7 @@ import {
 import type { SessionManager } from '../src/session/session-manager';
 import { MachineDocument, SessionDocument, type LoroDocumentManager } from '../src/lib/loro/doc';
 import { composeTestSessionDoc } from './session-doc-fixture';
+import Database from 'better-sqlite3';
 import { Session } from '../src/session/session';
 import { SessionEditAndResendService } from '../src/session/session-edit-and-resend-service';
 import { AcpAuthenticationRequiredError, AgentClient } from '../src/agent/agent-client';
@@ -10536,7 +10537,6 @@ describe('Operation Inbox execution boundary', () => {
       getWorkdir: () => '/tmp',
       getHostWorkdir: () => '/tmp',
       getParentSessionId: () => undefined,
-      getInboxRecoveryRoots: async () => [],
       exec: async () => '',
       terminate: async () => {
         created = false;
@@ -10662,6 +10662,177 @@ describe('Operation Inbox execution boundary', () => {
       storePath: path.join(root, 'operations.sqlite3'),
     };
   }
+
+  it('journals later resources through the active Session adapter before releasing execution', async () => {
+    const started = createDeferred<void>();
+    const finish = createDeferred<void>();
+    let persist!: (identity: { roots: readonly number[]; complete: boolean }) => void;
+    let attached = true;
+    const f = inboxExecutionFixture(async () => {
+      persist({ roots: [123, 456], complete: false });
+      persist({ roots: [123, 456], complete: true });
+      started.resolve();
+      await finish.promise;
+      return { stopReason: 'end_turn' };
+    });
+    Object.assign(f.session, {
+      watchInboxRecoveryResources: async (record: typeof persist) => {
+        persist = record;
+        persist({ roots: [123], complete: true });
+        return () => {
+          attached = false;
+        };
+      },
+    });
+    try {
+      await f.accept();
+      const running = f.service.continueSession(f.message);
+      await started.promise;
+      const db = new Database(f.storePath);
+      try {
+        const row = db.prepare('SELECT identity_json FROM inbox_resources').get() as {
+          identity_json: string;
+        };
+        expect(JSON.parse(row.identity_json)).toMatchObject({
+          roots: [process.pid, 123, 456],
+          complete: true,
+        });
+        expect(attached).toBe(true);
+      } finally {
+        db.close();
+      }
+      finish.resolve();
+      await running;
+      expect(attached).toBe(false);
+    } finally {
+      finish.resolve();
+      await f.close();
+    }
+  });
+
+  it('retains incomplete acquisition after prompt completion and retries failed release persistence', async () => {
+    let persist!: (identity: { roots: readonly number[]; complete: boolean }) => void;
+    const received: ContentBlock[][] = [];
+    const f = inboxExecutionFixture(async (blocks) => {
+      received.push(structuredClone(blocks));
+      persist({ roots: [123], complete: false });
+      f.add('arrived-while-acquiring');
+      return { stopReason: 'end_turn' };
+    });
+    Object.assign(f.session, {
+      watchInboxRecoveryResources: async (record: typeof persist) => {
+        persist = record;
+        record({ roots: [123], complete: true });
+        return () => {};
+      },
+    });
+    try {
+      await f.accept();
+      await f.service.continueSession(f.message);
+      expect(f.store.inbox.pending('workspace-1')).toEqual([]);
+      const next = {
+        workspaceId: 'workspace-1',
+        sessionId: f.message.sessionId,
+        userId: 'user-1',
+        inputId: 'later-human',
+        kind: 'human' as const,
+        config: f.message.acpSessionConfig,
+      };
+      f.store.inbox.accept(next);
+      expect(f.store.inbox.begin(next, 'successor')).toBe(false);
+      const db = new Database(f.storePath);
+      try {
+        db.exec(
+          "CREATE TRIGGER release_outage BEFORE UPDATE ON inbox_sessions WHEN OLD.blocked=1 AND NEW.blocked=0 BEGIN SELECT RAISE(ABORT,'release outage'); END;"
+        );
+        await expect(f.service.recoverInboxExecution(f.message.sessionId)).rejects.toThrow(
+          'release outage'
+        );
+        expect(f.store.inbox.begin(next, 'successor')).toBe(false);
+        db.exec('DROP TRIGGER release_outage');
+        await f.service.recoverInboxExecution(f.message.sessionId);
+        expect(f.store.inbox.begin(next, 'successor')).toBe(true);
+        expect(received).toHaveLength(1);
+        expect(received[0]).toEqual([{ type: 'text', text: 'CURRENT_REQUEST' }]);
+      } finally {
+        db.close();
+      }
+    } finally {
+      await f.close();
+    }
+  });
+
+  it.each(['valid', 'absent', 'foreign', 'canceled'] as const)(
+    'restores only a matching, uncanceled durable human receipt (%s) after RPC loss',
+    async (mode) => {
+      const received: ContentBlock[][] = [];
+      const f = inboxExecutionFixture(async (blocks) => {
+        received.push(structuredClone(blocks));
+        return { stopReason: 'end_turn' };
+      });
+      try {
+        const prior = {
+          workspaceId: 'workspace-1',
+          sessionId: f.message.sessionId,
+          userId: 'user-1',
+          inputId: 'prior-human',
+          kind: 'human' as const,
+          config: f.message.acpSessionConfig,
+        };
+        f.store.inbox.accept(prior);
+        f.store.inbox.begin(prior, 'prior-execution');
+        f.store.inbox.pause(
+          prior,
+          'prior-execution',
+          mode === 'canceled' ? ['human-input'] : [],
+          'stop-1'
+        );
+        f.store.inbox.release({ ...prior, executionId: 'prior-execution', outcome: 'user_stop' });
+        f.add('queued-result');
+        const { LoroDoc, LoroMap } = await import('loro-crdt');
+        const raw = f.doc.handle!.doc;
+        if (mode !== 'absent') {
+          const receipt = raw
+            .getMap('humanInputReceipts')
+            .setContainer('human-input', new LoroMap());
+          receipt.set('userId', mode === 'foreign' ? 'other-user' : 'user-1');
+          raw.commit();
+        }
+        const reopened = new LoroDoc();
+        reopened.import(raw.export({ mode: 'snapshot' }));
+        composeTestSessionDoc(f.doc, { doc: reopened });
+        await f.service.continueSession(f.message, { dispatchSource: 'crdt' });
+        if (mode === 'valid') {
+          expect(received).toHaveLength(1);
+          expect(JSON.stringify(received[0])).toContain('CURRENT_REQUEST');
+          expect(JSON.stringify(received[0])).toContain('queued-result');
+          expect(f.store.inbox.inputKind(prior, 'human-input')).toBe('human');
+          // Re-delivered receipts retain their original accepted identity; after
+          // another Stop they cannot grant fresh authorization or another prompt.
+          const later = { ...prior, inputId: 'later-human' };
+          f.store.inbox.accept(later);
+          f.store.inbox.begin(later, 'later-execution');
+          f.store.inbox.pause(later, 'later-execution', [], 'stop-2');
+          f.store.inbox.release({ ...later, executionId: 'later-execution', outcome: 'user_stop' });
+          await f.service.acceptInboxHumanInput({
+            sessionId: f.message.sessionId,
+            inputId: 'human-input',
+            userId: 'user-1',
+            config: f.message.acpSessionConfig,
+          });
+          expect(f.store.inbox.accept({ ...prior, kind: 'task', inputId: 'agent-task' })).toBe(
+            false
+          );
+          expect(received).toHaveLength(1);
+        } else {
+          expect(received).toEqual([]);
+          expect(f.store.inbox.pending('workspace-1')).toEqual([]);
+        }
+      } finally {
+        await f.close();
+      }
+    }
+  );
 
   it('submits one intact human input with eight results through the actual prompt boundary', async () => {
     const received: ContentBlock[][] = [];

@@ -64,6 +64,10 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
 - Physical request/resource release differs from waiter exit and Scope close. Keep immutable
   execution IDs, shared close receipts, full Cause and retained recovery owners. Unknown
   release blocks successors. Independent recovery must prove release before clearing that slot.
+  Persist acquisition-incomplete before every sandbox spawn, then union all spawned roots for
+  every Session owned by the execution. Only explicitly complete identities can prove restart
+  release; legacy snapshots and interrupted journaling remain blocked. Coordinator recovery
+  calls `recoverClose`, not the cached failed `close` receipt; never replay transport.
 - Upgrade drains old reconciliation chains and actual requests before activating Inbox mode.
   Old `stop()` alone is insufficient. Existing backlogs are passive; legacy submitted/unknown
   results cannot be granted a new submission. Only Inbox v1-compatible writers may downgrade.

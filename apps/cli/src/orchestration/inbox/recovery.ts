@@ -2,13 +2,19 @@ import { Context, Effect, Layer } from 'effect';
 import type { ProcessTableSnapshot } from '@/monitor/process-table';
 import { readProcessTable } from '@/monitor/process-table';
 
-export type InboxResourceIdentity = { platform: NodeJS.Platform; roots: readonly number[] };
+export type InboxResourceIdentity = {
+  platform: NodeJS.Platform;
+  roots: readonly number[];
+  /** False (including legacy absence) while resource acquisition is unaccounted for. */
+  complete?: boolean;
+};
 /** Read-only verification. Never send a signal to a PID that may have been reused. */
 export const provesResourcesGone = (
   identity: InboxResourceIdentity,
   snapshot: ProcessTableSnapshot
 ): boolean =>
   identity.platform !== 'win32' &&
+  identity.complete === true &&
   identity.roots.length > 0 &&
   identity.roots.every(
     (pid) => !snapshot.entries.some((entry) => entry.pid === pid || entry.processGroupId === pid)

@@ -35,6 +35,9 @@ A batch is one system history item plus one model input, even when details requi
 owner retains raw requests and full failures; `recoverInboxExecution` retries cleanup.
 Coordinator `stop()` now has a shared awaited drain receipt; `recoverStop()` is its
 independent retry entry. Same-process legacy handoff uses `startAfterLegacyDrain`.
+`recoverStop()` invokes the bridge's `recoverClose()` for failed close receipts, using
+an independent connection to retry only settlement/release/pause writes. The original
+failed close receipt remains unchanged; requests are never resubmitted.
 
 Only a confirmed normal release can grant an automatic intent. Stop cancels queued
 human execution eligibility and pauses automatic work. Fresh human input carries saved

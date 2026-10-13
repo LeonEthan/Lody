@@ -14,8 +14,8 @@ Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
   identity.
 - Live status is a target-daemon Machine RPC read; durable metadata is not a live-presence
   substitute.
-- Derive the human identity from the active dispatch/execution runtime and fail closed when none
-  exists; retries and recovery never reread mutable history.
+- Freeze runtime human identity; require it. Trusted sends stamp `humanInputReceipts` before launch;
+  recover via receipts, never role/author. [Rules](../orchestration/AGENTS.md).
 - Machine/Provider credentials stay host-scoped. Attribution, authorization and commits
   use the frozen Turn identity; GitHub network auth uses the trusted conversation owner.
 - Git: owner uses local config, no profile query; others never read it.

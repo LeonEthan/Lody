@@ -1264,3 +1264,51 @@ it('reprojects a crashed submitting batch as unknown without starting model work
     await h.coordinator.stop();
   }
 });
+
+it('recovers failed native close through the coordinator without resubmitting transport', async () => {
+  const harness = await makeHarness();
+  harness.coordinator.start();
+  await harness.coordinator.idle();
+  const bridge = (
+    harness.coordinator as unknown as {
+      inbox: import('./inbox/legacy').OperationInboxLegacy;
+    }
+  ).inbox;
+  const store = new LodyOperationStore(harness.storePath, () => TEST_NOW_MS);
+  const input = {
+    workspaceId: 'workspace-1',
+    sessionId: harness.requesterSessionId,
+    userId: 'user-1',
+    inputId: 'fresh-human',
+    kind: 'human' as const,
+    config: { prompt: 'request' },
+  };
+  store.finish(harness.requesterSessionId, 'review-round-1', {
+    type: 'result',
+    value: { items: [] },
+  });
+  await bridge.accept(input);
+  await bridge.begin(input, 'execution');
+  const batch = (await bridge.prepare(input))!;
+  expect(batch.memberCount).toBe(1);
+  const received: string[] = [];
+  await bridge.submit(batch, input, 'execution', () => received.push(batch.batchId));
+  const db = new Database(harness.storePath);
+  db.exec(
+    "CREATE TRIGGER review_settle_outage BEFORE UPDATE OF state ON inbox_batches WHEN NEW.state='settled' BEGIN SELECT RAISE(ABORT,'settlement outage'); END;"
+  );
+  await bridge.settle(batch, 'settled');
+  await expect(harness.coordinator.stop()).rejects.toThrow('Inbox Scope release failed');
+  db.exec('DROP TRIGGER review_settle_outage');
+  await harness.coordinator.recoverStop();
+  expect(db.prepare('SELECT state FROM inbox_batches WHERE batch_id=?').get(batch.batchId)).toEqual(
+    { state: 'settled' }
+  );
+  expect(received).toEqual([batch.batchId]);
+  expect(await bridge.close()).toBeUndefined();
+  harness.coordinator.start();
+  await harness.coordinator.idle();
+  await harness.coordinator.stop();
+  db.close();
+  store.close();
+});

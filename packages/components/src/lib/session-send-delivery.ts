@@ -10,7 +10,7 @@ import {
   type SessionTurnInputConfig,
 } from '@lody/shared';
 import debug from 'debug';
-import type { WorkspaceRuntime } from '@/atoms/runtime';
+import type { SessionDocDraft, WorkspaceRuntime } from '@/atoms/runtime';
 import { throwIfSendAborted } from './session-send-resources';
 
 const log = debug('lody:session-send');
@@ -42,6 +42,26 @@ export type SessionSendRuntime = Pick<
   'repo' | 'writer' | 'sendResources' | 'requestSessionDispatchTurn' | 'requestSessionSteer'
 > &
   Partial<Pick<WorkspaceRuntime, 'isMachineRpcUnreachable'>>;
+
+async function persistHumanInputReceipt(
+  runtime: SessionSendRuntime,
+  sessionId: SessionId,
+  inputId: string,
+  userId: string,
+  signal?: AbortSignal
+): Promise<void> {
+  await runtime.sendResources.withSessionStore(
+    sessionId,
+    (store) => {
+      if (store.getState().humanInputReceipts?.[inputId]?.userId === userId) return;
+      store.setState((draft: SessionDocDraft) => {
+        draft.humanInputReceipts ??= {};
+        draft.humanInputReceipts[inputId] = { userId };
+      });
+    },
+    signal
+  );
+}
 
 /**
  * Point the CLI's activation watermark at this turn unless a later local user
@@ -103,6 +123,12 @@ export async function writeUserTurn(
     throw new Error('Target conversation is no longer available');
   }
   throwIfSendAborted(signal);
+  // This is the trusted human-send producer, separate from generic history
+  // append and Agent task materialization. Persist its receipt BEFORE activating
+  // history/queue; RPC is only a redundant fast path, even for oversized input.
+  const userId = entry.userId?.trim();
+  if (!userId) throw new Error('Human input requires an explicit user identity');
+  await persistHumanInputReceipt(runtime, sessionId, entry.id, userId, signal);
   if (send.queue) await runtime.writer.enqueueSessionMessage(sessionId, send.queue);
   else await runtime.writer.appendSessionTurn(sessionId, entry);
   if (send.delivery.kind === 'dispatch') await activateUserTurn(runtime, sessionId, entry.id);
@@ -140,12 +166,18 @@ export async function dispatchUserTurn(
   const inputConfig = options?.inputConfig ?? normalizeSessionTurnInputConfig(entry?.inputConfig);
   const userId = entry?.userId?.trim();
   const timestamp = entry?.timestamp;
+  if (userId) await persistHumanInputReceipt(runtime, sessionId, userTurnId, userId);
   // Local history writes are the accept boundary; nudge the room upload
   // without holding the caller on it.
   void runtime.sendResources
     .withSessionStore(sessionId, (store, signal) => store.waitUntilSynced(signal))
     .catch((error: unknown) => {
-      log('session doc sync after dispatch request failed for %s/%s: %o', sessionId, userTurnId, error);
+      log(
+        'session doc sync after dispatch request failed for %s/%s: %o',
+        sessionId,
+        userTurnId,
+        error
+      );
     });
   const machineId = options?.machineId ?? (await readMachineId(runtime, sessionId));
   let rpc: Promise<boolean> = Promise.resolve(false);

@@ -18,9 +18,13 @@ Pre-Stop queued human inputs lose execution eligibility and retain text; fresh i
 
 POSIX reopen recovery requires nonempty process-root identity and proven absence of roots/groups; it never signals potentially reused PIDs. Windows, empty identities or unprovable resources remain blocked. Unknown submission only settles and never replays. Oversized individual members remain fully readable through fragments. Compatibility is Inbox v1; older per-Delivery binaries are unsupported downgrades. Host exit fences upgrade; the same-process legacy adapter must drain old chains and physical resources.
 
+Review of `40ef5c29cbe496f28f17ab10297cf37c3c48030f` found three adapter handoff defects. The revision continuously journals every sandbox acquisition, marking identity incomplete before spawn and unioning later terminal roots. Execution retains all Session owners and the producing host PID; absence of initial ACP roots alone cannot prove a closed resource set. Missing completeness and interrupted journaling remain blocked. Trusted renderer/non-delegated CLI sends persist a separate control-document `humanInputReceipts` outbox before activation/queue. Matching history dispatch restores authorization without RPC, while Agent/generic history writes, foreign receipts and canceled/terminal IDs cannot clear pause. Coordinator `recoverStop` calls independent `recoverClose` to retry retained durable receipts, preserving the original failure and never resending transport.
+
 ## Validation and delivery status
 
 Base: `3ac76bad10f46720517a2ca6929f03de4ef5bb9b`. This implementation is a PR candidate, not merged or released. Verification used an isolated source copy with pinned dependencies; the final comparison found matching changed-source bytes. Effect remains 4.0.2; catalog and lockfile were not upgraded.
+
+The following table preserves the initial `40ef5c29c` authoring evidence. Revision results are separate below.
 
 | Scope | Result |
 | --- | --- |
@@ -33,10 +37,14 @@ Base: `3ac76bad10f46720517a2ca6929f03de4ef5bb9b`. This implementation is a PR ca
 | Root `pnpm check` | Failed: CLI 4055 passed, 4 skipped; one unchanged Git transport case failed with `context_unreadable`. Later pause/Watcher edits received the focused reruns above, not a claim of final full-tree green |
 | Actual working-tree docs status/check | 82 existing errors, no Inbox-file errors; not document approval |
 
+Revision-specific regression: 7 owning CLI suites, 676 passed; 4 human-send/configuration suites, 117 passed. Coverage includes real independent process groups with SQLite reopen and injected process-table snapshots, concurrent acquisition fences, producing-host presence, actual execution adapter journaling, incomplete acquisition after prompt completion, retryable release persistence, fresh verified resource generations, durable user receipts after CRDT reopen (valid/absent/foreign/canceled), RPC loss/oversized send, and coordinator-level settlement outage/recovery without transport replay. These counts overlap the earlier matrix and are not additive.
+
+The revision's complete Shared/components suites passed 1428/5141 tests. Complete typecheck, final CLI typecheck, lint (zero errors), format and Inbox/process/platform/public/i18n guards passed. Re-running root `pnpm check` reached CLI 4065 passed/4 skipped with the same unchanged Git transport `context_unreadable` failure; final acquisition/cleanup guards and fixture changes received the 676-test intersection, final types/lint/format and source-byte comparison, not another full-root green claim. Docs check retains the exact same 82-error array as `40ef5c29c`, without Inbox errors. No real-model, full-system-process-table or desktop end-to-end acceptance is claimed.
+
 Tests observe full received input, durable rows, fault triggers, Deferred, injected clocks and fake timers without live network or sleeps. OS children recover the fixed eight-member intent without a new event, exclude the late ninth, and leave paused/cross-fence unknown work passive. The actual legacy coordinator fixture matches the base bytes after relative-import relocation; before/after-fence cases still require old-chain completion and actual release after old stop returns. Tests do not call real models.
 
 Manual Stop shares its cancelId across RPC and durable fallback. Failed persistence retains each request identity and repairs it before fresh human acceptance. Internal cancellation revokes execution without persisting a human message pause. Consumed payload copies follow Operation retention; permanent Session deletion also removes Inbox copies. Reopen repairs history receipts without replaying transport.
 
-Independent review, human Spec approval, real-model and desktop end-to-end product acceptance remain outstanding. Windows, missing POSIX identity or unproven release remain blocked even after fresh input. Whole Session/ACP/history native migration is not claimed.
+The reviewed `40ef5c29c` had three P1 findings; the revised candidate still requires independent re-review. Human Spec approval, real-model and desktop end-to-end product acceptance remain outstanding. Windows, missing POSIX identity or unproven release remain blocked even after fresh input. Whole Session/ACP/history native migration is not claimed.
 
 [Design](../../proposed/architecture/2026-10-12-turn-scoped-operation-inbox.md), [implementation plan](../../proposed/architecture/2026-10-12-operation-inbox-effect-implementation-plan.md), [Spec](../../../../specs/session-orchestration.md).
