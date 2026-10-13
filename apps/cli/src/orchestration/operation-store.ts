@@ -2,6 +2,7 @@ import { InboxSqlite } from './inbox/sqlite';
 import { SessionInputAttachmentsSchema } from '@/lib/session-input-content';
 import {
   MemoryBindingSchema,
+  buildAgentMessageAuthor,
   AgentMessageAuthorSchema,
   AgentRoleSnapshotSchema,
 } from '@lody/shared';
@@ -898,7 +899,12 @@ export class LodyOperationStore {
       | undefined;
     const author = authorRow?.author_json
       ? parseJson(authorRow.author_json, AgentMessageAuthorSchema, 'Operation author')
-      : undefined;
+      : frozen.sourceTurnId
+        ? buildAgentMessageAuthor({
+            sessionId: parsed.requester_session_id,
+            turnId: frozen.sourceTurnId,
+          })
+        : undefined;
     const inputRow = this.db
       .prepare(
         'SELECT attachments_json FROM operation_inputs WHERE requester_session_id = ? AND operation_id = ?'

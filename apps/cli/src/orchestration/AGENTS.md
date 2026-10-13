@@ -29,8 +29,8 @@ Root and `apps/cli/AGENTS.md` apply; `specs/session-orchestration.md` owns behav
   the source Session. Recovery uses that user for attribution/authorization and the current owner
   Machine credential to execute. Completion preserves userId. Matching includes both ids, kind,
   and fingerprint; reuse from another Turn is `OPERATION_ID_REUSED`, not a retry.
-  Presentation and attachment snapshots live in `operation_authors` / `operation_inputs`,
-  atomically with acceptance; recovery uses these frozen snapshots.
+  Author/attachment snapshots in `operation_authors` / `operation_inputs` freeze atomically.
+  Missing authors retain frozen Session/Turn provenance, never human identity.
 - `operation-coordinator.ts` is owned only by the local Host-lease Worker. MCP
   subprocesses may accept Operations but never schedule completion Turns.
 - Reconciliation is level-checked. Loro subscriptions and SQLite directory

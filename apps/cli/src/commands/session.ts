@@ -165,6 +165,18 @@ export type DelegatedSessionRequester = {
   author?: AgentMessageAuthor;
 };
 
+/** Delegation without provenance must never be recorded as human input. */
+const resolveSessionInputAuthor = (
+  userId: string,
+  delegatedRequester?: DelegatedSessionRequester
+): MessageAuthor => {
+  if (!delegatedRequester) return { v: 1, kind: 'human', userId };
+  if (!delegatedRequester.author) {
+    throw new Error('Delegated message is missing Agent source identity.');
+  }
+  return delegatedRequester.author;
+};
+
 type ResolvedSessionRequester = {
   userId: string;
   isDelegated: boolean;
@@ -3555,6 +3567,7 @@ export async function prepareSessionInput(
     options.delegatedRequester
   );
   const requesterUserId = requester.userId;
+  const author = resolveSessionInputAuthor(requesterUserId, options.delegatedRequester);
   const sessionOwnerUserId = resolveSessionCreateOwnerUserId(
     requesterUserId,
     options.sessionOwnerUserId
@@ -3725,7 +3738,7 @@ export async function prepareSessionInput(
         : 'pending',
     read: !!ownerTarget || machineSupportsPreparedSessionInputProtocol(targetMachine),
     userId: requesterUserId,
-    author: options.delegatedRequester?.author ?? { v: 1, kind: 'human', userId: requesterUserId },
+    author,
     items: inputBlocksToHistoryItems(inputBlocks),
     inputConfig: {
       ...(options.agentRoleId
@@ -3947,6 +3960,7 @@ export async function sendSessionChatResult(
 }> {
   const requester = resolveSessionRequester(auth, requesterUserIdOverride, delegatedRequester);
   const requesterUserId = requester.userId;
+  const author = resolveSessionInputAuthor(requesterUserId, delegatedRequester);
   const session = await validateSessionChatTargetForRequester({
     auth,
     workspace,
@@ -4036,7 +4050,7 @@ export async function sendSessionChatResult(
     sessionDoc,
     prompt,
     userId: requesterUserId,
-    author: delegatedRequester?.author,
+    author,
     inputConfig: {
       agentRoleId: roleSelection?.agentRoleId ?? null,
       agentRoleRevision: roleSelection?.agentRoleRevision,

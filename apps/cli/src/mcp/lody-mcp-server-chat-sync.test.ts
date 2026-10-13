@@ -88,11 +88,11 @@ vi.mock('@/session/session-backend', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/session/session-backend')>();
   return {
     ...actual,
-    createSessionBackend: vi.fn(async () => ({
-      history: {
-        readTurn: mocks.readTurn,
-      },
-    })),
+    createSessionBackend: vi.fn(async (doc, meta) =>
+      doc?.sessionData
+        ? actual.createSessionBackend(doc, meta)
+        : { history: { readTurn: mocks.readTurn } }
+    ),
   };
 });
 
@@ -288,6 +288,7 @@ describe('session chat prevalidation sync failures', () => {
 });
 
 describe('turn-scoped reverse chat rejection', () => {
+  let sessionData: ReturnType<typeof createLoroSessionData>;
   let store: LodyOperationStore;
   let root: string;
   let writer: ReturnType<typeof createHistoryWriter>;
@@ -355,6 +356,7 @@ describe('turn-scoped reverse chat rejection', () => {
       doc,
       writer,
     });
+    sessionData = data;
     mocks.readTurn.mockImplementation(data.history.readTurn.bind(data.history));
     setInput('requester-turn-id', targetSession.id);
     delivered = [];
@@ -380,6 +382,135 @@ describe('turn-scoped reverse chat rejection', () => {
     store.close();
     await rm(root, { recursive: true, force: true });
   });
+
+  it.each(['session_chat', 'session_create'] as const)(
+    'keeps missing-snapshot %s recovery Agent-authored and rejects chat back to its source',
+    async (kind) => {
+      const actualStore = await vi.importActual<typeof import('@/orchestration/operation-store')>(
+        '@/orchestration/operation-store'
+      );
+      const commands =
+        await vi.importActual<typeof import('@/commands/session')>('@/commands/session');
+      store.accept({
+        workspaceId: 'workspace-id' as never,
+        ownerMachineId: 'machine-id' as never,
+        requesterSessionId: targetSession.id as SessionId,
+        requesterUserId: requesterSession.userId,
+        operationId: 'incoming-without-display-snapshot',
+        kind,
+        canonicalCommand: { prompt: 'Recovered work' },
+        frozenContinuationConfig: { sourceTurnId: 'source-a-turn', inputConfig: {} },
+        initiatorChainDepth: 0,
+        createdAt: '2026-10-12T00:00:00Z',
+        deadlineAt: '2099-01-01T00:00:00Z',
+        items: [
+          {
+            status: 'active',
+            target: { sessionId: requesterSession.id as SessionId, userTurnId: 'recovered-input' },
+            inputDurable: false,
+          },
+        ],
+      });
+      store.close();
+      store = new actualStore.LodyOperationStore(path.join(root, 'operations.sqlite3'));
+      mocks.accept.mockImplementation(store.accept.bind(store));
+      mocks.get.mockImplementation(store.get.bind(store));
+      mocks.findMatchingRetry.mockImplementation(store.findMatchingRetry.bind(store));
+      mocks.snapshot.mockImplementation(store.snapshot.bind(store));
+      const recovered = store.get(
+        targetSession.id as SessionId,
+        'incoming-without-display-snapshot'
+      );
+      expect(recovered.author).toEqual({
+        v: 1,
+        kind: 'agent',
+        sessionId: targetSession.id,
+        turnId: 'source-a-turn',
+        name: 'Agent',
+      });
+      const delegatedRequester = { userId: recovered.requesterUserId, author: recovered.author };
+      let input: import('@lody/shared').SessionHistoryInput;
+      if (kind === 'session_create') {
+        const prepared = await commands.prepareSessionInput(
+          {
+            userId: recovered.requesterUserId,
+            machineId: 'machine-id',
+            token: '',
+            userName: 'User',
+            userEmail: 'user@example.test',
+            machineName: 'Local',
+          } as never,
+          { id: 'workspace-id', name: 'Workspace', slug: 'workspace', role: 'owner' },
+          {} as never,
+          'Recovered work',
+          {
+            workspaceMetaPrewriteSatisfied: true,
+            bypassSessionQuota: true,
+            historyBackend: 'loro',
+            userTurnId: 'recovered-input',
+            delegatedRequester,
+          },
+          { inheritSessionDefaults: false },
+          {
+            targetMachine: { id: 'machine-id', ownerUserId: recovered.requesterUserId },
+            agentConfig: {
+              id: 'agent-id',
+              machineId: 'machine-id',
+              cliType: 'registry',
+              agentType: 'fixture',
+            },
+          } as never
+        );
+        input = prepared.userTurn;
+        writer.append(input as never);
+      } else {
+        await commands.appendUserPromptHistory({
+          sessionDoc: {
+            sessionData,
+            sessionId: requesterSession.id,
+            getMetaState: async () => ({ historyBackend: 'loro' }),
+            appendUserTurn: async (entry: import('@lody/shared').SessionHistoryInput) => {
+              writer.append(entry as never);
+            },
+          } as never,
+          prompt: 'Recovered work',
+          userId: delegatedRequester.userId,
+          author: delegatedRequester.author,
+          preallocatedId: 'recovered-input',
+        });
+        input = writer
+          .readStored()
+          .find(
+            (entry) => entry.id === 'recovered-input'
+          ) as import('@lody/shared').SessionHistoryInput;
+      }
+      expect(input.author).toEqual(recovered.author);
+      expect(input.userId).toBe(recovered.requesterUserId);
+      mocks.activeInvocation.mockReturnValue({
+        type: 'session/active-invocation-context',
+        sessionId: requesterSession.id,
+        active: true,
+        requesterUserId: recovered.requesterUserId,
+        sourceTurnId: input.id,
+        inputConfig: {},
+      });
+      const result = await callAndMapMcpError(() =>
+        startSessionChatOperation({
+          sessionId: targetSession.id,
+          prompt: 'Acknowledge',
+          operationId: 'forbidden-recovered-reply',
+        })
+      );
+      const content = result.content[0];
+      if (!content || content.type !== 'text') throw new Error('expected error');
+      expect(JSON.parse(content.text)).toMatchObject({
+        ok: false,
+        error: { code: 'REVERSE_CHAT_FORBIDDEN', retryable: false },
+      });
+      expect(storedOperations()).toEqual([]);
+      expect(delivered).toEqual([]);
+    }
+  );
 
   it.each(['single', 'batch', 'legacy'] as const)(
     'rejects a %s chat back to the current input sender without durable work or target input',

@@ -61,6 +61,7 @@ import {
   selectDefaultAgentConfigForCreate,
   readDelegatedMachineAccess,
   resolveSessionRequester,
+  sendSessionChatResult,
   resolveSessionCommandRequesterUserId,
   resolveChatArgs,
   resolveRenameArgs,
@@ -2299,6 +2300,43 @@ describe('prepared command attachment inputs', () => {
     bypassSessionQuota: true,
     historyBackend: 'loro' as const,
   };
+
+  it('rejects delegated create and chat without source identity before any publication', async () => {
+    const manager = new Proxy(
+      {},
+      {
+        get: () => {
+          throw new Error('Unexpected side effect');
+        },
+      }
+    );
+    const delegatedRequester = { userId: auth.userId };
+    await expect(
+      prepareSessionInput(
+        auth,
+        workspace,
+        manager as never,
+        'Delegated work',
+        { ...options, delegatedRequester },
+        { inheritSessionDefaults: false },
+        ownerTarget
+      )
+    ).rejects.toThrow('missing Agent source identity');
+    await expect(
+      sendSessionChatResult(
+        auth,
+        workspace,
+        manager as never,
+        'target' as SessionId,
+        'Delegated work',
+        {},
+        undefined,
+        undefined,
+        undefined,
+        delegatedRequester
+      )
+    ).rejects.toThrow('missing Agent source identity');
+  });
 
   it('keeps raw input in history and preserves attachments beside composed execution text', async () => {
     // Preparation must not write metadata/history or start execution.

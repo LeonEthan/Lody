@@ -73,6 +73,19 @@ afterEach(async () => {
 });
 
 describe('LodyOperationStore', () => {
+  it('does not infer an Agent source from the requester Session alone', async () => {
+    const store = await makeStore();
+    try {
+      const input = baseInput();
+      const { sourceTurnId: _, ...config } = input.frozenContinuationConfig;
+      const { operation } = store.accept({ ...input, frozenContinuationConfig: config });
+      expect(operation.author).toBeUndefined();
+      expect(store.get(operation.requesterSessionId, operation.operationId).author).toBeUndefined();
+    } finally {
+      store.close();
+    }
+  });
+
   it('deletes old-only tasks and Delivery state instead of recovering or indexing them', async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), 'lody-discard-old-store-'));
     roots.add(root);

@@ -88,9 +88,11 @@ format; old per-member continuation statuses and notices are removed.
 
 `operation_authors` stores source identity and per-target Role display snapshots in
 the Operation acceptance transaction, with cascading cleanup. Separate storage
-keeps Operation records separate from display snapshots. Missing rows
-mean legacy provenance, not permission to reconstruct historical identities from
-current catalogs. See the [contract](../../../../specs/message-author-identity.md).
+keeps Operation records separate from display snapshots. A missing author snapshot
+on a delegated Operation retains its frozen requester Session and source Turn as
+minimal Agent provenance, with the generic label `Agent` and no Role/model details.
+Create/chat reject delegation without source identity rather than defaulting to human.
+Never reconstruct historical display details from current catalogs. See the [contract](../../../../specs/message-author-identity.md).
 
 Decision rationale, verification limits and future steer conditions are maintained in
 the [implementation record](../../../../.agents/notes/implemented/architecture/2026-10-12-operation-inbox.md).

@@ -35,6 +35,8 @@ Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fi
 
 手动 Stop 的 RPC 与持久兜底共用请求 ID，防止迟到重复请求再次暂停新输入。写盘失败保留请求身份以便补写。已消费结果副本随 Operation 保留期清理；永久删除 Session 同时删除 Inbox 副本。最终存储边界是 schema／Inbox protocol v2、host launch v3。此次明确放弃旧编排数据兼容：旧版专用库和未使用的兼容结果副本在首次打开时删除，不重放、不导入；当前 Inbox 的暂停、未知提交和资源所有权保留。完成结果直接入 Inbox，删除旧表、逐条认领／续跑接口、旧模型和旧协调器 fixture；结果序号持久递增，保留期清理不能重用旧水位。忙闲判断不再把被动结果算作执行。`inbox/legacy.ts` 只桥接仍未迁移的当前 Session／ACP，batch 成员的展示格式仍保留。目前没有已发布的兼容 SHA。
 
+作者来源与展示快照分开：保留下来的当前 Operation 即使没有作者快照，只要保存了 `sourceTurnId`，读取时也以冻结的 `requesterSessionId/sourceTurnId` 保留最小 Agent 来源，通用名称为 `Agent`，不补 Role、模型或目录信息。create/chat 在任何发布前拒绝缺少来源身份的委派；普通用户入口仍署名 human。反向检查直接读取准确输入的 Agent `sessionId`，不依赖父子关系。此修复不导入旧版专用库，也不重写既有历史。
+
 Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest` 槽位，不再增加 metadata ID 字段。renderer 先持久保存详情，再写 `lastCanceledTurn = cancel-request:<id>`；RPC 保持立即发送，并使用同一 ID。Watcher 等待匹配的控制数据，通过独立取消链处理控制数据到达；旧版直接写 turn ID 的请求仍兼容。SQLite 负责持久去重，因此重开及迟到 RPC／兜底不会再次暂停新输入，新的点击仍有独立 ID。资源所有权、真实释放移交及暂停写盘失败恢复保持不变；本次 adapter 调整不扩展原生迁移。
 
 与主分支 `d76690b62` 合并后，保留原始 ACP 排空 → presence 清除 → turn／Inbox 移交的顺序。presence 清理失败仍保留旧执行所有者；daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。依赖维持合并后的锁定版本，包括 Streams 0.17.0、Effect 4.0.2。能力注册同时保留 Inbox v2 和主分支新增的 Magpie／DSH 能力，不互相覆盖。
@@ -46,10 +48,11 @@ Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest
 | 范围 | 本次清理的证据 |
 | --- | --- |
 | 最终合并后的 CLI 交集 | 10 个 suite，466 项通过；Store／Coordinator／Inbox／执行／进度投影、Watcher／supervisor／注册和 Magpie 启动配置；覆盖旧库删除、事务回滚、当前状态保留、消费保留期与序号不重用 |
+| 作者恢复／命令／MCP | 4 个 suite，248 项通过；SQLite 重开、真实 create 准备／chat 历史、缺失来源拒绝，以及恢复后反向请求不创建 Operation |
 | 执行入口／Watcher／supervisor／注册／命令／MCP | 7 个 suite，509 项通过；旧宿主拒绝、batch 准入与反向 chat |
 | Shared 消息／组件关系展示 | 各 3／2 个 suite，28／28 项通过 |
 | 类型、lint、格式与 `check:quick` | 通过；保留现有边界检查，并禁止旧 API、逐条派发来源和结算回调回流 |
-| 完整 `pnpm check` | CLI 4076 项通过、4 项跳过；未修改的 Git transport 一项 `context_unreadable`／remote helper aborted，未独立复现基线；最终删减由所属测试和静态检查覆盖，不能宣称全仓全绿 |
+| 完整 `pnpm check` | 最终作者修复的完整检查：CLI 4085 项通过、4 项跳过；未修改的 Git transport 一项 `context_unreadable`／remote helper aborted，未独立复现基线，不宣称全仓全绿 |
 | 文档检查 | 82 项已有错误，无 Inbox 错误 |
 
 测试通过 Deferred、注入时钟、fake timers 和故障触发器检查完整模型输入、持久行与真实释放。覆盖八项合批、空边界、迟到第九项、无新事件重开、暂停／未知不重发，以及当前调度所有权与资源释放。旧协调器 fixture 的早期移交测试随被退役的契约删除，不能充当新版验收。资源测试使用真实独立进程组，进程表为注入快照。不宣称真实模型、完整系统进程表、桌面端到端、合入或发布验收。
