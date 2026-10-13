@@ -115,11 +115,28 @@ private release retry receipt simplify the code. Scope failure recovery is uncha
 close-owner comments state that delayed disposal success does not replace its original
 failure receipt. No evidence justified repeating Scope.close or changing coordinator disposal.
 
+The failing Actions runs `38378067632` and `38378068245` were read in full for
+head `86553a65e`. Their actual checkout is merge `7ae334e` over base `567afa18d`,
+not the standalone PR head. Seven CI groups and Desktop smoke fail before testing:
+main upgraded ACP gitlinks without updating the root pnpm lockfile. The aggregate
+Tests and missing Playwright video tool errors are downstream consequences. Frozen
+install reproduces the same nine Claude manifest mismatches with those exact gitlinks.
+
+Lock regeneration then hits the existing seven-day age gate. Registry integrity was
+verified against main's committed adapter locks for 34 candidate artifacts; only 11
+need age exceptions (ACP SDK 1.8.0; Claude Agent SDK 0.3.293 and its eight platform
+artifacts; Anthropic SDK 0.132.1). The proposed exceptions are exact and preserve the
+general gate. Automatic approval rejected applying broader supply-chain exceptions
+without explicit user authorization; no exception or new lockfile has been applied.
+The fix remains pending that decision. `pnpm check` was attempted and stops in Claude adapter compilation against the old installed SDK, so it is not validation of the upgraded dependency graph. Docs and format pass. Two moved Codex test evidence links are repaired
+without changing Spec intent or approval. These runs are installation failures, not
+Inbox test failures or desktop acceptance evidence.
+
 ## Verification and remaining limits
 
-Author validation now includes installation and checks in the actual author worktree: Node 24.21.0, pnpm 10.20.0 and locked Effect 4.0.2. `pnpm install --frozen-lockfile` succeeds without changing the lockfile. The install guard permits this checkout; the earlier assumption that it was a nested workspace was incorrect. Earlier isolated-copy results remain historical evidence, not an independent base/head review. Overlapping scopes must not be added.
+Before the ACP base upgrade (head `86553a65e`), author validation included installation and checks in the actual author worktree: Node 24.21.0, pnpm 10.20.0 and locked Effect 4.0.2. `pnpm install --frozen-lockfile` succeeds without changing the lockfile. The install guard permits this checkout; the earlier assumption that it was a nested workspace was incorrect. Earlier isolated-copy results remain historical evidence, not an independent base/head review. Overlapping scopes must not be added.
 
-| Scope | Current implementation evidence |
+| Scope | Pre-ACP-upgrade implementation evidence |
 | --- | --- |
 | Author-worktree intersection | 5 suites, 413 passed: Inbox, Coordinator, execution service, dispatch watcher and Fleet. Final Inbox rerun: 51 passed, including five operator recovery cases and frozen caller-event regression |
 | Admission ablation | Earlier isolated-copy tests fail at both deterministic competition positions when the submission lock is removed, and pass when restored; unknown-submission non-replay assertions retained |

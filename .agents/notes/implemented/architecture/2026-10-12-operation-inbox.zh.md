@@ -63,11 +63,15 @@ Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮�
 
 准入锁同时计数等待者与持有者，仅在引用为零时移除；投影缓存跟随 SQLite 保留的回执清理。reconcile 使用具名 tracing，删除五处非空断言，明确 50 成员预览上限，release 重试使用自己的回执，不修改调用方事件。Scope 失败恢复保持原行为；注释明确底层延迟成功不会替换首次失败回执，没有证据支持重复 Scope.close 或改变 coordinator dispose。
 
+已完整读取 head `86553a65e` 的 Actions `38378067632` 与 `38378068245`。实际 checkout 是基于 `567afa18d` 的合并提交 `7ae334e`，不是独立 PR head。七个 CI 分组及 Desktop smoke 都在测试前安装失败：main 更新 ACP gitlink 后未同步根 pnpm 锁文件；Tests 汇总及找不到 Playwright 的视频步骤是后续连带失败。检出准确 gitlink 后，本地 frozen install 复现相同九项 Claude manifest 不匹配。
+
+重建锁文件随后被现有七日发布年龄门槛阻止。34 个候选 artifact 的 registry integrity 均已与 main 子模块的已提交锁文件一致性核对，实际只有 11 项需要例外：ACP SDK 1.8.0，Claude Agent SDK 0.3.293 及八个平台 artifact，Anthropic SDK 0.132.1。提案只添加精确版本、保留通用门槛。自动审批以未获得明确供应链例外授权为由拒绝了应用；尚未修改例外或锁文件，修复等待用户决定。已尝试 pnpm check，但 Claude adapter 对旧已安装 SDK 编译失败，不能作为升级后依赖图的验证；docs 和 format 通过。另修复两个被上游移动的 Codex 测试证据链接，不改变 Spec 意图或批准状态。这些运行是安装失败，不是 Inbox 测试失败，也不能作为桌面验收证据。
+
 ## 验证与剩余边界
 
-本次已在作者工作树实际安装和检查：Node 24.21.0、pnpm 10.20.0、锁定 Effect 4.0.2。`pnpm install --frozen-lockfile` 成功，锁文件未变。安装 guard 允许此 checkout，之前把它当成嵌套工作区是不准确的。先前隔离副本结果只保留为历史证据，不是独立 base/head 审核；重叠范围不能累加。
+ACP base 升级前（head `86553a65e`）已在作者工作树实际安装和检查：Node 24.21.0、pnpm 10.20.0、锁定 Effect 4.0.2。`pnpm install --frozen-lockfile` 成功，锁文件未变。安装 guard 允许此 checkout，之前把它当成嵌套工作区是不准确的。先前隔离副本结果只保留为历史证据，不是独立 base/head 审核；重叠范围不能累加。
 
-| 范围 | 当前实现证据 |
+| 范围 | ACP base 升级前实现证据 |
 | --- | --- |
 | 作者工作树相关交集 | 5 suites，413 项通过：Inbox、Coordinator、执行服务、dispatch watcher 与 Fleet。最终 Inbox 单独复跑 51 项通过，包含五个人工恢复场景及冻结调用方事件的回归验证 |
 | 准入反证 | 此前隔离副本的两个确定性竞争位置：移除提交锁均失败，恢复后均通过；保留未知提交禁止重发断言 |
