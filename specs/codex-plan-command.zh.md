@@ -13,4 +13,4 @@ Codex 适配器负责命令解析和模式设置，并声明可选的正文参�
 
 - [命令处理](../packages/acp-extension-codex/src/CodexCommands.ts)
 - [配置测试](../packages/acp-extension-codex/src/__tests__/CodexACPAgent/session-config-options.test.ts)
-- [Steer 确认生命周期测试](../packages/acp-extension-codex/src/__tests__/CodexACPAgent/steer.test.ts)
+- [Adapter 生命周期测试](../packages/acp-extension-codex/src/__tests__/CodexACPAgent/)

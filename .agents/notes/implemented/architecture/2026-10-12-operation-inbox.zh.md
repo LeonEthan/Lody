@@ -111,3 +111,11 @@ Cloud 合成使用相同 PR 生产代码，加上已记录的本地 SDK／运行
 冻结安装仍报告 Claude importer 与锁文件有九项依赖不一致。根 pnpm check 与 OSS 桌面构建均在使用旧已安装 SDK 编译 Claude adapter 时失败，桌面 smoke 因此未启动。相关 ACP gitlink 与 Codex 清单和固定 base 完全一致。这些结果不证明干净安装、Linux CI、PR 合并树或桌面验收通过。
 
 首轮环境差异单独保留：继承的 GIT_EXEC_PATH 使 Git 指向当前会话凭据包装器；仅移除该变量后，原生 Git 的 18 项全部通过，完整 CLI 复跑也通过。Node 22.18.0 缺少一个 Shared suite 所需的 WASM 加载行为，22.23.1 通过。首轮 Node 24 并行运行有两项人工恢复测试失败，随后两次 Node 22 完整执行与 Node 24 单独复跑均通过；不抹掉首轮失败，也不声称已证明其根因。人工恢复 adapter 会拒绝进程快照的任何警告，包括可选 macOS 内存探针警告。没有放宽生产恢复检查。
+
+## 同步 main a4270dd81（2026-10-13）
+
+沿用分支既有的 merge 方式，把 main `a4270dd8162f94f60c13ed55eba4a5c7bcb0b1c8` 合入 PR head `ad8b4a4ec40ab906fcd5c03de097135856dcc358`。同时保留 Inbox 准入／回执与 main 的独立额度刷新，两项协议能力和两组追加的执行测试均保留；额度测试组与 main 完全一致。机器注册的完整清单断言补上额度能力。Codex 证据链接按恢复后的 adapter 修正，不改变 Spec 意图。
+
+main 的额度刷新合并在运行时 pin 回滚后重新带入升级过的 ACP 锁文件。冻结安装发现它与恢复后的 gitlink 不匹配；重新解析也会触及未改变的发布年龄门槛。因此恢复 `c10ca8561` 的兼容锁文件，该版本的依赖声明与 workspace 配置和本次合并一致，package manifest 唯一差异是 PR 的 CLI 类型检查脚本。额度刷新没有新增依赖，功能继续保留；没有额外升级、发布年龄豁免或运行时发布。
+
+冻结安装、完整 pnpm check（含 CLI 4162 项通过、4 项跳过）、format／format:check、针对 main 的文档检查与 GitHub 策略测试 113 项均通过。执行／Inbox／机器注册交集的 358 项也通过，与完整检查重叠，不能累加计数。CLI 在 2 GiB 堆限制下构建并通过发布包 import 检查；OSS 桌面构建及 smoke 的 6 个场景／40 个步骤全部通过。验证使用 Node 22.23.1、原生 Git helper 和 CI 的签名配置。没有放宽运行时校验、发布年龄策略或测试断言。推送后对应 head 的 Actions 与真实模型／Cloud 产品验收仍是独立证据。

@@ -216,3 +216,31 @@ Node 24 run, then pass in both Node 22 full runs and a focused Node 24 rerun.
 That first failure is not erased or attributed to a proven cause; the operator
 adapter's process snapshot rejects any warning, including optional macOS memory
 probe warnings. No production recovery check was weakened.
+
+## Main integration at a4270dd81 (2026-10-13)
+
+Merge main `a4270dd8162f94f60c13ed55eba4a5c7bcb0b1c8` into PR head
+`ad8b4a4ec40ab906fcd5c03de097135856dcc358`, following the branch's existing
+merge history. Preserve Inbox admission/receipts and main's independent quota
+refresh, including both protocol capability keys and both appended execution
+test groups. The quota test group remains byte-identical to main. The exhaustive
+machine-registration test now expects the added quota capability as well.
+Codex evidence links follow the restored adapter revision without changing intent.
+
+Main's quota merge reintroduced the upgraded ACP lock graph after the runtime-pin
+rollback. Frozen installation rejects that graph against the restored gitlinks;
+fresh resolution also hits the unchanged release-age gate. Restore the compatible
+lockfile from `c10ca8561`, whose dependency declarations and workspace settings
+match this merge (the PR's CLI typecheck script is the only package-manifest
+difference). This preserves quota refresh, which declares no new dependencies,
+and avoids a new dependency upgrade, quarantine exception or runtime publication.
+
+Frozen installation, complete pnpm check (including 4162 CLI tests, 4 skipped),
+format/format:check, document checks against main and 113 GitHub policy tests pass.
+The 358-case execution/Inbox/registration intersection also passes; it overlaps
+the complete check and is not an additional test total. The CLI builds under the
+2 GiB heap limit with published-bundle import checks. The OSS desktop builds and
+its smoke suite passes all 6 scenarios / 40 steps. Validation uses Node 22.23.1,
+native Git helpers and CI's signing configuration. No runtime guard, release-age
+policy or test assertion was weakened. Matching pushed-head Actions and real
+model/cloud product acceptance remain separate evidence.
