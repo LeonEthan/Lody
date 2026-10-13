@@ -116,7 +116,6 @@ Batch membership is immutable. History projection is an idempotent stable-ID wri
 
 | Transition | Atomic write set and conditions |
 | --- | --- |
-| Operation completion → queued | Existing completion row plus idempotent result index; never depend on post-commit notification |
 | Completion → queued receipt/pending intent | Persist result and wake eligibility in the completion transaction. If idle, unpaused, unblocked, without accepted input or an existing live intent, record one pending intent. Busy/paused results stay queued |
 | First normal release → boundary record/pending intent | Atomically save the unique release record. Create one pending intent only if wakeable results remain and no queued input takes priority. Duplicate releases never grant another intent |
 | Pending intent → prepared/settled_empty | Conditionally claim intent, snapshot the current queue watermark, require a wakeable result and include all unconsumed/unclaimed results through that watermark. Only nonempty results atomically create fixed batch/members, live claims and input binding. Empty results atomically settle intent as terminal settled_empty without batch/execution or reactivation. Pending human input prevents this automatic branch |

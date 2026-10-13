@@ -10527,6 +10527,7 @@ describe('Operation Inbox execution boundary', () => {
       add,
       accept,
       close,
+      wake: () => bridge.wake(),
       storePath: path.join(root, 'operations.sqlite3'),
     };
   }
@@ -10740,10 +10741,12 @@ describe('Operation Inbox execution boundary', () => {
     }
   });
 
-  it('naturally releases into one actual automatic input containing all eight busy arrivals', async () => {
+  it('naturally releases into one actual automatic input containing busy receipts then wakes again for a late receipt', async () => {
     const started = createDeferred<void>();
     const complete = createDeferred<void>();
     const automatic = createDeferred<void>();
+    const lateAutomatic = createDeferred<void>();
+    let automaticCount = 0;
     const received: ContentBlock[][] = [];
     const f = inboxExecutionFixture(
       async (blocks) => {
@@ -10755,7 +10758,11 @@ describe('Operation Inbox execution boundary', () => {
         return { stopReason: 'end_turn' };
       },
       undefined,
-      () => automatic.resolve()
+      () => {
+        automaticCount++;
+        if (automaticCount === 1) automatic.resolve();
+        else lateAutomatic.resolve();
+      }
     );
     try {
       await f.accept();
@@ -10779,6 +10786,18 @@ describe('Operation Inbox execution boundary', () => {
       expect(batches).toMatchObject([{ memberCount: 8, deliveryStatus: 'settled' }]);
       expect(f.store.inbox.pending('workspace-1')).toEqual([]);
       f.add('late-nine');
+      expect(f.store.inbox.pending('workspace-1')).toHaveLength(1);
+      await f.wake();
+      await lateAutomatic.promise;
+      expect(received).toHaveLength(3);
+      const lateBlocks = received[2];
+      if (!lateBlocks) throw new Error('Missing late receipt input');
+      const late = lateBlocks
+        .filter((b) => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n');
+      expect(late).toContain('late-nine');
+      expect(late).not.toContain('busy-0');
       expect(f.store.inbox.pending('workspace-1')).toEqual([]);
     } finally {
       complete.resolve();

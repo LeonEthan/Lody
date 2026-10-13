@@ -152,6 +152,8 @@ one wakeable receipt grants a persistent automatic intent. Busy Sessions defer
 consumption until normal completion and actual release. Stop blocks receipt-driven
 wakes until fresh trusted human input. Result persistence and wake intent creation
 share the completion transaction; reopen recovers an unsubmitted intent without a new event.
+Suppressing user-facing completion notifications for Agent-initiated turns does not
+suppress Operation receipts or their wake eligibility.
 
 Wake eligibility is distinct from membership: one wakeable receipt carries all
 unconsumed, unclaimed results in the same Session/User queue, including passive
