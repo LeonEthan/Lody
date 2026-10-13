@@ -44,8 +44,9 @@ Read parent rules and each heading's linked context before edits.
   (`fromPageContent`) never opens private LAN; only the address bar may.
 - Preload one bounded frame after live confirmation; require atomic moves, no
   polling, and cleanup safe after Browser takeover.
-- Static HTML runs `allow-scripts`-only from a policy-owned `srcdoc`; truncated
-  documents are never executable and static frames die with their tab.
+- Static HTML requires policy-owned `srcdoc`. Scripts require credentialless and
+  `allow-scripts` only; otherwise use navigation-stripped HTML with an empty sandbox.
+  Never preview truncated text; static frames die with their tab.
 - Preview comment writes go through `runtime.writer.mutatePreviewVisualComments`, never the store's `setState`.
 
 ## [Conversation surface](../../../../../.agents/docs/sessions-surface.md)

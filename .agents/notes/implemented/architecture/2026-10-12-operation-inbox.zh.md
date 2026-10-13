@@ -37,7 +37,7 @@ Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fi
 
 Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest` 槽位，不再增加 metadata ID 字段。renderer 先持久保存详情，再写 `lastCanceledTurn = cancel-request:<id>`；RPC 保持立即发送，并使用同一 ID。Watcher 等待匹配的控制数据，通过独立取消链处理控制数据到达；旧版直接写 turn ID 的请求仍兼容。SQLite 负责持久去重，因此重开及迟到 RPC／兜底不会再次暂停新输入，新的点击仍有独立 ID。资源所有权、真实释放移交及暂停写盘失败恢复保持不变；本次 adapter 调整不扩展原生迁移。
 
-与主分支 `7b540b10f` 合并后，保留原始 ACP 排空 → presence 清除 → turn／Inbox 移交的顺序。presence 清理失败仍保留旧执行所有者；daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。依赖维持合并后的锁定版本，包括 Streams 0.17.0、Effect 4.0.2。
+与主分支 `d76690b62` 合并后，保留原始 ACP 排空 → presence 清除 → turn／Inbox 移交的顺序。presence 清理失败仍保留旧执行所有者；daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。依赖维持合并后的锁定版本，包括 Streams 0.17.0、Effect 4.0.2。能力注册同时保留 Inbox v2 和主分支新增的 Magpie／DSH 能力，不互相覆盖。
 
 ## 验证与剩余边界
 
@@ -45,7 +45,7 @@ Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest
 
 | 范围 | 本次清理的证据 |
 | --- | --- |
-| Store／Coordinator／Inbox／执行／进度投影 | 最终 5 个 suite，387 项通过；删除旧库、事务回滚、保留当前未知／暂停／资源状态、消费保留期与序号不重用 |
+| 最终合并后的 CLI 交集 | 10 个 suite，466 项通过；Store／Coordinator／Inbox／执行／进度投影、Watcher／supervisor／注册和 Magpie 启动配置；覆盖旧库删除、事务回滚、当前状态保留、消费保留期与序号不重用 |
 | 执行入口／Watcher／supervisor／注册／命令／MCP | 7 个 suite，509 项通过；旧宿主拒绝、batch 准入与反向 chat |
 | Shared 消息／组件关系展示 | 各 3／2 个 suite，28／28 项通过 |
 | 类型、lint、格式与 `check:quick` | 通过；保留现有边界检查，并禁止旧 API、逐条派发来源和结算回调回流 |

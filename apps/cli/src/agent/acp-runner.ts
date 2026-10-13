@@ -211,6 +211,7 @@ export type SpawnAcpProcessOptions = {
   agentType: string;
   customAcp?: CustomAcpLaunchSpec;
   runtimeOverrides?: BuiltinRuntimeOverrides;
+  magpieGatewayUrl?: string;
   workdir: string;
   env: NodeJS.ProcessEnv;
   args?: string[];
@@ -231,6 +232,7 @@ export const spawnAcpProcess = (options: SpawnAcpProcessOptions): ChildProcess =
       agentType: options.agentType,
       customAcp: options.customAcp,
       runtimeOverrides: options.runtimeOverrides,
+      magpieGatewayUrl: options.magpieGatewayUrl,
     });
     command = command ?? launch.command;
     args = args ?? launch.args;
@@ -261,6 +263,8 @@ export type StartLocalAcpAgentOptions = {
   agentType: string;
   customAcp?: CustomAcpLaunchSpec;
   runtimeOverrides?: BuiltinRuntimeOverrides;
+  agentConfigId?: string;
+  magpieGatewayUrl?: string;
   workdir: string;
   env?: NodeJS.ProcessEnv;
   logger: Logger;
@@ -342,6 +346,8 @@ export const startLocalAcpAgent = async (options: StartLocalAcpAgentOptions) => 
     agentType: options.agentType,
     customAcp: options.customAcp,
     runtimeOverrides: options.runtimeOverrides,
+    agentConfigId: options.agentConfigId,
+    magpieGatewayUrl: options.magpieGatewayUrl,
     env: options.env,
     extraArgs: options.extraArgs,
     onManagedRuntimeProgress: options.onManagedRuntimeProgress

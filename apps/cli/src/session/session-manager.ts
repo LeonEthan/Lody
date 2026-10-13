@@ -282,6 +282,7 @@ function buildSessionPreparationCompatibility(
       codexAuth: launchSource?.codexAuth,
       customAcp: launchSource?.customAcp,
       runtimeOverrides: launchSource?.runtimeOverrides,
+      magpieGatewayUrl: launchSource?.magpieGatewayUrl,
       env: launchSource?.env,
     }),
     runConfig: normalizeSessionPreparationRunConfigForDedup({
@@ -1053,6 +1054,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       mcpServerIds: spec.runConfig?.mcpServerIds ?? [],
       customAcp: agentConfig.customAcp,
       runtimeOverrides: agentConfig.runtimeOverrides,
+      magpieGatewayUrl: agentConfig.magpieGatewayUrl,
       project: spec.project as ProjectRef | undefined,
       assumeDocExisting: true,
       env: { ...agentConfig.env },
@@ -1151,6 +1153,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       credentials = await this.prepareGitHubRepoSessionConfig(config);
       signal.throwIfAborted();
       const launch = await resolveACPProcessLaunchAsync({
+        agentConfigId: config.agentConfigId,
+        magpieGatewayUrl: config.magpieGatewayUrl,
         cliType: config.agentCliType,
         agentType: config.agentType,
         customAcp: config.customAcp,
@@ -1550,6 +1554,8 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       const launchResolutionStartedAt = performance.now();
       let managedRuntimeReadyLogged = false;
       const launch = await resolveACPProcessLaunchAsync({
+        agentConfigId: config.agentConfigId,
+        magpieGatewayUrl: config.magpieGatewayUrl,
         cliType: config.agentCliType,
         agentType: config.agentType,
         customAcp: config.customAcp,
@@ -1739,6 +1745,7 @@ export class SessionManager extends EventEmitter<SessionManagerEvents> {
       env: config.env ?? {},
       customAcp: config.customAcp,
       runtimeOverrides: config.runtimeOverrides,
+      magpieGatewayUrl: config.magpieGatewayUrl,
     });
   }
 

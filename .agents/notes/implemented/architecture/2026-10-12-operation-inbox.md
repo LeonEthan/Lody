@@ -37,7 +37,7 @@ Manual Stop shares its request ID between RPC and persistent fallback, preventin
 
 Stop request details now live in one replaceable `cancelRequest` control-document slot, rather than an extra metadata ID field. The renderer persists the payload before publishing `lastCanceledTurn = cancel-request:<id>`; RPC remains an immediate fast path with the same ID. The watcher waits for matching control data and processes control arrivals on its separate cancellation chain. Legacy turn-ID markers remain supported. SQLite owns durable deduplication, so reopen and late RPC/fallback cannot pause fresh input again, while a new click has an independent ID. Resource ownership, actual-release handoff and failed-pause recovery are unchanged; this adapter adjustment does not extend the native migration.
 
-Integration with main `7b540b10f` preserves raw ACP drain → presence clear → Turn/Inbox handoff. Presence cleanup failure retains the old execution owner. Daemon shutdown cancels history-owned work and drains/recover-closes Inbox. Merged dependency pins remain unchanged, including Streams 0.17.0 and Effect 4.0.2.
+Integration with main `d76690b62` preserves raw ACP drain → presence clear → Turn/Inbox handoff. Presence cleanup failure retains the old execution owner. Daemon shutdown cancels history-owned work and drains/recover-closes Inbox. Merged dependency pins remain unchanged, including Streams 0.17.0 and Effect 4.0.2. Capability registration retains Inbox v2 alongside main’s new Magpie/DSH capabilities.
 
 ## Verification and remaining limits
 
@@ -45,7 +45,7 @@ Author validation uses a separate source copy with pinned dependencies and match
 
 | Scope | Cleanup evidence |
 | --- | --- |
-| Store/coordinator/Inbox/execution/progress projection | Final 5 suites, 387 passed; old-store deletion, transaction rollback, native unknown/pause/resource preservation, consumed retention and monotonic sequence |
+| Final merged CLI intersection | 10 suites, 466 passed; store/coordinator/Inbox/execution/progress, watcher/supervisor/registration and Magpie launch configuration; old-store deletion, transaction rollback, native evidence preservation, retention and monotonic sequence |
 | Execution/watcher/supervisor/registration/commands/MCP | 7 suites, 509 passed; old-host rejection, batch admission and reverse chat |
 | Shared messages/component relations | 3/2 suites, 28/28 passed |
 | Types, lint, format and `check:quick` | Passed; existing guards retained, retired APIs/per-Delivery dispatch/settlement callbacks forbidden |

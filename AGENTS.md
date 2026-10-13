@@ -1,7 +1,7 @@
-# Repository guidelines
+# Repository rules
 
 `CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
-Repository map and entry points: [README.md](README.md#repository).
+Map: [README.md](README.md#repository).
 
 ## Context and documentation
 
@@ -20,13 +20,13 @@ Repository map and entry points: [README.md](README.md#repository).
   Only meaning-preserving editorial edits may retain approval.
 - Non-trivial work MUST add/update the owning [Agent Note](.agents/notes/AGENTS.md#when-to-write)
   in the same PR; substantial research/design also requires a note without a PR.
-  Only mechanical/local edits without changed decisions are exempt. Link different
+  Mechanical/local edits with unchanged decisions are exempt. Link different
   decisions; proposals stay `proposed`. Read-only tasks report deferred updates.
 - Update affected docs/READMEs. Run `pnpm run docs status` at start and
   `pnpm run docs check` at finish; review SHA-protected changes before confirming.
-  Checks and translations prove neither correctness nor approval. Translation may
+  Checks/translations prove neither correctness nor approval. Translation may
   follow later. Details: [document maintenance](.agents/README.md).
-- Keep binding rules in the nearest `AGENTS.md` (<8 KiB; new scopes need a
+- Keep rules in the nearest `AGENTS.md` (<8 KiB; new scopes need a
   `CLAUDE.md` symlink). Keep explanations and rationale in their owning docs/notes.
 
 ## Effect reference
@@ -71,6 +71,9 @@ simple; use the guide's responsibility split only when a large module needs it.
   artifact and versioned ACP contract. Shared ACP extension contracts belong in the
   public `LodyAI/acp-extension-core` submodule, consumed through the root workspace;
   never duplicate them locally.
+- Magpie: require local desktop confirmation, fixed loopback mappings and public token.
+  Keep gateway metadata outside env and catalogs under Lody data, never user profiles.
+  [Contract](specs/magpie-provider-import.md).
 - Pi provider migration requires owner confirmation and the target's `builtinPi`
   protocol capability. Preserve provider IDs and settings; never convert legacy
   native session IDs. Contract: [builtin Pi](specs/builtin-pi.md).
@@ -101,12 +104,12 @@ simple; use the guide's responsibility split only when a large module needs it.
   mock-call-only checks and duplicates that cannot detect a behavioral regression.
   Test the real boundary and resulting state, including failure paths; retain
   meaningful compile-failure contracts. Extend the owning suite instead of adding
-  a file per small fix. Do not delete behavioral coverage merely to reduce counts.
+  a file per small fix. Do not delete behavioral coverage to reduce counts.
 - For future work, follow
   [documentation consolidation](.agents/AGENTS.md#documentation-at-submission).
   Update owning docs and Notes; update a Spec only when reviewed intent is affected.
   Consolidate redundant PR-local notes and repair inbound links.
-- Keep edits traceable to the request and preserve unrelated work. Prefer explicit
+- Keep edits request-scoped; preserve unrelated work. Prefer explicit
   contracts over hidden fallbacks; remove only unused code. Update the nearest
   public `AGENTS.md` when an invariant or boundary changes.
 
