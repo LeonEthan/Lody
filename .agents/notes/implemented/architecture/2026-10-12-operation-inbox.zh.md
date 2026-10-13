@@ -1,4 +1,4 @@
-# 原生 Effect 结果收件箱
+# Operation 结果收件箱与反向 chat 限制
 
 Status: implemented
 Type: architecture
@@ -8,43 +8,50 @@ Translation: current
 
 ## 摘要
 
-完成结果先保存，真实自然释放才按固定水位合批；Stop 后只随新用户输入处理。独立 Effect 内核管理 SQLite 意图、成员、准入和结算，主流程提供真实 prompt 启动及释放。旧逐条续跑已切断；任务 chat 与结果资料仍有不同启动权限。代码已接入，独立 review、完整验收和发布状态另列，不把先前 75 项反向 chat 测试当作 Inbox 已验收。
+逐条结果续跑和反向创建 chat 会让对话反复恢复执行。现在结果只保存，不唤醒空闲会话；确认自然结束且真实释放后，把固定水位内的非空结果合批一次，Stop 后等新的用户消息。原生 Effect 内核负责持久调度与准入，Session／ACP 仍是明确登记的临时 adapter。当前 PR 候选已实现，独立复审、Spec 批准和真实模型／桌面验收仍未完成。
 
-## 决策与边界
+## 决定与理由
 
-Stop 前未执行的旧用户输入取消资格、保留原文；新消息只携带结果，旧指令需重新发送。提交门覆盖栅栏及 transport 启动；持久执行输入绑定防止新消息解除暂停后复活旧执行。只有自动批次给新用户让位，正在准备的普通用户输入不被后来队列取消。应用用户 steer 更新输入所有权，实际执行 ID 保持不变。
+[会话编排 Spec](../../../../specs/session-orchestration.zh.md)维护行为，[编排 README](../../../../apps/cli/src/orchestration/README.md#completion-consumption)维护实现与事务契约。本文合并原调查、反向 chat 修复记录、设计和实施计划；早期版本保留在 Git 历史中。
 
-`inbox/service.ts` 使用 Effect 4.0.2 原语；Scope 拥有连接、信号与 fibers。`operationInboxLegacy` 是唯一登记的 host runtime：协调器、用户/Stop/提交/释放入口尚是 Promise 消费者。Session、ACP 和历史总体迁移没有完成；临时 adapter 保留原始请求、失败及独立恢复入口，不能将包装称为完成迁移。静态守卫隔离内核与旧消费者。
+- 结果到达不获得执行许可。真实自然释放只记录一次固定水位，空边界也保留；只有非空且可处理的成员才产生自动意图。重开无需新事件即可恢复该意图；迟到结果和重复释放不能扩大水位。
+- Stop 先持久暂停，再取消执行。Stop 前排队的输入保留历史，但失去执行资格；新的用户消息携带结果资料，不携带已取消的旧指令。用户原文、配置和因果深度保持不变，Agent 任务不能解除暂停。
+- Stop、可信用户接受和真实 transport 启动共用准入。未知提交不重发，包括携带 batch 的用户输入的 stale-ACP 恢复；只重试结算。Scope 关闭或等待者取消不代表资源真实释放。
+- B 当前准确输入由 Agent A 发起时，不能向 A 发新 chat。单条、批量和旧入口在接受新工作前返回 `REVERSE_CHAT_FORBIDDEN`；后续独立输入替换此限制。这样不需要任务图或 task/note 新工具，但不保证消除更长的环或重复向外委派。
 
-POSIX 重开恢复以非空根进程身份及进程组不存在为释放证明，不向可能复用的 PID 发信号。Windows、空身份或无法证明的资源保持阻塞。未知提交只结算、不重放。大单项结果也可分片完整读取。兼容范围为 Inbox v1；旧逐条派发版本不支持降级。升级通过 host 退出屏障；同进程 legacy adapter 必须等待旧链及实际资源释放。
+历史调查没有定位到“模型更频繁反向发信”的单一改动。[PR #1262](https://github.com/LodyAI/Lody/pull/1262)改变的是 Agent 作者展示，不是普通执行提示；没有证据支持通过回滚头像修复。已有放大路径是反向创建任务和逐 Delivery 续跑。源码核对不是受控模型重放。
 
-## 验证与交付状态
+2026-10-12 的调研借鉴了 [Codex 完成通知](https://github.com/openai/codex/blob/a9b0815167c27ab13719dd12d13b63e02b70d221/codex-rs/core/src/agent/control/completion.rs)与 [OpenCode 调度器](https://github.com/anomalyco/opencode/blob/4617210822bdbb31e5749751afbfb4584ccedac8/packages/core/src/session/run-coordinator.ts)的持久入队、独立准入和批量消费；没有照搬它们的 Stop 语义，也没有独立运行它们的测试。
 
-本次基于 `3ac76bad10f46720517a2ca6929f03de4ef5bb9b`，实现作为 PR 候选，尚未合入或发布。验证使用隔离源码副本和锁定依赖；最后检查确认改动的源码与副本字节一致。Effect 为 4.0.2，没有升级 catalog／lockfile。
+## 所有权、恢复与兼容
 
-下表保留最初 `40ef5c29c` 的作者验证证据；本次修订结果单独列在后面。
+Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fiber；`operationInboxLegacy` 是唯一登记的主流程桥接。整个 Session／ACP／历史迁移尚未完成，边界见 [Effect 台账](../../proposed/architecture/2026-09-27-effect-lifecycle-migration-roadmap.zh.md#单元台账)。
 
-| 验证范围 | 结果 |
+`40ef5c29cbe496f28f17ab10297cf37c3c48030f` 的审核发现三个 adapter 缺口，修订落实以下契约：
+
+1. 每次资源创建前持久登记“不完整”，持续合入后来的终端／进程 roots，保留全部 Session 所有者和发起 host PID。重开必须证明资源集合完整且全部消失。身份缺失、Windows 或释放无法确认时保持阻塞，不能向可能被复用的 PID 发信号。
+2. 可信 renderer／非委派 CLI 在激活或入队前持久保存 `humanInputReceipts`。RPC 丢失或输入过大时，历史兜底恢复匹配授权；普通历史、用户不符的回执、已取消／已结束输入不能解除暂停。
+3. 协调器 `recoverStop()` 调用独立的 `recoverClose()`，只补写结算／释放／暂停回执。保留原失败回执和恢复所有者，不重发 transport，也不把再次关闭 Scope 当成恢复。
+
+手动 Stop 的 RPC 与持久兜底共用请求 ID，防止迟到重复请求再次暂停新输入。写盘失败保留请求身份以便补写。已消费结果副本随 Operation 保留期清理；永久删除 Session 同时删除 Inbox 副本。兼容边界是 Inbox schema／protocol v1、host launch v2；不支持降级到旧逐 Delivery 二进制，同进程移交必须真实排空执行链及资源。目前没有已发布的兼容 SHA。
+
+## 验证与剩余边界
+
+作者验证使用锁定依赖的隔离源码副本，并核对改动源码字节一致；不是独立 base/head 审核。下面的测试范围有交集，不能累加。
+
+| 范围 | 最近记录的证据 |
 | --- | --- |
-| 收件箱、当前／兼容模型、协调器、编辑重发、MCP、历史及本地平台专项 | 11 个 suite，201 项通过 |
-| 执行、Watcher、Fleet、SessionManager、sandbox 和凭据所有权 | 6 个 suite，400 项通过 |
-| 最后的暂停回执恢复及 Watcher 变更复跑 | 5 个 suite，396 项通过；包括失败暂停先补记、多个 Stop ID、共同 gate、原始请求与关闭恢复 |
-| 原生 Roost 后端契约 | 31 项通过；新增批次状态定向更新、用户原文不变、重复幂等、关闭后重开 |
-| Shared／RPC／组件／Electron 完整消费者回归 | 1428／124／5139／216 项通过；RPC 原有 3 项跳过 |
-| 类型、lint、格式、原生 Inbox／进程／平台／public boundary、i18n | 通过；lint 无 error |
-| root `pnpm check` | 未通过：CLI 4055 项通过、4 项跳过；未改动的 Git 传输 suite 一项失败，`context_unreadable`。之后的暂停／Watcher 小改由上述专项复跑覆盖，不沿用此前全仓结果冒充最终全绿 |
-| 实际工作树 docs status／check | 均保留 82 项已有错误，无 Inbox 文件错误；不是文档批准 |
+| 所属 CLI suites | 7 个 suite，676 项通过；批量、准入、SQLite／CRDT 重开、资源创建和协调器恢复 |
+| 用户发送／配置 | 4 个 suite，117 项通过；持久授权、RPC 丢失和大输入 |
+| Shared／组件完整测试 | 1428／5141 项通过 |
+| 类型、lint、格式、Inbox／进程／平台／public／i18n guard | 通过，lint 无 error |
+| root check | CLI 4065 项通过、4 项跳过；未修改的 Git transport 一项 `context_unreadable`，没有独立基线复现。最后资源改动经过专项复跑，不是又一次完整 root 全绿 |
+| 文档检查 | 82 项已有错误，无 Inbox 错误；本次合并后错误数组不变 |
 
-测试控制真实接收的完整输入、持久行、故障触发器、Deferred、注入时钟及 fake timers，不依赖网络或真实 sleep。独立 OS 子进程覆盖：固定八项意图无需新事件即恢复；迟到第九项留队；暂停和跨栅栏未知状态重开不运行。真实旧协调器 fixture 的主体与该 base 字节一致，仅迁移相对导入；分别停在栅栏前后，旧 stop 返回后新 owner 仍须等待旧链与实际释放。测试不调用真实模型。
+初版 `40ef5c29c` 的消费者验证还有 RPC 124 项、Electron 216 项通过，RPC 原有 3 项跳过。这些和仅反向 chat 的 75 项测试都不能证明修订后的 Inbox 已验收；详细中间测试表留在 Git 历史，不再重复维护活跃文档。
 
-手动 Stop 的 RPC 与持久兜底共用 cancelId；失败写盘保留每份请求身份，先补记再接受新用户输入，避免旧队列复活。内部取消只撤销执行资格，不持久暂停。已消费结果的完整副本随 Operation 保留期限清理，永久删除 Session 同时删除收件箱副本。重开只修复历史回执，不重放提交。
+测试通过 Deferred、注入时钟、fake timers 和故障触发器检查完整模型输入、持久行与真实释放。覆盖八项合批、空边界、迟到第九项、无新事件重开、暂停／未知不重发，以及真实旧协调器栅栏前后的移交。资源测试使用真实独立进程组，进程表为注入快照。不宣称真实模型、完整系统进程表、桌面端到端、合入或发布验收。
 
-`40ef5c29cbe496f28f17ab10297cf37c3c48030f` 的 review 发现三个 adapter 交接缺口。本次修订持续登记 sandbox 的每次资源创建：spawn 前先落盘“不完整”，再合入后来的终端 roots；执行保留全部 Session 所有者以及发起它们的 host PID，不能仅凭最初 ACP roots 消失就认定集合已闭合。缺少完整性标记或登记中断时继续阻塞。renderer 和非委派 CLI 用户入口在激活／入队前持久写入独立的 `humanInputReceipts` 控制回执；历史兜底恢复匹配的授权，无需 RPC。Agent／普通历史写入、用户不匹配的回执、已取消／已结束的 ID 都不能解除暂停。协调器 `recoverStop` 接入独立的 `recoverClose`，保留原失败，只补写持久回执，绝不重发请求。
+修订候选仍待独立复审，Spec 保持 draft。未来 Lody 各落地端和 Agent adapter 都完整支持 ACP steer 后，再评估执行中合批交付，并验证实际应用、暂停、取消和未知交付。这是维护条件，不是当前行为或定时提醒。
 
-本次专项回归：7 个 CLI suite，676 项通过；4 个用户发送／配置 suite，117 项通过。覆盖真实独立进程组＋SQLite 重开（进程表使用注入快照）、并发创建的不完整栅栏、发起 host 仍存活、实际执行 adapter 登记、prompt 结束但创建未完成、释放回执写盘失败重试、已确认释放后的全新资源代际、CRDT 重开后的匹配／缺失／用户不符／已取消回执、RPC 丢失／大输入，以及协调器级结算写盘故障恢复且无重发。它们与上表有交集，不能累加。
-
-本次 Shared／组件完整测试分别为 1428／5141 项通过。完整类型检查、最终 CLI 类型检查、lint（零 error）、格式、Inbox／进程／平台／public／i18n guard 均通过。复跑 root `pnpm check` 到 CLI 4065 项通过／4 项跳过，仍因未修改的 Git transport `context_unreadable` 失败；最后的创建／清理栅栏和 fixture 调整以 676 项交集、最终类型／lint／格式及源码字节核对验证，不宣称又一次完整 root 全绿。docs check 与 `40ef5c29c` 的 82 项错误数组完全一致，无 Inbox 错误。不宣称真实模型、完整系统进程表或桌面端到端验收。
-
-`40ef5c29c` 的独立 review 有三个 P1；修订后的候选仍待独立复审。Spec 人工批准、真实模型和桌面端到端产品验收尚未完成。POSIX 身份缺失、Windows 或无法证明旧资源结束时继续阻塞，不能用用户新消息绕过它。整体 Session／ACP／历史原生迁移不在此次完成声明内。
-
-[设计](../../proposed/architecture/2026-10-12-turn-scoped-operation-inbox.zh.md)、[实施计划](../../proposed/architecture/2026-10-12-operation-inbox-effect-implementation-plan.zh.md)、[Spec](../../../../specs/session-orchestration.zh.md)。
+[PR #1523](https://github.com/LodyAI/Lody/pull/1523)。

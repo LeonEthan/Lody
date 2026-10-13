@@ -44,6 +44,24 @@ human execution eligibility and pauses automatic work. Fresh human input carries
 results, and a failed/unreleased execution cannot manufacture another wake. See the
 [contract](../../../../specs/session-orchestration.md#idempotent-message-consumption).
 
+### Batch transactions
+
+Batch membership is immutable. History projection is an idempotent stable-ID write outside the transaction and grants no dispatch permission. Enforce unique release records, intent-to-automatic-batch binding, human-input-to-submittable-batch binding, and at most one live claim per result. Superseded batches retain member history; only current claims/bindings grant eligibility. Automatic batches require `memberCount > 0`, consistent with actual membership; both batch creation and submission fencing validate this condition.
+
+| Transition | Atomic write set and conditions |
+| --- | --- |
+| Operation completion → queued | Existing completion row plus idempotent result index; never depend on post-commit notification |
+| First normal release → boundary record/pending intent | Require verified normal release and no existing record; atomically save the unique release record and fixed watermark. Create pending intent only with eligible results through that watermark; otherwise terminate here. Duplicates cannot resnapshot |
+| Pending intent → prepared/settled_empty | Conditionally claim intent and query all eligible results through its watermark. Only nonempty results atomically create fixed batch/members, live claims and input binding. Empty results atomically settle intent as terminal settled_empty without batch/execution or reactivation. Pending human input prevents this automatic branch |
+| Human input → prepared/original batch-free path | With results, bind trusted input receipt to a nonempty batch; without results, create no batch and retain the ordinary human-input path. Freeze original prompt/attachments/configuration |
+| Unsubmitted automatic batch → yield to human | Require old batch still prepared; supersede old intent/batch, transfer all live claims, create new fixed membership and human-input binding in one transaction. Failure rolls everything back; never release and bind in separate transactions |
+| Prepared → submitting | Under the shared gate, conditionally update owner/pause/acceptance sequence/execution identity/claim/binding, also verify automatic batch memberCount > 0, and persist unique submission token; immediately start transport afterward |
+| Prepared → paused/invalid | Require no submission fence; invalidate intent/binding and release claims as passive queued data, with pause in the same transaction; do not restore automatic eligibility |
+| Submitting → submitted/unknown | Persist receipt and retain non-resubmittable members. Unknown never returns to prepared/queued. Proven non-invocation records not_submitted for the recovery entry, without automatic replay |
+| Submitted/unknown → settled | Update settlement/consumption and Cause only; duplicate settlement is idempotent and invokes no provider. Settled uncertainty is not confirmed model success |
+
+Use `BEGIN IMMEDIATE` for claims. Automatic batches use their intent's saved watermark; human preparation snapshots the current watermark. The replacement batch may include newly available results; old membership history stays unchanged. Post-claim arrivals remain queued. History failure is pre-submission; uncertainty beyond the fence remains unknown and rebuilding history cannot restore submission eligibility.
+
 Consumed Operation payloads expire after seven days. `operation_retired_ids`
 retains only their Session/Operation keys for the life of the local store.
 The retirement trigger runs in the same cleanup transaction, before cascaded
@@ -63,3 +81,6 @@ the Operation acceptance transaction, with cascading cleanup. Separate storage
 keeps strict legacy `SELECT *` and frozen-config readers compatible. Missing rows
 mean legacy provenance, not permission to reconstruct historical identities from
 current catalogs. See the [contract](../../../../specs/message-author-identity.md).
+
+Decision rationale, verification limits and future steer conditions are maintained in
+the [implementation record](../../../../.agents/notes/implemented/architecture/2026-10-12-operation-inbox.md).
