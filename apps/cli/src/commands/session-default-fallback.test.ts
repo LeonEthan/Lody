@@ -1357,7 +1357,7 @@ describe('agent-originated MCP inherited fallback', () => {
         expect(fixture.dispatched).toEqual([latest]);
       } finally {
         await coordinator.idle();
-        coordinator.stop();
+        await coordinator.stop();
         store.close();
       }
     }
@@ -1731,7 +1731,7 @@ describe.each([
           });
         } finally {
           await coordinator.idle();
-          coordinator.stop();
+          await coordinator.stop();
           recoveredStore.close();
         }
       }

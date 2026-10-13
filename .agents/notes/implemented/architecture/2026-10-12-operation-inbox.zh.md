@@ -70,6 +70,8 @@ Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮�
 | pnpm check | 作者工作树实跑未全绿：类型与 lint 通过；CLI 4106 通过、4 跳过、1 项 Git transport 失败（context_unreadable／remote helper aborted）。transport 源码和测试均未相对 main 改动；未独立复现基线，递归检查终止，不能宣称全仓测试通过 |
 | 文档 | 作者环境 docs check 通过；此前 82 项缺失链接为历史结果，原先缺失的子模块源码现已存在 |
 
+CLI 默认编辑器项目现已收录源码与测试，让两者共享 `@/*` 别名；生产类型检查明确使用 `tsconfig.typecheck.json`，保留原排除范围。实际 TypeScript language server 探针确认 src 内测试和 tests 目录文件都进入配置项目并正确解析 timeout-utils，不宣称修复其他测试类型错误。两个测试清理入口补齐等待 Coordinator 关闭后再关闭 SQLite，相关 144 项通过。全仓类型、lint、format、quick 边界及文档检查通过；全仓检查仍被下述同一 Git transport 失败终止。
+
 测试通过 Deferred、注入时钟、fake timers 和故障触发器检查完整模型输入、持久行与真实释放。覆盖八项合批、空边界、迟到第九项、无新事件重开、暂停／未知不重发，以及当前调度所有权与资源释放。旧协调器 fixture 的早期移交测试随被退役的契约删除，不能充当新版验收。资源测试使用真实独立进程组，进程表为注入快照。不宣称真实模型、完整系统进程表、桌面端到端、合入或发布验收。
 
 修订候选仍待独立复审，Spec 保持 draft。未来 Lody 各落地端和 Agent adapter 都完整支持 ACP steer 后，再评估执行中合批交付，并验证实际应用、暂停、取消和未知交付。这是维护条件，不是当前行为或定时提醒。
