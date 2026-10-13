@@ -10,9 +10,12 @@ export const makeWorkspaceCleanupOwner = Effect.fnUntraced(function* (
   const failures: unknown[] = [];
   const attempt = Effect.fnUntraced(function* () {
     while (phase < phases.length) {
-      yield* phases[phase]!;
+      const current = phases[phase];
+      if (!current) return yield* Effect.die(new Error('Missing workspace cleanup phase'));
+      yield* current;
       phase++;
     }
+    return undefined;
   });
   const run = (recover: boolean) =>
     gate.withPermit(

@@ -29,7 +29,8 @@ export function batchPage(members: readonly InboxMember[], limit: number, offset
     if (offset >= json.length) throw new Error('Invalid batch content cursor');
     let count = Math.min(json.length - offset, Math.floor((INBOX_READ_BYTES - bytes) / 8));
     // Do not split a UTF-16 surrogate pair between pages.
-    if (offset + count < json.length && /[\uD800-\uDBFF]/u.test(json[offset + count - 1]!)) count--;
+    if (offset + count < json.length && /[\uD800-\uDBFF]/u.test(json.charAt(offset + count - 1)))
+      count--;
     items.push({
       sequence: member.sequence,
       operationId: member.operationId,

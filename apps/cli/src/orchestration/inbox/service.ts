@@ -103,7 +103,7 @@ export class OperationInbox extends Context.Service<
         const scope = yield* Effect.scope;
         const submissionGate = Semaphore.makeUnsafe(1);
         let quiesced = false;
-        const gates = new Map<string, Semaphore.Semaphore>();
+        const gates = new Map<string, { semaphore: Semaphore.Semaphore; users: number }>();
         const running = new Set<string>();
         const vetoed = new Set<string>();
         const signal = yield* Queue.dropping<void>(1);
@@ -126,7 +126,8 @@ export class OperationInbox extends Context.Service<
           pause: Repository['pause'] = repo.pause
         ) {
           for (const [key, receipt] of pauses) {
-            yield* gate(receipt.scope).withPermit(
+            yield* withGate(
+              receipt.scope,
               pause(receipt.scope, receipt.id, receipt.ids, receipt.cancelId)
             );
             if (pauses.get(key) === receipt) pauses.delete(key);
@@ -141,18 +142,29 @@ export class OperationInbox extends Context.Service<
           }
         });
         yield* Effect.addFinalizer(() => retrySettlements().pipe(Effect.orDie));
-        const gate = (s: InboxScope) => {
-          const key = inboxScopeKey(s);
-          let semaphore = gates.get(key);
-          if (!semaphore) {
-            semaphore = Semaphore.makeUnsafe(1);
-            gates.set(key, semaphore);
-          }
-          return semaphore;
-        };
+        // Count waiters as well as holders: never replace a lock while anyone owns a reference.
+        const withGate = <A, E, R>(s: InboxScope, effect: Effect.Effect<A, E, R>) =>
+          Effect.acquireUseRelease(
+            Effect.sync(() => {
+              const key = inboxScopeKey(s);
+              let entry = gates.get(key);
+              if (!entry) {
+                entry = { semaphore: Semaphore.makeUnsafe(1), users: 0 };
+                gates.set(key, entry);
+              }
+              entry.users++;
+              return { key, entry };
+            }),
+            ({ entry }) => entry.semaphore.withPermit(effect),
+            ({ key, entry }) =>
+              Effect.sync(() => {
+                entry.users--;
+                if (!entry.users && gates.get(key) === entry) gates.delete(key);
+              })
+          );
         const wake = Queue.offer(signal, undefined).pipe(Effect.asVoid);
         const prepare = Effect.fn('OperationInbox.prepare')(function* (input: InboxInput) {
-          return yield* gate(input).withPermit(repo.prepare(input, owner));
+          return yield* withGate(input, repo.prepare(input, owner));
         });
         const submit = <A>(
           batch: InboxBatch | undefined,
@@ -161,7 +173,8 @@ export class OperationInbox extends Context.Service<
           start: () => A
         ) =>
           submissionGate.withPermit(
-            gate(s).withPermit(
+            withGate(
+              s,
               Effect.uninterruptible(
                 Effect.gen(function* () {
                   if (
@@ -187,7 +200,8 @@ export class OperationInbox extends Context.Service<
           for (const item of pending) {
             const key = inboxScopeKey(item.input);
             if (running.has(key)) continue;
-            const batch = yield* gate(item.input).withPermit(
+            const batch = yield* withGate(
+              item.input,
               repo.prepare(item.input, owner, item.intentId)
             );
             if (!batch || !execution.ready(batch)) continue;
@@ -227,7 +241,8 @@ export class OperationInbox extends Context.Service<
             id: string,
             update: () => void
           ) {
-            yield* gate(previous).withPermit(
+            yield* withGate(
+              previous,
               Effect.uninterruptible(
                 Effect.gen(function* () {
                   if (!(yield* repo.adopt(previous, next, id)))
@@ -238,7 +253,8 @@ export class OperationInbox extends Context.Service<
             );
           }),
           abandon: (targetWorkspaceId, sessionId, id) =>
-            gate({ workspaceId: targetWorkspaceId, sessionId, userId: '' }).withPermit(
+            withGate(
+              { workspaceId: targetWorkspaceId, sessionId, userId: '' },
               repo.abandon(targetWorkspaceId, sessionId, id)
             ),
           wake,
@@ -251,11 +267,12 @@ export class OperationInbox extends Context.Service<
               })
             )
           ),
-          cancelExecution: (s, id) => gate(s).withPermit(repo.cancelExecution(s, id)),
+          cancelExecution: (s, id) => withGate(s, repo.cancelExecution(s, id)),
           prepare,
           submit,
           accept: Effect.fn('OperationInbox.accept')(function* (i: InboxInput) {
-            return yield* gate(i).withPermit(
+            return yield* withGate(
+              i,
               Effect.gen(function* () {
                 for (const [key, receipt] of pauses) {
                   if (inboxScopeKey(receipt.scope) !== inboxScopeKey(i)) continue;
@@ -274,7 +291,7 @@ export class OperationInbox extends Context.Service<
             );
           }),
           begin: Effect.fn('OperationInbox.begin')(function* (s: InboxScope, id: string) {
-            return yield* gate(s).withPermit(repo.begin(s, id, owner));
+            return yield* withGate(s, repo.begin(s, id, owner));
           }),
           pause: Effect.fn('OperationInbox.pause')(function* (
             s: InboxScope,
@@ -282,7 +299,8 @@ export class OperationInbox extends Context.Service<
             ids?: readonly string[],
             cancelId?: string
           ) {
-            return yield* gate(s).withPermit(
+            return yield* withGate(
+              s,
               Effect.gen(function* () {
                 const key = JSON.stringify([inboxScopeKey(s), cancelId ?? `legacy:${id}`]);
                 const receipt = { scope: s, id, ids, cancelId };
@@ -295,10 +313,13 @@ export class OperationInbox extends Context.Service<
               }).pipe(Effect.uninterruptible)
             );
           }),
-          release: Effect.fn('OperationInbox.release')(function* (e: InboxRelease) {
+          release: Effect.fn('OperationInbox.release')(function* (event: InboxRelease) {
+            // Private retry receipt: storage fixes its watermark, never the caller's event.
+            const e = { ...event };
             const key = JSON.stringify([e.workspaceId, e.sessionId, e.executionId]);
             releases.set(key, e);
-            yield* gate(e).withPermit(
+            yield* withGate(
+              e,
               repo.release(e).pipe(
                 Effect.tap(() =>
                   Effect.sync(() => {

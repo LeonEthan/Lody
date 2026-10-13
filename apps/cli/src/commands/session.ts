@@ -32,6 +32,7 @@ import {
   type PreparedSessionInput,
 } from '@/lib/prepared-session-input';
 import { Command, Option } from 'commander';
+import { sessionInboxRecoveryCommand } from './session-inbox-recovery';
 import {
   SessionDiscoveryFilterShape,
   matchesSessionDiscovery,
@@ -5606,4 +5607,5 @@ export const sessionCommand = new Command('session')
   .addCommand(sessionRenameCommand)
   .addCommand(sessionArchiveCommand)
   .addCommand(sessionRestoreCommand)
+  .addCommand(sessionInboxRecoveryCommand)
   .addCommand(sessionDeleteCommand);

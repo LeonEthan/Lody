@@ -63,7 +63,7 @@ export class CoordinatorWorkflow {
   ) {
     return Effect.forEach(values, map, { concurrency });
   }
-  reconcile = Effect.fnUntraced(
+  reconcile = Effect.fn('Coordinator.reconcile')(
     function* (this: CoordinatorWorkflow, _reason: string): Effect.fn.Return<void, unknown> {
       if (!this.started) return;
       yield* this.projectInboxReceipts();
@@ -96,7 +96,13 @@ export class CoordinatorWorkflow {
   );
   projectInboxReceipts = Effect.fnUntraced(
     function* (this: CoordinatorWorkflow): Effect.fn.Return<void, unknown> {
-      for (const batch of yield* this.ports.receipts) {
+      const batches = yield* this.ports.receipts;
+      const retained = new Set(
+        batches.map((batch) => JSON.stringify([batch.batchId, batch.state]))
+      );
+      for (const key of this.projectedBatches)
+        if (!retained.has(key)) this.projectedBatches.delete(key);
+      for (const batch of batches) {
         const key = JSON.stringify([batch.batchId, batch.state]);
         if (this.projectedBatches.has(key)) continue;
         const meta = yield* this.ports.metadata(batch.sessionId as SessionId);

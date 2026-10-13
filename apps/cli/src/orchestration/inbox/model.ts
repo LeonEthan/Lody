@@ -6,8 +6,9 @@ import type {
   OperationCompletionContent,
 } from '@lody/shared';
 
-export const INBOX_PROTOCOL_VERSION = 2;
 export const INBOX_PREVIEW_BYTES = 64 * 1024;
+/** Inline context is a preview; batch_get reads the complete fixed membership. */
+export const INBOX_INLINE_MEMBERS = 50;
 export type InboxScope = { workspaceId: string; sessionId: string; userId: string };
 export type InboxInput = InboxScope & {
   inputId: string;

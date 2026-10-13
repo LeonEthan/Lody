@@ -1,6 +1,7 @@
 import { Effect, Exit, Fiber, Scope, Semaphore } from 'effect';
 
-/** The disposal fiber outlives a timed-out waiter; recovery never repeats Scope.close. */
+/** The disposal fiber outlives a timed-out waiter. close retains that receipt even if
+ * disposal later succeeds; recover awaits the original fiber, never repeats Scope.close. */
 export const makeInboxCloseOwner = Effect.fnUntraced(function* (ports: {
   dispose: Effect.Effect<void, unknown>;
   recover: Effect.Effect<void, unknown>;
@@ -11,7 +12,7 @@ export const makeInboxCloseOwner = Effect.fnUntraced(function* (ports: {
   let original: Exit.Exit<void, unknown> | undefined;
   let recovered = false;
   const awaitRaw = Effect.suspend(() =>
-    Fiber.await(raw!).pipe(
+    (raw ? Fiber.await(raw) : Effect.fail(new Error('Inbox disposal has not started'))).pipe(
       Effect.timeoutOrElse({
         duration: 10_000,
         orElse: () => Effect.fail(new Error('Inbox Scope release remains unresolved')),

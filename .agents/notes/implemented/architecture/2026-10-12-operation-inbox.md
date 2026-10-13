@@ -95,17 +95,37 @@ upstream Session/ACP/history migration completion is not expanded.
 
 Merged base `0b46cc2d8e33c6feafd08c00f51089456ab1e732` without rewriting PR history. Conflict resolution keeps main's reusable Effect function conversions and lint installation/check scripts, together with Inbox admission/non-replay, exact-input notification attribution and sandbox recovery roots. The six execution, sandbox, Coordinator and Inbox suites pass 391 cases after resolution. Root types, lint (including Effect lint), format, quick boundaries and docs pass. Full CLI tests report 4137 passed, four skipped and the same Git transport failure observed before this merge; the root check remains incomplete.
 
+The blocked-restart review was reproduced on `ea9fb9b0f` with disk SQLite reopen:
+a missing resource row cannot enter automatic enumeration; an incomplete journal
+cannot prove release even with an empty process table. The fix retains this conservative
+automatic rule and adds `session recover-inbox`, a local offline operator entry.
+A scoped platform adapter holds the Host lease before opening SQLite; all external I/O
+stays there, while the native workflow checks explicit attestation and exact execution.
+Known live roots, failed probes and cross-platform identities reject recovery. The
+operator must independently confirm unrecorded resources as well. One transaction pauses,
+retires old input, confirms release and records the attestation; failures roll it all back.
+Unknown batch receipts remain unknown, no automatic intent is created, and only fresh
+trusted human input resumes. No MCP recovery tool or remote RPC was added. The existing
+Promise Host-lease capability remains a named platform adapter, not a new native migration claim.
+
+Admission gates now count queued waiters and holders and evict only at zero references;
+projected batch cache entries are pruned against retained SQLite receipts. Named reconcile
+tracing, five removed non-null assertions, an explicit 50-member preview constant and a
+private release retry receipt simplify the code. Scope failure recovery is unchanged;
+close-owner comments state that delayed disposal success does not replace its original
+failure receipt. No evidence justified repeating Scope.close or changing coordinator disposal.
+
 ## Verification and remaining limits
 
 Author validation now includes installation and checks in the actual author worktree: Node 24.21.0, pnpm 10.20.0 and locked Effect 4.0.2. `pnpm install --frozen-lockfile` succeeds without changing the lockfile. The install guard permits this checkout; the earlier assumption that it was a nested workspace was incorrect. Earlier isolated-copy results remain historical evidence, not an independent base/head review. Overlapping scopes must not be added.
 
 | Scope | Current implementation evidence |
 | --- | --- |
-| Author-worktree intersection | 7 suites, 569 passed: Coordinator, progress feedback, Inbox, execution service, Operation store, Session commands and dispatch watcher |
+| Author-worktree intersection | 5 suites, 413 passed: Inbox, Coordinator, execution service, dispatch watcher and Fleet. Final Inbox rerun: 51 passed, including five operator recovery cases and frozen caller-event regression |
 | Admission ablation | Earlier isolated-copy tests fail at both deterministic competition positions when the submission lock is removed, and pass when restored; unknown-submission non-replay assertions retained |
 | SQLite / ownership | Shared in-memory completion transaction, rollback and asynchronous-callback rejection; disk reopen, actual release and shared-close recovery behavior retained |
 | Types / static / format | Author-worktree root type checks, lint, format and check:quick pass; native core boundaries checked |
-| pnpm check | Author-worktree run is not green: types and lint pass; CLI reports 4137 passed, 4 skipped and one Git transport failure (`context_unreadable` / remote helper aborted). Both transport source and test are unchanged from main. No independent baseline reproduction; recursive termination prevents a full-root test acceptance claim |
+| pnpm check | Author-worktree run is not green: types and lint pass; CLI reports 4142 passed, 4 skipped and one Git transport failure (`context_unreadable` / remote helper aborted). Both transport source and test are unchanged from main. No independent baseline reproduction; recursive termination prevents a full-root test acceptance claim |
 | Documentation | Author docs check passes; earlier 82 broken-link errors are historical (the previously absent submodule source files are now present) |
 
 The CLI editor project now includes source and test files, so both use the same `@/*` alias. Production type checking explicitly uses `tsconfig.typecheck.json` with the previous exclusions. A real TypeScript language-server probe confirms that both a colocated test and a `tests/` file belong to the configured project and resolve `timeout-utils`; unrelated test typing errors are not claimed as fixed. Two test cleanup paths now await Coordinator shutdown before closing SQLite (144 focused cases pass). Root types, lint, format, quick boundaries and docs pass; the full check still stops at the same Git transport failure listed below.

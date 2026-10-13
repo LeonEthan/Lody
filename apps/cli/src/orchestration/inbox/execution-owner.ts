@@ -67,7 +67,11 @@ export const makeExecutionOwner = Effect.fnUntraced(function* (
     Effect.forEach([...resources.values()], (resource) => resource.detach, { discard: true })
   );
   if (!(yield* inbox.begin(input, id)))
-    return yield* Effect.fail(new Error('INBOX_EXECUTION_REJECTED'));
+    return yield* Effect.fail(
+      new Error(
+        'INBOX_EXECUTION_REJECTED: inspect blocked resources with lody session recover-inbox'
+      )
+    );
   if (!batch) batch = yield* inbox.prepare(input);
   const finishWork = Effect.fnUntraced(function* (
     outcome: InboxRelease['outcome'],

@@ -101,7 +101,8 @@ export const coordinatorSessionsLayer = (
     materialize: (operation, item, index) =>
       io(() => {
         const key = operation.requesterSessionId + '\0' + operation.operationId;
-        const controller = controllers.get(key)!;
+        const controller = controllers.get(key);
+        if (!controller) throw new Error('Operation materialization has no resource owner');
         if (!active() || controller.signal.aborted) return Promise.resolve();
         return options.materializeTarget(operation, item, index, controller.signal);
       }),

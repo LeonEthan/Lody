@@ -946,8 +946,14 @@ it('retries a failed normal-release write with its first watermark, excluding la
           db.exec(
             "CREATE TRIGGER fail_release BEFORE INSERT ON inbox_intents BEGIN SELECT RAISE(ABORT,'release outage'); END;"
           );
-          const event = { ...f.input, executionId: 'exec', outcome: 'normal' as const };
+          const event = Object.freeze({
+            ...f.input,
+            executionId: 'exec',
+            outcome: 'normal' as const,
+          });
           expect((yield* Effect.exit(inbox.release(event)))._tag).toBe('Failure');
+          expect(event).not.toHaveProperty('releaseWatermark');
+          expect(event.outcome).toBe('normal');
           f.add('late');
           db.exec('DROP TRIGGER fail_release');
         }).pipe(
@@ -1314,4 +1320,193 @@ it('includes the header and omission footer in the complete 64 KiB preview budge
   expect(Buffer.byteLength(preview, 'utf8')).toBeLessThanOrEqual(INBOX_PREVIEW_BYTES);
   expect(preview).toContain('Shown 0/1.');
   expect(f.sql.members(batch)).toHaveLength(1);
+});
+
+function operatorEndpoint(root: string) {
+  return {
+    kind: 'pipe' as const,
+    path:
+      process.platform === 'win32'
+        ? String.raw`\\.\pipe\lody-inbox-${path.basename(root)}`
+        : path.join(root, 'operator.sock'),
+  };
+}
+
+describe('blocked execution operator recovery', () => {
+  it.each(['missing', 'incomplete'] as const)(
+    'recovers %s identity after reopen, paused and without replay',
+    async (kind) => {
+      const f = fixture();
+      f.start();
+      f.add('saved-result');
+      if (kind === 'incomplete')
+        f.sql.registerResources(f.input, 'execution-1', {
+          platform: process.platform,
+          roots: [],
+          complete: false,
+        });
+      f.store.close();
+      const reopened = new LodyOperationStore(f.filename);
+      stores.push(reopened);
+      reopened.inbox.activate('workspace', 'replacement');
+      expect(reopened.inbox.blockedExecutions('workspace')).toMatchObject([
+        {
+          executionId: 'execution-1',
+          reason: kind === 'missing' ? 'missing_identity' : 'incomplete_identity',
+        },
+      ]);
+      const fresh = { ...f.input, inputId: 'fresh' };
+      expect(reopened.inbox.begin(fresh, 'successor')).toBe(false);
+      const { recoverBlockedInboxExecution } = await import('./operator-recovery');
+      const { makeInboxOperatorRecovery } = await import('../platform/operator-recovery');
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const ports = yield* makeInboxOperatorRecovery('machine', 'workspace', {
+              filename: f.filename,
+              endpoint: operatorEndpoint(f.root),
+            });
+            yield* recoverBlockedInboxExecution(ports, 'A', 'execution-1', true);
+          })
+        )
+      );
+      expect(reopened.inbox.state(fresh)).toMatchObject({
+        blocked: 0,
+        paused: 1,
+        active_execution: null,
+      });
+      expect(reopened.inbox.pending('workspace')).toEqual([]);
+      expect(reopened.inbox.begin(f.input, 'replay')).toBe(false);
+      expect(reopened.inbox.accept(fresh)).toBe(true);
+      expect(reopened.inbox.prepare(fresh, 'replacement')).toMatchObject({ memberCount: 1 });
+      expect(reopened.inbox.begin(fresh, 'successor')).toBe(true);
+    }
+  );
+  it('requires confirmation and exact execution identity, and never replays unknown submission', async () => {
+    const f = fixture();
+    f.start();
+    f.add('saved');
+    f.release();
+    const [intent] = f.sql.pending('workspace');
+    if (!intent) throw Error('missing intent');
+    const batch = f.sql.prepare(intent.input, 'owner', intent.intentId);
+    if (!batch) throw Error('missing batch');
+    f.sql.begin(batch, 'uncertain');
+    f.sql.fence(batch, 'uncertain');
+    f.sql.registerResources(batch, 'uncertain', {
+      platform: process.platform,
+      roots: [],
+      complete: false,
+    });
+    f.store.close();
+    const reopened = new LodyOperationStore(f.filename);
+    stores.push(reopened);
+    reopened.inbox.activate('workspace', 'replacement');
+    const { recoverBlockedInboxExecution } = await import('./operator-recovery');
+    const { makeInboxOperatorRecovery } = await import('../platform/operator-recovery');
+    await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const ports = yield* makeInboxOperatorRecovery('machine', 'workspace', {
+            filename: f.filename,
+            endpoint: operatorEndpoint(f.root),
+          });
+          expect(
+            (yield* Effect.exit(recoverBlockedInboxExecution(ports, 'A', 'uncertain', false)))._tag
+          ).toBe('Failure');
+          expect(
+            (yield* Effect.exit(recoverBlockedInboxExecution(ports, 'A', 'wrong', true)))._tag
+          ).toBe('Failure');
+          expect(reopened.inbox.state(batch).blocked).toBe(1);
+          yield* recoverBlockedInboxExecution(ports, 'A', 'uncertain', true);
+        })
+      )
+    );
+    expect(reopened.inbox.getBatch(batch.batchId, batch)?.state).toBe('unknown');
+    expect(reopened.inbox.fence(batch, 'retry')).toBe(false);
+    expect(reopened.inbox.pending('workspace')).toEqual([]);
+    const fresh = { ...f.input, inputId: 'fresh' };
+    reopened.inbox.accept(fresh);
+    expect(reopened.inbox.prepare(fresh, 'replacement')).toBeUndefined();
+    expect(reopened.inbox.begin(fresh, 'new')).toBe(true);
+  });
+  it('refuses a live Host and known live roots, retaining blocking and releasing the operator lease', async () => {
+    const f = fixture();
+    f.start();
+    f.sql.registerResources(f.input, 'execution-1', {
+      platform: process.platform,
+      roots: [process.pid],
+      complete: false,
+    });
+    f.store.close();
+    const reopened = new LodyOperationStore(f.filename);
+    stores.push(reopened);
+    reopened.inbox.activate('workspace', 'replacement');
+    const { makeInboxOperatorRecovery } = await import('../platform/operator-recovery');
+    const { recoverBlockedInboxExecution } = await import('./operator-recovery');
+    const { acquireLocalCliHostLease } = await import('@lody/shared/node/local-cli-host-lease');
+    const endpoint = operatorEndpoint(f.root);
+    const lease = await acquireLocalCliHostLease({
+      instanceId: 'worker',
+      mode: 'foreground',
+      endpoint,
+    });
+    if (lease.status !== 'acquired') throw Error('fixture lease unavailable');
+    try {
+      await expect(
+        Effect.runPromise(
+          Effect.scoped(
+            makeInboxOperatorRecovery('machine', 'workspace', { filename: f.filename, endpoint })
+          )
+        )
+      ).rejects.toThrow('Stop the local daemon');
+    } finally {
+      await lease.lease.close();
+    }
+    await expect(
+      Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const ports = yield* makeInboxOperatorRecovery('machine', 'workspace', {
+              filename: f.filename,
+              endpoint,
+            });
+            yield* recoverBlockedInboxExecution(ports, 'A', 'execution-1', true);
+          })
+        )
+      )
+    ).rejects.toThrow('Known resources are still running');
+    expect(reopened.inbox.state(f.input).blocked).toBe(1);
+    const next = await acquireLocalCliHostLease({
+      instanceId: 'next',
+      mode: 'foreground',
+      endpoint,
+    });
+    expect(next.status).toBe('acquired');
+    if (next.status === 'acquired') await next.lease.close();
+  });
+  it('atomically rolls back pause and release if audit persistence fails', () => {
+    const f = fixture();
+    f.start();
+    f.sql.registerResources(f.input, 'execution-1', {
+      platform: 'darwin',
+      roots: [],
+      complete: false,
+    });
+    const db = new Database(f.filename);
+    try {
+      db.prepare('UPDATE inbox_sessions SET blocked=1').run();
+      db.exec(
+        "CREATE TRIGGER fail_operator_audit BEFORE UPDATE OF cause ON inbox_resources WHEN NEW.cause='Operator confirmed all resources released' BEGIN SELECT RAISE(ABORT,'audit-failure'); END;"
+      );
+      expect(() => f.sql.recoverBlocked(f.input, 'execution-1')).toThrow('audit-failure');
+      expect(f.sql.state(f.input)).toMatchObject({
+        blocked: 1,
+        paused: 0,
+        active_execution: 'execution-1',
+      });
+    } finally {
+      db.close();
+    }
+  });
 });

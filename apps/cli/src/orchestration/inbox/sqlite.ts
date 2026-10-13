@@ -11,7 +11,7 @@ import {
   type InboxRelease,
   type InboxScope,
 } from './model';
-import type { InboxResourceIdentity } from './recovery';
+import type { BlockedInboxExecution, InboxResourceIdentity } from './recovery';
 import { canFenceBatch, inputAcceptance } from './rules';
 
 const StateRow = z.object({
@@ -766,6 +766,52 @@ export class InboxSqlite {
           identity,
         };
       });
+  }
+  blockedExecutions(workspaceId: string): BlockedInboxExecution[] {
+    const identities = new Map(
+      this.unreleased(workspaceId).map((row) => [
+        JSON.stringify([row.scope.sessionId, row.scope.userId, row.executionId]),
+        row.identity,
+      ])
+    );
+    return this.db
+      .prepare(
+        'SELECT session_id,user_id,active_execution FROM inbox_sessions WHERE workspace_id=? AND blocked=1 AND active_execution IS NOT NULL'
+      )
+      .all(workspaceId)
+      .map((row) => {
+        const r = z
+          .object({ session_id: z.string(), user_id: z.string(), active_execution: z.string() })
+          .parse(row);
+        const identity = identities.get(
+          JSON.stringify([r.session_id, r.user_id, r.active_execution])
+        );
+        return {
+          scope: { workspaceId, sessionId: r.session_id, userId: r.user_id },
+          executionId: r.active_execution,
+          ...(identity ? { identity } : {}),
+          reason: !identity
+            ? 'missing_identity'
+            : identity.complete !== true
+              ? 'incomplete_identity'
+              : 'resources_unreleased',
+        };
+      });
+  }
+  /** Offline operator attestation; never grants automatic continuation or replays old input. */
+  recoverBlocked(s: InboxScope, executionId: string): boolean {
+    return this.transaction(() => {
+      const current = this.state(s);
+      if (!current.blocked || current.active_execution !== executionId) return false;
+      this.pause(s, executionId, undefined, `operator-recovery:${executionId}`);
+      this.confirmReleased(s, executionId);
+      this.db
+        .prepare(
+          "INSERT INTO inbox_resources(workspace_id,session_id,user_id,execution_id,state,cause) VALUES(?,?,?,?,'released','Operator confirmed all resources released') ON CONFLICT(workspace_id,session_id,execution_id) DO UPDATE SET cause=excluded.cause"
+        )
+        .run(s.workspaceId, s.sessionId, s.userId, executionId);
+      return true;
+    });
   }
   confirmReleased(s: InboxScope, executionId: string): void {
     this.transaction(() => {

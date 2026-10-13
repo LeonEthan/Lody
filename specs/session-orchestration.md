@@ -160,6 +160,14 @@ require a new send. Agent chat, role, userId and author cannot clear pause. Fail
 never auto-continue; unreleased resources block all successors. Normal future human
 turns resume the same normal-release rule.
 
+Missing or incomplete recovery journals must remain visible and recoverable. A local
+operator may explicitly attest that all old resources, including unrecorded ones,
+have been released while holding exclusive Host ownership; known live resources or
+uncertain probes still block recovery. Atomically retire the exact old execution and
+pause the session. Do not replay unknown submissions or manufacture a normal-release
+intent. Only fresh trusted human input resumes work afterward. A dead daemon PID alone
+is not release evidence. This maintenance action is not available through Agent/MCP tools.
+
 An automatic batch yields atomically to pre-submission human acceptance. A human input
 already being prepared survives later queued human input. Keep admission from the
 submission fence through synchronous transport initiation, without an intervening

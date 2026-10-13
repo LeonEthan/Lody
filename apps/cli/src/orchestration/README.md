@@ -63,9 +63,33 @@ watermarks and persists input/batch/resource receipts. `inbox/service.ts` owns c
 signals, scoped workers and the shared admission gate. `inbox/legacy.ts` registers the
 single host runtime and the unfinished Session adapter. `inbox/recovery.ts` supplies the pure disappearance rule; the process probe is a platform capability. It proves
 resource disappearance conservatively; unsupported or missing identities remain blocked.
+Session admission locks retain both waiters and holders, then evict only at zero references.
+Projected receipt cache entries follow retained SQLite receipt identities/statuses. Release
+retries own a private mutable receipt, leaving the caller event unchanged.
+
+Missing or incomplete resource journals remain fail-closed across restart, including
+when no record exists between `begin` and first acquisition. Inspect them with the
+local, offline operator command (stop the daemon and desktop first):
+
+```sh
+lody session recover-inbox <sessionId> --machine <machineId> --workspace <workspaceId>
+# Only AFTER independently checking that all old processes/requests are released:
+lody session recover-inbox <sessionId> --machine <machineId> --workspace <workspaceId> \
+  --execution <executionId> --confirm-resources-released
+```
+
+The scoped platform adapter acquires the exclusive Host lease before opening SQLite,
+checks known PIDs/process groups without sending signals, and rejects live roots,
+probe uncertainty or another platform. The operator must attest unrecorded resources
+as well; a dead daemon PID alone is insufficient. The native workflow rechecks the
+exact blocked identity. Pause, old-input retirement, release and audit commit in one
+transaction. Recovery stays paused, creates no intent and never replays unknown
+submissions; restart Lody and send fresh input from an Inbox-aware client/CLI.
+This is local-account maintenance, not a new MCP tool or remote recovery RPC.
 
 `session-execution-service.ts` calls the actual prompt primitive while holding admission.
 A batch is one system history item plus one model input, even when details require pages.
+Inline context intentionally previews at most 50 members and 64 KiB; batch_get reads all fixed members.
 `batch-page.ts` returns complete large members in bounded JSON fragments. The execution
 owner retains raw requests and full failures; `recoverInboxExecution` retries cleanup.
 Coordinator `stop()` now has a shared awaited drain receipt; `recoverStop()` is its

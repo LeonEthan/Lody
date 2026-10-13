@@ -69,6 +69,9 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
   release; legacy snapshots and interrupted journaling remain blocked. Coordinator recovery
   calls `recoverClose`, not the cached failed `close` receipt; never replay transport.
 - Schema/Inbox v2 drops Delivery data/APIs; keep Operation rows and retired IDs.
+  Missing/incomplete journals stay blocked automatically. Offline operator recovery holds the
+  Host lease before opening SQLite, verifies known roots and requires explicit confirmation
+  of all unrecorded resources. Retire the exact execution and pause atomically; no replay or wake.
   Keep current pause/unknown/resource evidence and monotonic sequences. Host v3 rejects old
   workers before storage; end the prior Worker before handoff. Passive results are not busy.
 - Create Operations may also maintain one stable `role: system` `operation_progress`
@@ -82,20 +85,15 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
   errors, and deadlines do not terminate targets. Result consumption does not end reconciliation:
   retain it through target terminal state and local Loro flush, and preserve it through SQLite
   cleanup/restart. Missing evidence or writes retain an owned retry and never wake the agent.
-  Unchanged progress must return before `updateHistory` / `Mirror.setState`: Mirror notifies
-  even for unchanged state, so nested A -> B -> C progress writes otherwise wake their own
-  coordinator forever. Test this with real Mirror subscriptions.
+  Unchanged progress must return before `updateHistory` / `Mirror.setState` to prevent
+  self-waking loops. Test with real Mirror subscriptions.
 - Missing Session metadata, a recoverable tombstone, or an unsynchronized
   Machine Flock document is uncertainty, not permanent deletion/configuration
   absence. Keep the item/result pending until positive evidence or deadline.
 - Deadlines finish the root with item `TARGET_TIMEOUT` results but never cancel
   target Turns. Operation cancel is the only best-effort remote-cancel path.
-- Store paths are keyed strictly by an explicit machineId
-  (`getLodyOperationStorePath` has no default): the MCP server resolves it from
-  the session context, never from its own process environment. The former
-  env/`'local'` fallback let the daemon-hosted HTTP transport (whose process
-  has no `LODY_MCP_MACHINE_ID`) silently write Operations into a store no
-  coordinator reconciles, so completions were never delivered.
+- Store paths require explicit machineId (`getLodyOperationStorePath` has no default).
+  MCP resolves it from trusted Session context, never its environment or a local fallback.
 - `session_create_many` and `session_chat_many` target writes bypass cooperative
   Session/Turn quotas. Preserve the bypass in both MCP-process materialization
   and daemon recovery replay; otherwise quota rejection degrades into a false

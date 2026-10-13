@@ -59,17 +59,21 @@ Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮�
 
 合并 base `0b46cc2d8e33c6feafd08c00f51089456ab1e732`，不改写 PR 历史。冲突解决同时保留主分支可复用 Effect 函数转换及 lint 安装／检查脚本，以及 Inbox 准入与不重发、准确输入通知归属、sandbox 恢复 roots。解决后执行、sandbox、Coordinator 与 Inbox 六个 suite 共 391 项通过。全仓类型、lint（含 Effect lint）、format、quick 边界及文档检查通过；完整 CLI 测试 4137 通过、4 跳过，仍有合并前已观察到的同一 Git transport 失败，全仓检查未完整通过。
 
+在 `ea9fb9b0f` 上通过磁盘 SQLite 重开复现了阻塞缺口：缺资源行无法进入自动恢复枚举，不完整日志即使面对空进程表也不能证明释放。修复保留自动恢复的保守规则，增加本机离线 `session recover-inbox`。scoped platform adapter 先独占 Host 再打开 SQLite，所有外部 I/O 留在平台；原生 workflow 检查明确确认与准确执行身份。已知 roots 存活、探针失败或平台不符时拒绝恢复，操作者还必须独立确认未登记资源已经释放。暂停、退役旧输入、确认释放和审计在同一事务中，失败全部回滚。未知批次仍未知，不产生自动意图，只有新的可信用户输入恢复工作。不新增 MCP 恢复工具或远程 RPC；现有 Promise Host lease 属于登记的平台 adapter，不扩大原生迁移声明。
+
+准入锁同时计数等待者与持有者，仅在引用为零时移除；投影缓存跟随 SQLite 保留的回执清理。reconcile 使用具名 tracing，删除五处非空断言，明确 50 成员预览上限，release 重试使用自己的回执，不修改调用方事件。Scope 失败恢复保持原行为；注释明确底层延迟成功不会替换首次失败回执，没有证据支持重复 Scope.close 或改变 coordinator dispose。
+
 ## 验证与剩余边界
 
 本次已在作者工作树实际安装和检查：Node 24.21.0、pnpm 10.20.0、锁定 Effect 4.0.2。`pnpm install --frozen-lockfile` 成功，锁文件未变。安装 guard 允许此 checkout，之前把它当成嵌套工作区是不准确的。先前隔离副本结果只保留为历史证据，不是独立 base/head 审核；重叠范围不能累加。
 
 | 范围 | 当前实现证据 |
 | --- | --- |
-| 作者工作树相关交集 | 7 suites，569 项通过：Coordinator、进度回传、Inbox、执行服务、Operation 存储、Session 命令与 dispatch watcher |
+| 作者工作树相关交集 | 5 suites，413 项通过：Inbox、Coordinator、执行服务、dispatch watcher 与 Fleet。最终 Inbox 单独复跑 51 项通过，包含五个人工恢复场景及冻结调用方事件的回归验证 |
 | 准入反证 | 此前隔离副本的两个确定性竞争位置：移除提交锁均失败，恢复后均通过；保留未知提交禁止重发断言 |
 | SQLite／所有权 | 内存共享连接的完成事务、失败回滚、异步事务拒绝；磁盘重开、资源释放和共享关闭恢复沿用行为覆盖 |
 | 类型／静态／格式 | 作者工作树全仓类型检查、lint、format、check:quick 通过，原生内核边界检查通过 |
-| pnpm check | 作者工作树实跑未全绿：类型与 lint 通过；CLI 4137 通过、4 跳过、1 项 Git transport 失败（context_unreadable／remote helper aborted）。transport 源码和测试均未相对 main 改动；未独立复现基线，递归检查终止，不能宣称全仓测试通过 |
+| pnpm check | 作者工作树实跑未全绿：类型与 lint 通过；CLI 4142 通过、4 跳过、1 项 Git transport 失败（context_unreadable／remote helper aborted）。transport 源码和测试均未相对 main 改动；未独立复现基线，递归检查终止，不能宣称全仓测试通过 |
 | 文档 | 作者环境 docs check 通过；此前 82 项缺失链接为历史结果，原先缺失的子模块源码现已存在 |
 
 CLI 默认编辑器项目现已收录源码与测试，让两者共享 `@/*` 别名；生产类型检查明确使用 `tsconfig.typecheck.json`，保留原排除范围。实际 TypeScript language server 探针确认 src 内测试和 tests 目录文件都进入配置项目并正确解析 timeout-utils，不宣称修复其他测试类型错误。两个测试清理入口补齐等待 Coordinator 关闭后再关闭 SQLite，相关 144 项通过。全仓类型、lint、format、quick 边界及文档检查通过；全仓检查仍被下述同一 Git transport 失败终止。
