@@ -879,18 +879,18 @@ it('keeps the original shared failed shutdown receipt and recovers settlement th
     },
   });
   await bridge.accept(f.input);
-  await bridge.begin(f.input, 'exec');
-  const batch = (await bridge.prepare(f.input))!;
-  await bridge.submit(batch, f.input, 'exec', () => received.push(batch.batchId));
+  const owner = await bridge.openExecution(f.input, 'exec');
+  const batch = owner.batch!;
+  await owner.submit(() => received.push(batch.batchId));
   const db = new Database(f.filename);
   db.exec(
     "CREATE TRIGGER fail_close_settlement BEFORE UPDATE OF state ON inbox_batches WHEN NEW.state='settled' BEGIN SELECT RAISE(ABORT,'outage'); END;"
   );
-  await bridge.settle(batch, 'settled');
+  await owner.finish('normal');
   const first = bridge.close();
   expect(bridge.close()).toBe(first);
   await expect(first).rejects.toHaveProperty('cause');
-  expect(db.prepare('SELECT state FROM inbox_batches').get()).toEqual({ state: 'submitting' });
+  expect(db.prepare('SELECT state FROM inbox_batches').get()).toEqual({ state: 'submitted' });
   db.exec('DROP TRIGGER fail_close_settlement');
   await bridge.recoverClose();
   expect(db.prepare('SELECT state FROM inbox_batches').get()).toEqual({ state: 'settled' });

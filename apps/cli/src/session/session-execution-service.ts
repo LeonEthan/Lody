@@ -4325,7 +4325,6 @@ export class SessionExecutionService {
                               promptPromise: submitted.value,
                             });
                             if (inboxBatch) {
-                              await inbox!.settle(inboxBatch, 'submitted');
                               await (
                                 await createSessionBackend(sessionDoc)
                               )

@@ -29,6 +29,12 @@ wake tickets and retry fibers. The old coordinator class is a registered applica
 entry point, not a second reconciliation loop. Concrete Session/history/OS effects
 are in `platform/`; these upstream Promise adapters still require their own migration.
 
+Ordinary coordinator steps compose directly with `yield*`. Only deadline,
+materialization retry and best-effort progress boundaries inspect failure Causes.
+Interruption propagates instead of becoming a completed Operation or a progress
+warning; recoverable failures keep the complete Cause. Activity/epoch admission
+remains authoritative; immutable repository aliases need no replacement checks.
+
 `OrchestrationDatabase` owns one scoped SQLite connection. Disk and `:memory:` Layers
 use the same schema, SQL and repositories. In-memory SQLite is still mutable I/O,
 not a pure function; it makes isolated tests reproducible without changing semantics.
@@ -42,7 +48,10 @@ the unused session-row configuration read/write is removed without a schema migr
 
 `inbox/execution-owner.ts` hides input/batch identity, resource registration, raw
 requests, submission, settlement and release recovery. Session callers use this
-handle rather than SQL. `inbox/close-owner.ts` retains the original close receipt and
+handle rather than SQL. Its `submit` starts transport and records the submitted
+receipt; callers cannot manually interleave begin/prepare/submit/settle through the
+Legacy facade. Read queries use a plain Effect-valued port interface; concrete SQL
+remains in platform, without an unused Service/Layer. `inbox/close-owner.ts` retains the original close receipt and
 a raw disposal fiber; independent recovery repairs receipts without repeating requests.
 Fleet startup and normal stop use the same phased cleanup owner. Automatic startup
 retry first recovers retained resources, then starts a replacement.

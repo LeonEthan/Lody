@@ -1,3 +1,9 @@
+import { Cause, Effect, Exit } from 'effect';
+import { CoordinatorWorkflow } from './coordinator-workflow';
+import type { CoordinatorActivity } from './coordinator-activity';
+import type { CoordinatorPorts } from './coordinator-ports';
+import { OperationRepository } from './operation-repository';
+import { operationRepositoryLayer } from './platform/operations';
 import Database from 'better-sqlite3';
 import { mkdtemp, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -1199,16 +1205,16 @@ it('recovers failed native close through the coordinator without resubmitting tr
     value: { items: [] },
   });
   await bridge.accept(input);
-  await bridge.begin(input, 'execution');
-  const batch = (await bridge.prepare(input))!;
+  const owner = await bridge.openExecution(input, 'execution');
+  const batch = owner.batch!;
   expect(batch.memberCount).toBe(1);
   const received: string[] = [];
-  await bridge.submit(batch, input, 'execution', () => received.push(batch.batchId));
+  await owner.submit(() => received.push(batch.batchId));
   const db = new Database(harness.storePath);
   db.exec(
     "CREATE TRIGGER review_settle_outage BEFORE UPDATE OF state ON inbox_batches WHEN NEW.state='settled' BEGIN SELECT RAISE(ABORT,'settlement outage'); END;"
   );
-  await bridge.settle(batch, 'settled');
+  await owner.finish('normal');
   await expect(harness.coordinator.stop()).rejects.toThrow('Inbox Scope release failed');
   db.exec('DROP TRIGGER review_settle_outage');
   await harness.coordinator.recoverStop();
@@ -1222,4 +1228,124 @@ it('recovers failed native close through the coordinator without resubmitting tr
   await harness.coordinator.stop();
   db.close();
   store.close();
+});
+
+describe('native coordinator failure boundaries', () => {
+  it.each([
+    'retry',
+    'deadline',
+    'deadline-interrupt',
+    'deadline-mixed-interrupt',
+    'progress',
+    'progress-interrupt',
+    'progress-mixed-interrupt',
+  ] as const)(
+    'preserves Cause and durable Operation state at the %s boundary',
+    async (scenario) => {
+      const store = new LodyOperationStore(':memory:', () => TEST_NOW_MS);
+      const interrupted = scenario.endsWith('interrupt');
+      const cause = interrupted
+        ? scenario.includes('mixed')
+          ? Cause.combine(Cause.fail(new Error('cleanup failure')), Cause.interrupt(99))
+          : Cause.interrupt(99)
+        : Cause.combine(
+            Cause.fail(new Error('storage failure')),
+            Cause.die(new Error('adapter defect'))
+          );
+      const warnings: unknown[] = [];
+      const operation = store.accept({
+        workspaceId: 'workspace-1' as WorkspaceId,
+        ownerMachineId: 'machine-1' as MachineId,
+        requesterSessionId: 'requester-1' as SessionId,
+        requesterUserId: 'user-1',
+        operationId: 'cause-boundary',
+        kind: scenario.startsWith('progress') ? 'session_create' : 'session_chat',
+        canonicalCommand: { scenario },
+        frozenContinuationConfig: { inputConfig: {} },
+        initiatorChainDepth: 0,
+        createdAt: new Date(TEST_NOW_MS).toISOString(),
+        deadlineAt: new Date(
+          TEST_NOW_MS + (scenario.startsWith('deadline') ? 0 : 60000)
+        ).toISOString(),
+        items: [
+          {
+            status: 'active',
+            target: { sessionId: 'target-1' as SessionId, userTurnId: 'input-1' },
+            inputDurable: true,
+          },
+        ],
+      }).operation;
+      const activity: CoordinatorActivity['Service'] = {
+        wake: () => Effect.void,
+        signal: () => Effect.void,
+        arm: () => Effect.void,
+        cancel: () => Effect.void,
+        cancelWhere: () => Effect.void,
+        has: () => false,
+        drain: Effect.void,
+      };
+      const ports: CoordinatorPorts['Service'] = {
+        active: () => true,
+        now: () => TEST_NOW_MS,
+        claimToken: 'claim',
+        metadata: () => Effect.failCause(cause),
+        session: () => Effect.fail(new Error('unexpected history access')),
+        execution: () => ({}),
+        operation: () => Effect.succeed({ signal: { aborted: false } }),
+        cancelInactive: () => Effect.void,
+        receipts: Effect.succeed([]),
+        wakeInbox: Effect.void,
+        confirmReadable: () => Effect.void,
+        materialize: () => Effect.void,
+        warn: (_message, detail) =>
+          Effect.sync(() => {
+            warnings.push(detail);
+          }),
+      };
+      try {
+        await Effect.runPromise(
+          Effect.scoped(
+            Effect.gen(function* () {
+              const repository = yield* OperationRepository;
+              const scope = yield* Effect.scope;
+              const core = new CoordinatorWorkflow(
+                { workspaceId: operation.workspaceId, machineId: operation.ownerMachineId },
+                ports,
+                repository,
+                activity,
+                scope
+              );
+              const exit = yield* Effect.exit(
+                scenario.startsWith('progress')
+                  ? core.writeOperationProgress(operation)
+                  : core.reconcileOperation(operation)
+              );
+              const persisted = yield* repository.get(
+                operation.requesterSessionId,
+                operation.operationId
+              );
+              if (scenario === 'deadline') {
+                expect(Exit.isSuccess(exit)).toBe(true);
+                expect(persisted).toMatchObject({
+                  state: 'finished',
+                  completion: { type: 'error', error: { code: 'COORDINATOR_FAILED' } },
+                });
+              } else {
+                expect(persisted.state).toBe('active');
+                if (scenario === 'progress') {
+                  expect(Exit.isSuccess(exit)).toBe(true);
+                  expect(warnings).toEqual([cause]);
+                } else {
+                  expect(Exit.isFailure(exit) && exit.cause).toEqual(cause);
+                  expect(warnings).toEqual([]);
+                }
+              }
+            }).pipe(Effect.provide(operationRepositoryLayer(store)))
+          )
+        );
+      } finally {
+        store.close();
+      }
+    }
+  );
 });

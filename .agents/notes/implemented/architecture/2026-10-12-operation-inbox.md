@@ -78,6 +78,21 @@ for the next legacy message after Stop.
 
 Upgrade validation: 4 CLI suites / 487 tests and 79 component tests pass. All three targeted cases fail against reviewed `552c349` source in the isolated copy and pass after restoring the fix. CLI Stop also tests released strict parsing and Inbox v2 pause / Operation cancellation fields. No full-machine upgrade or old-desktop-binary end-to-end acceptance is claimed.
 
+The native orchestration cleanup removes the Effect.exit / thrown exception / Cause
+restoration round trip from ordinary steps. Only deadline, materialization retry and
+best-effort progress boundaries handle failure; interruption propagates. Immutable
+store aliases and identity comparisons are removed, while activity/epoch checks remain.
+The Legacy facade no longer exposes begin/prepare/submit/settle/adopt. ExecutionOwner.submit
+records the submitted receipt, replacing Session's manual settlement. Queries use an
+ordinary Effect-valued port instead of an unused Context.Service/Layer. Shared close
+receipts, actual release, independent recovery and durable admission remain intact.
+
+The changed intersection passes 4 suites / 339 tests, including seven native Cause /
+real SQLite state cases for combined failures, deadline settlement, progress downgrade
+and interruption. Shared-close failure/recovery tests now use the production execution
+owner and still assert original receipts and non-replay. Counts overlap earlier evidence;
+upstream Session/ACP/history migration completion is not expanded.
+
 ## Verification and remaining limits
 
 Author validation uses a separate source copy with pinned dependencies and matching changed-source bytes, not an independent base/head review. These scopes overlap and must not be added; earlier complete matrices remain in Git history.
@@ -89,7 +104,7 @@ Author validation uses a separate source copy with pinned dependencies and match
 | SQLite / ownership | Shared in-memory completion transaction, rollback and asynchronous-callback rejection; disk reopen, actual release and shared-close recovery behavior retained |
 | Types / static / format | Root types and lint, format and check:quick pass; extended guard forbids concrete I/O and nested runtime access in the native core |
 | pnpm check | Attempted, not green: sandbox process/port failures and recursive termination at e2ee-core with no test files. Before the main merge, unsandboxed CLI reports 4087 passed, 4 skipped and one failure in unchanged Git transport (`context_unreadable` / remote helper aborted); no independent baseline or full-root acceptance claim |
-| Documentation | Same pre-existing array of 82 errors; no Inbox errors |
+| Documentation | Current author docs check passes; earlier 82 broken-link errors are historical (the previously absent submodule source files are now present) |
 
 
 Tests observe full provider inputs, durable rows and actual release with Deferred, injected clocks, fake timers and failure triggers. They cover eight-result batching, empty boundaries, late ninth results, event-free restart, paused/unknown non-replay, and current scheduler ownership/resource release. Earlier legacy-fixture handoff tests were retired with their contract and are not v2 acceptance. Resource tests use real independent process groups with injected process-table snapshots. No live model, complete system process-table, desktop end-to-end, merge or release acceptance is claimed.

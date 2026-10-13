@@ -1,8 +1,8 @@
-import { Effect, Layer } from 'effect';
-import { InboxQueries } from '../inbox/queries';
+import { Effect } from 'effect';
+import type { InboxQueries } from '../inbox/queries';
 import type { InboxSqlite } from '../inbox/sqlite';
 
-export const makeInboxQueries = (sql: InboxSqlite): InboxQueries['Service'] => {
+export const makeInboxQueries = (sql: InboxSqlite): InboxQueries => {
   const io = <A>(f: () => A) => Effect.try({ try: f, catch: (cause) => cause });
   return {
     preferredHumanInput: (w, s) => io(() => sql.preferredHumanInput(w, s)),
@@ -11,5 +11,3 @@ export const makeInboxQueries = (sql: InboxSqlite): InboxQueries['Service'] => {
     pauseTarget: (w, s, id) => io(() => sql.pauseTarget(w, s, id)),
   };
 };
-export const inboxQueriesLayer = (sql: InboxSqlite) =>
-  Layer.succeed(InboxQueries, makeInboxQueries(sql));

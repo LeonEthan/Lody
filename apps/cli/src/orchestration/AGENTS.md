@@ -54,7 +54,7 @@ Root/CLI rules apply; `specs/session-orchestration.md` owns behavior.
   never resnapshot or wake. Late results wait for fresh input or another normal boundary.
 - `inbox/service.ts` is native Effect v4. Scope owns its signal/fibers and repository connection;
   one per-Session admission covers Stop, trusted human acceptance and actual transport start.
-  Native workflows never import platform I/O or consumers. Registered entry bridges own runtimes.
+  Core imports no platform/consumers; registered bridges execute. Submit/settle through execution owners.
 - Inbox-aware Stop pauses/cancels queued eligibility; legacy Stop only cancels execution.
   Only trusted fresh human receipts clear pause; role/userId/author are insufficient. New human
   acceptance cannot revive a canceled execution or discard an already prepared human input.

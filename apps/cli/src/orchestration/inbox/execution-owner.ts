@@ -185,10 +185,12 @@ export const makeExecutionOwner = Effect.fnUntraced(function* (
       }),
     steer: <A>(start: () => A) => inbox.submit(undefined, input, id, start),
     submit: <A>(start: () => A) =>
-      inbox.submit(batch, input, id, () => {
-        phase = 'submitting';
-        return start();
-      }),
+      inbox
+        .submit(batch, input, id, () => {
+          phase = 'submitting';
+          return start();
+        })
+        .pipe(Effect.tap(() => (batch ? inbox.settle(batch, 'submitted') : Effect.void))),
     finish: (outcome: InboxRelease['outcome'], cause?: unknown) =>
       releaseGate.withPermit(finishWork(outcome, cause)),
     awaitReleased: Deferred.await(released),

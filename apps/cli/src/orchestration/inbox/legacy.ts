@@ -135,26 +135,16 @@ export const operationInboxLegacy = (options: {
           ),
       };
     },
-    adopt: (p: InboxInput, n: InboxInput, id: string, update: () => void) =>
-      runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.adopt(p, n, id, update))),
     quiesce: () => runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.quiesce)),
     cancelExecution: (scope: InboxScope, id: string) =>
       runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.cancelExecution(scope, id))),
     wake: () => runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.wake)),
     accept: (input: InboxInput) =>
       runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.accept(input))),
-    begin: (scope: InboxScope, id: string) =>
-      runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.begin(scope, id))),
     pause: (scope: InboxScope, id: string, ids?: readonly string[], cancelId?: string) =>
       runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.pause(scope, id, ids, cancelId))),
-    prepare: (input: InboxInput) =>
-      runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.prepare(input))),
     release: (event: InboxRelease) =>
       runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.release(event))),
-    submit: <A>(batch: InboxBatch | undefined, scope: InboxScope, id: string, start: () => A) =>
-      runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.submit(batch, scope, id, start))),
-    settle: (batch: InboxBatch, outcome: 'submitted' | 'unknown' | 'settled', cause?: string) =>
-      runtime.runPromise(Effect.flatMap(OperationInbox, (i) => i.settle(batch, outcome, cause))),
     recoverClose: () => {
       if (recoveredClose) return recoveredClose;
       const attempt = runClose(closeOwner.recover, 'Inbox Scope recovery failed');
