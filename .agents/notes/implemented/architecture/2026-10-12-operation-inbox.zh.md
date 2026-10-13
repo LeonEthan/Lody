@@ -59,17 +59,16 @@ Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮�
 
 ## 验证与剩余边界
 
-作者验证使用锁定依赖的隔离源码副本，并核对改动源码字节一致；不是独立 base/head 审核。以下范围有交集，不能累加；以前的完整测试记录保留在 Git 历史中。
+本次已在作者工作树实际安装和检查：Node 24.21.0、pnpm 10.20.0、锁定 Effect 4.0.2。`pnpm install --frozen-lockfile` 成功，锁文件未变。安装 guard 允许此 checkout，之前把它当成嵌套工作区是不准确的。先前隔离副本结果只保留为历史证据，不是独立 base/head 审核；重叠范围不能累加。
 
-| 范围 | 本轮实现证据 |
+| 范围 | 当前实现证据 |
 | --- | --- |
-| 原生编排相关交集 | 合并 main `09407b3b7` 后 7 suites，416 项通过；包含真实 Coordinator／Mirror、执行服务、Fleet 自动重试、SQLite、Inbox 与原生 presence |
-| 准入反证 | 两个确定性竞争位置：隔离副本移除提交锁均失败，恢复后均通过；保留未知提交禁止重发断言 |
+| 作者工作树相关交集 | 7 suites，569 项通过：Coordinator、进度回传、Inbox、执行服务、Operation 存储、Session 命令与 dispatch watcher |
+| 准入反证 | 此前隔离副本的两个确定性竞争位置：移除提交锁均失败，恢复后均通过；保留未知提交禁止重发断言 |
 | SQLite／所有权 | 内存共享连接的完成事务、失败回滚、异步事务拒绝；磁盘重开、资源释放和共享关闭恢复沿用行为覆盖 |
-| 类型／静态／格式 | 全仓类型及 lint、format、check:quick 通过；新增 guard 禁止内核依赖具体 I/O 或自建 runtime |
-| pnpm check | 已执行但未全绿：沙盒中出现进程／端口相关失败，递归检查还被 e2ee-core 无测试文件终止；合并 main 前沙盒外 CLI 为 4087 通过、4 跳过、一项未修改 Git transport 的 context_unreadable／remote helper aborted；未独立验证基线，不宣称全仓验收 |
-| 文档 | 当前作者环境 docs check 通过；此前 82 项缺失链接为历史结果，原先缺失的子模块源码现已存在 |
-
+| 类型／静态／格式 | 作者工作树全仓类型检查、lint、format、check:quick 通过，原生内核边界检查通过 |
+| pnpm check | 作者工作树实跑未全绿：类型与 lint 通过；CLI 4106 通过、4 跳过、1 项 Git transport 失败（context_unreadable／remote helper aborted）。transport 源码和测试均未相对 main 改动；未独立复现基线，递归检查终止，不能宣称全仓测试通过 |
+| 文档 | 作者环境 docs check 通过；此前 82 项缺失链接为历史结果，原先缺失的子模块源码现已存在 |
 
 测试通过 Deferred、注入时钟、fake timers 和故障触发器检查完整模型输入、持久行与真实释放。覆盖八项合批、空边界、迟到第九项、无新事件重开、暂停／未知不重发，以及当前调度所有权与资源释放。旧协调器 fixture 的早期移交测试随被退役的契约删除，不能充当新版验收。资源测试使用真实独立进程组，进程表为注入快照。不宣称真实模型、完整系统进程表、桌面端到端、合入或发布验收。
 

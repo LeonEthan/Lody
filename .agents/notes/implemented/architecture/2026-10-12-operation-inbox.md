@@ -95,17 +95,16 @@ upstream Session/ACP/history migration completion is not expanded.
 
 ## Verification and remaining limits
 
-Author validation uses a separate source copy with pinned dependencies and matching changed-source bytes, not an independent base/head review. These scopes overlap and must not be added; earlier complete matrices remain in Git history.
+Author validation now includes installation and checks in the actual author worktree: Node 24.21.0, pnpm 10.20.0 and locked Effect 4.0.2. `pnpm install --frozen-lockfile` succeeds without changing the lockfile. The install guard permits this checkout; the earlier assumption that it was a nested workspace was incorrect. Earlier isolated-copy results remain historical evidence, not an independent base/head review. Overlapping scopes must not be added.
 
 | Scope | Current implementation evidence |
 | --- | --- |
-| Native orchestration intersection | 7 suites, 416 passed after merging main `09407b3b7`: actual Coordinator/Mirror, execution service, Fleet automatic retry, SQLite, Inbox and native presence |
-| Admission ablation | Both deterministic competition positions fail when the submission lock is removed in the isolated copy, and pass when restored; unknown-submission non-replay assertions retained |
+| Author-worktree intersection | 7 suites, 569 passed: Coordinator, progress feedback, Inbox, execution service, Operation store, Session commands and dispatch watcher |
+| Admission ablation | Earlier isolated-copy tests fail at both deterministic competition positions when the submission lock is removed, and pass when restored; unknown-submission non-replay assertions retained |
 | SQLite / ownership | Shared in-memory completion transaction, rollback and asynchronous-callback rejection; disk reopen, actual release and shared-close recovery behavior retained |
-| Types / static / format | Root types and lint, format and check:quick pass; extended guard forbids concrete I/O and nested runtime access in the native core |
-| pnpm check | Attempted, not green: sandbox process/port failures and recursive termination at e2ee-core with no test files. Before the main merge, unsandboxed CLI reports 4087 passed, 4 skipped and one failure in unchanged Git transport (`context_unreadable` / remote helper aborted); no independent baseline or full-root acceptance claim |
-| Documentation | Current author docs check passes; earlier 82 broken-link errors are historical (the previously absent submodule source files are now present) |
-
+| Types / static / format | Author-worktree root type checks, lint, format and check:quick pass; native core boundaries checked |
+| pnpm check | Author-worktree run is not green: types and lint pass; CLI reports 4106 passed, 4 skipped and one Git transport failure (`context_unreadable` / remote helper aborted). Both transport source and test are unchanged from main. No independent baseline reproduction; recursive termination prevents a full-root test acceptance claim |
+| Documentation | Author docs check passes; earlier 82 broken-link errors are historical (the previously absent submodule source files are now present) |
 
 Tests observe full provider inputs, durable rows and actual release with Deferred, injected clocks, fake timers and failure triggers. They cover eight-result batching, empty boundaries, late ninth results, event-free restart, paused/unknown non-replay, and current scheduler ownership/resource release. Earlier legacy-fixture handoff tests were retired with their contract and are not v2 acceptance. Resource tests use real independent process groups with injected process-table snapshots. No live model, complete system process-table, desktop end-to-end, merge or release acceptance is claimed.
 
