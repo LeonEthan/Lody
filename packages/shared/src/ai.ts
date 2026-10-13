@@ -954,7 +954,7 @@ const CLAUDE_STATIC_MODELS: StaticBuiltinAcpCapabilities['models'] = [
   {
     modelId: 'haiku',
     name: 'Haiku',
-    description: 'Haiku 4.5 · Fastest for quick answers',
+    description: 'Haiku 5.5 · Fastest for quick answers',
   },
 ];
 
