@@ -67,6 +67,14 @@ Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮�
 
 重建锁文件随后被现有七日发布年龄门槛阻止。34 个候选 artifact 的 registry integrity 均已与 main 子模块的已提交锁文件一致性核对，实际只有 11 项需要例外：ACP SDK 1.8.0，Claude Agent SDK 0.3.293 及八个平台 artifact，Anthropic SDK 0.132.1。提案只添加精确版本、保留通用门槛。自动审批以未获得明确供应链例外授权为由拒绝了应用；尚未修改例外或锁文件，修复等待用户决定。已尝试 pnpm check，但 Claude adapter 对旧已安装 SDK 编译失败，不能作为升级后依赖图的验证；docs 和 format 通过。另修复两个被上游移动的 Codex 测试证据链接，不改变 Spec 意图或批准状态。这些运行是安装失败，不是 Inbox 测试失败，也不能作为桌面验收证据。
 
+## 当前提交本地验证（2026-10-13）
+
+在 `58d2e34b3` 上，16 个 suite、371 项测试通过：Inbox、Coordinator、Operation store 和 dispatch watcher 共 204 项；竞争模型、进度和 MCP 共 107 项；shared 控制文档、协议和前向兼容共 23 项；组件控制文档、发送资源、派发状态及持久用户发送共 37 项。真实 Host socket／资源测试在沙盒禁止 socket 后，已在沙盒外重跑。CLI、shared、components 的直接类型检查及根 `check:quick` 通过，使用的是现有已安装依赖，不能证明 main 升级后的 ACP 依赖能全新安装并通过验收。
+
+Session execution 和 Fleet suite 在导入时失败：main 的 Codex adapter 声明 `@openai/codex` 0.160.1，但已提交运行时清单仍为 0.159.2。base `567afa18d` 也包含同一清单；仅重新安装无法修复这项源码契约不一致。根 `pnpm check` 还在使用旧已安装 SDK 编译新 Claude 源码时失败。没有绕过运行时校验；桌面构建／smoke 与当前提交完整验收仍被阻塞。
+
+Inbox 调度和 SQLite 是机器本地状态，但输入准入还消费同步的 Session 文档字段 `humanInputReceipts`、`cancelRequest`、metadata 取消标记，以及客户端到机器的 RPC。因此，本地调度不代表没有客户端／CLI 混合版本边界。现有 Stop 协商与 Operation 保留行为未改；本次未扩大做旧客户端二进制或整机升级验收，已有 SQLite 升级回归包含在 Operation store suite 中。
+
 ## 验证与剩余边界
 
 ACP base 升级前（head `86553a65e`）已在作者工作树实际安装和检查：Node 24.21.0、pnpm 10.20.0、锁定 Effect 4.0.2。`pnpm install --frozen-lockfile` 成功，锁文件未变。安装 guard 允许此 checkout，之前把它当成嵌套工作区是不准确的。先前隔离副本结果只保留为历史证据，不是独立 base/head 审核；重叠范围不能累加。

@@ -132,6 +132,32 @@ The fix remains pending that decision. `pnpm check` was attempted and stops in C
 without changing Spec intent or approval. These runs are installation failures, not
 Inbox test failures or desktop acceptance evidence.
 
+## Current-head local verification (2026-10-13)
+
+At `58d2e34b3`, local validation passes 371 tests across 16 suites: 204 in Inbox,
+Coordinator, Operation store and dispatch watcher; 107 in the race model, progress
+and MCP suites; 23 in shared control-plane/protocol/forward-compatibility suites;
+and 37 in component control-plane, send resources, dispatch state and durable human
+send suites. Real Host socket/resource tests were rerun outside the sandbox after
+sandbox socket denial. Direct CLI, shared and component type checks and root
+`check:quick` pass with the existing installed dependency graph. These results do
+not validate a fresh installation of main's upgraded ACP dependencies.
+
+Session execution and Fleet suites fail during import: main's Codex adapter declares
+`@openai/codex` 0.160.1, while the committed runtime manifest remains 0.159.2. The
+same manifest is present on base `567afa18d`; fresh installation alone cannot fix
+that source contract mismatch. Root `pnpm check` also stops compiling the upgraded
+Claude source against the old installed SDK. No runtime guard was bypassed; desktop
+build/smoke and complete current-head acceptance remain blocked.
+
+Inbox scheduling and its SQLite database are machine-local. Input admission also
+consumes synchronized Session document fields (`humanInputReceipts`, `cancelRequest`
+and the metadata cancellation marker), plus client-to-machine RPC. Therefore local
+scheduling does not eliminate mixed client/CLI compatibility. Existing negotiated
+Stop behavior and preserved Operation rows remain unchanged; no broader old-client
+binary or full-machine upgrade validation was performed in this run. The existing
+SQLite upgrade regression is included in the Operation store suite.
+
 ## Verification and remaining limits
 
 Before the ACP base upgrade (head `86553a65e`), author validation included installation and checks in the actual author worktree: Node 24.21.0, pnpm 10.20.0 and locked Effect 4.0.2. `pnpm install --frozen-lockfile` succeeds without changing the lockfile. The install guard permits this checkout; the earlier assumption that it was a nested workspace was incorrect. Earlier isolated-copy results remain historical evidence, not an independent base/head review. Overlapping scopes must not be added.
