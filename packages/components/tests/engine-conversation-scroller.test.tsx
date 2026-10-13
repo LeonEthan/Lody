@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act, createRef, StrictMode, useState, type ReactElement } from 'react';
+import { act, Component, createRef, StrictMode, useState, type ReactElement } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { SessionId } from '@lody/shared';
@@ -9,9 +9,35 @@ import type {
   ConversationRowComponentProps,
   ConversationScrollerState,
 } from '../src/components/ai-gui/conversation-list/types';
-import { clearSavedScrollStates } from '../src/lib/conversation-scroll/saved-state';
+import {
+  clearSavedScrollStates,
+  getScrollEngineDiagnostics,
+} from '../src/lib/conversation-scroll/saved-state';
 import type { EngineRow } from '../src/lib/conversation-scroll/types';
 import { createFrameHarness, type FrameHarness } from './support/scroll-frame-harness';
+
+class RecoveryBoundary extends Component<
+  { children: ReactElement },
+  { error: Error | null; retry: number }
+> {
+  override state = { error: null as Error | null, retry: 0 };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  override render() {
+    if (this.state.error) {
+      return (
+        <button
+          data-loop-error={this.state.error.name}
+          onClick={() => this.setState(({ retry }) => ({ error: null, retry: retry + 1 }))}
+        >
+          Retry
+        </button>
+      );
+    }
+    return <StrictMode key={this.state.retry}>{this.props.children}</StrictMode>;
+  }
+}
 
 /**
  * The engine's React adapter under browser-ordered scroll events and
@@ -86,6 +112,7 @@ function mount(
     scaledRects = false,
     feedback = false,
     tickOnScroll = false,
+    oscillatingFeedback,
   }: {
     strict?: boolean;
     suppress?: { current: boolean };
@@ -97,12 +124,14 @@ function mount(
     feedback?: boolean;
     /** A view that setStates on every onScroll, like the top-fade flag. */
     tickOnScroll?: boolean;
+    oscillatingFeedback?: { current: boolean };
   } = {}
 ): Ctx {
   let keys = initialKeys;
   const px = (value: string | undefined) => parseFloat(value ?? '0') || 0;
   const isHidden = () => hidden?.current === true;
-  const harness =
+  let attached: HTMLDivElement | null = null;
+  const harness: FrameHarness =
     harnessToReuse ??
     createFrameHarness({
       viewportHeight: () => (isHidden() ? 0 : VIEWPORT),
@@ -121,6 +150,16 @@ function mount(
       },
       rectOf: (element, scrollTop) => {
         const el = element as HTMLElement;
+        // Retry can restore fully measured rows without a supplementary commit.
+        // Give that new DOM node browser geometry before its first layout effect,
+        // rather than installing it later through the parent's state notification.
+        if (oscillatingFeedback) {
+          const viewport = el.closest<HTMLDivElement>('[data-message-selection-scroll]');
+          if (viewport && viewport !== attached) {
+            attached = viewport;
+            harness.attachViewport(viewport);
+          }
+        }
         if (isHidden()) return { top: 0, height: 0 };
         if (el.hasAttribute('data-message-selection-scroll')) return { top: 0, height: VIEWPORT };
         if (
@@ -138,11 +177,10 @@ function mount(
   const root = createRoot(host);
   const handle = createRef<ConversationListHandle>() as { current: ConversationListHandle | null };
   const state: Ctx['state'] = { current: null };
-  let attached = false;
   const onStateChange = (next: ConversationScrollerState) => {
     state.current = next;
-    if (next.scrollElement && !attached) {
-      attached = true;
+    if (next.scrollElement && next.scrollElement !== attached) {
+      attached = next.scrollElement;
       harness.attachViewport(next.scrollElement);
     }
   };
@@ -169,6 +207,7 @@ function mount(
           scrolls.push(offset);
           if (feedback && offset === 0) setFlipped((value) => !value);
           if (tickOnScroll) setTick((n) => n + 1);
+          if (oscillatingFeedback?.current) setFlipped((value) => !value);
         }}
         suppressAutoScrollRef={suppress}
         onStateChange={onStateChange}
@@ -180,7 +219,15 @@ function mount(
   }
   const render = () => {
     const list = <List listKeys={keys} />;
-    root.render(strict ? <StrictMode>{list}</StrictMode> : list);
+    root.render(
+      oscillatingFeedback ? (
+        <RecoveryBoundary>{list}</RecoveryBoundary>
+      ) : strict ? (
+        <StrictMode>{list}</StrictMode>
+      ) : (
+        list
+      )
+    );
   };
   act(render);
   return {
@@ -797,5 +844,42 @@ it('a view that setStates on every onScroll does not nested-update-loop', async 
     expect(ctx.scrolls.length).toBeLessThan(20);
   } finally {
     unmount(ctx);
+  }
+});
+
+it('stops alternating scroll feedback at the boundary and recovers on explicit retry', async () => {
+  const oscillatingFeedback = { current: true };
+  const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+  const ctx = mount(
+    'engine-loop-recovery' as SessionId,
+    Array.from({ length: 40 }, (_, i) => `r${i}`),
+    undefined,
+    { oscillatingFeedback }
+  );
+  try {
+    await ctx.settle();
+    const retry = ctx.host.querySelector<HTMLButtonElement>('[data-loop-error]');
+    expect(retry?.dataset.loopError).toBe('ConversationScrollUpdateLoopError');
+    expect(getScrollEngineDiagnostics().at(-1)).toMatchObject({
+      reason: 'update-loop',
+      synchronousCommits: 25,
+    });
+    expect(ctx.host.querySelector('[data-conversation-scroll-engine]')).toBeNull();
+    oscillatingFeedback.current = false;
+    await act(async () => retry!.click());
+    await ctx.settle();
+    expect(ctx.host.querySelector('[data-loop-error]')).toBeNull();
+    expect(ctx.host.querySelector('[data-conversation-scroll-engine]')).not.toBeNull();
+    expect(ctx.state.current?.revealed).toBe(true);
+    expect(getScrollEngineDiagnostics().at(-1)?.covered).toBe(true);
+    const offset = ctx.harness.scrollTop;
+    const firstIndex = ctx.handle.current!.findItemIndex(offset);
+    expect(ctx.host.querySelector(`[data-virtual-index="${firstIndex}"]`)).not.toBeNull();
+    ctx.setKeys(Array.from({ length: 40 }, (_, i) => `r${i}`));
+    await ctx.settle();
+    expect(ctx.harness.scrollTop).toBe(offset);
+  } finally {
+    unmount(ctx);
+    log.mockRestore();
   }
 });

@@ -57,6 +57,8 @@ Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮�
 
 本次交集 4 suites／339 项通过，包含七个原生 Cause＋真实 SQLite 状态用例；覆盖组合失败、deadline 结算、进度降级与中断传播。共享关闭失败／独立恢复测试改为走生产执行 owner，仍验证原失败回执和不重发。此交集与前述结果重叠，不能累加；不扩大上游 Session／ACP／历史迁移完成声明。
 
+合并 base `0b46cc2d8e33c6feafd08c00f51089456ab1e732`，不改写 PR 历史。冲突解决同时保留主分支可复用 Effect 函数转换及 lint 安装／检查脚本，以及 Inbox 准入与不重发、准确输入通知归属、sandbox 恢复 roots。解决后执行、sandbox、Coordinator 与 Inbox 六个 suite 共 391 项通过。全仓类型、lint（含 Effect lint）、format、quick 边界及文档检查通过；完整 CLI 测试 4137 通过、4 跳过，仍有合并前已观察到的同一 Git transport 失败，全仓检查未完整通过。
+
 ## 验证与剩余边界
 
 本次已在作者工作树实际安装和检查：Node 24.21.0、pnpm 10.20.0、锁定 Effect 4.0.2。`pnpm install --frozen-lockfile` 成功，锁文件未变。安装 guard 允许此 checkout，之前把它当成嵌套工作区是不准确的。先前隔离副本结果只保留为历史证据，不是独立 base/head 审核；重叠范围不能累加。
@@ -67,7 +69,7 @@ Agent 发起的 turn 结束后不发送用户完成通知。收尾读取本轮�
 | 准入反证 | 此前隔离副本的两个确定性竞争位置：移除提交锁均失败，恢复后均通过；保留未知提交禁止重发断言 |
 | SQLite／所有权 | 内存共享连接的完成事务、失败回滚、异步事务拒绝；磁盘重开、资源释放和共享关闭恢复沿用行为覆盖 |
 | 类型／静态／格式 | 作者工作树全仓类型检查、lint、format、check:quick 通过，原生内核边界检查通过 |
-| pnpm check | 作者工作树实跑未全绿：类型与 lint 通过；CLI 4106 通过、4 跳过、1 项 Git transport 失败（context_unreadable／remote helper aborted）。transport 源码和测试均未相对 main 改动；未独立复现基线，递归检查终止，不能宣称全仓测试通过 |
+| pnpm check | 作者工作树实跑未全绿：类型与 lint 通过；CLI 4137 通过、4 跳过、1 项 Git transport 失败（context_unreadable／remote helper aborted）。transport 源码和测试均未相对 main 改动；未独立复现基线，递归检查终止，不能宣称全仓测试通过 |
 | 文档 | 作者环境 docs check 通过；此前 82 项缺失链接为历史结果，原先缺失的子模块源码现已存在 |
 
 CLI 默认编辑器项目现已收录源码与测试，让两者共享 `@/*` 别名；生产类型检查明确使用 `tsconfig.typecheck.json`，保留原排除范围。实际 TypeScript language server 探针确认 src 内测试和 tests 目录文件都进入配置项目并正确解析 timeout-utils，不宣称修复其他测试类型错误。两个测试清理入口补齐等待 Coordinator 关闭后再关闭 SQLite，相关 144 项通过。全仓类型、lint、format、quick 边界及文档检查通过；全仓检查仍被下述同一 Git transport 失败终止。

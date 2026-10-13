@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { ScrollSim, turnRows, type SimRow } from './support/scroll-engine-sim';
+import {
+  ConversationScrollUpdateLoopError,
+  MAX_SYNCHRONOUS_SCROLL_COMMITS,
+} from '../src/lib/conversation-scroll/controller';
 
 /**
  * Model tests of the conversation scroll engine's transaction logic
@@ -624,6 +628,51 @@ describe('commands', () => {
 });
 
 describe('onScroll must not re-enter a cycle (React #185)', () => {
+  it('bounds transaction restarts caused by changing row keys and records the failure', () => {
+    const first = turnRows(
+      40,
+      () => 100,
+      () => 60,
+      'first'
+    );
+    class OscillatingSim extends ScrollSim {
+      private generation = 0;
+      override requestCommit() {
+        this.rows = turnRows(
+          40,
+          () => 100,
+          () => 60,
+          `restart-${this.generation++}-`
+        );
+        super.requestCommit();
+      }
+    }
+    const diagnostics: string[] = [];
+    const sim = new OscillatingSim(first, V, {
+      callbacks: {
+        onDiagnostic: (entry) => diagnostics.push(entry.reason),
+      },
+    });
+    expect(() => sim.render()).toThrow(ConversationScrollUpdateLoopError);
+    expect(sim.commits).toBe(MAX_SYNCHRONOUS_SCROLL_COMMITS + 1);
+    expect(diagnostics.at(-1)).toBe('update-loop');
+    const writes = sim.writes.length;
+    expect(() => sim.render(first)).toThrow(ConversationScrollUpdateLoopError);
+    expect(sim.writes.length).toBe(writes);
+  });
+
+  it('does not accumulate a synchronous budget across independent updates', () => {
+    const sim = new ScrollSim(
+      turnRows(40, () => 100),
+      V
+    );
+    for (let i = 0; i < MAX_SYNCHRONOUS_SCROLL_COMMITS * 2; i += 1) {
+      sim.render(turnRows(40, () => 100 + i));
+      sim.settle();
+      expectHealthy(sim);
+    }
+  });
+
   it('a consumer that re-commits from onScroll settles instead of looping', () => {
     const rows = turnRows(40, () => 100);
     const sim = new ScrollSim(rows, V);

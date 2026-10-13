@@ -351,42 +351,41 @@ const pollWithin = <A, E>(
  * same Deferred instead of interrupting the wait, so it also holds inside a
  * finalizer; a taskkill still running afterwards is killed.
  */
-const runTaskkill = (np: NodeProcessApi, args: readonly string[]) =>
-  Effect.gen(function* () {
-    const done = yield* Deferred.make<number | null, unknown>();
-    const taskkill = yield* Effect.try({
-      try: () => {
-        const spawned = np.spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
-        spawned.once('close', (code: number | null) =>
-          Deferred.doneUnsafe(done, Effect.succeed(code))
-        );
-        spawned.once('error', (error: Error) => Deferred.doneUnsafe(done, Effect.fail(error)));
-        return spawned;
-      },
-      catch: (cause) => cause,
-    });
-    const deadline = yield* Effect.forkDetach(
-      Effect.interruptible(
-        Effect.andThen(
-          Effect.sleep(TASKKILL_DEADLINE),
-          Deferred.fail(
-            done,
-            new Error(`taskkill did not finish within ${Duration.format(TASKKILL_DEADLINE)}`)
-          )
-        )
-      )
-    );
-    return yield* Deferred.await(done).pipe(
-      Effect.ensuring(
-        Effect.andThen(
-          Fiber.interrupt(deadline),
-          Effect.sync(() => {
-            if (!hasExited(taskkill)) taskkill.kill();
-          })
-        )
-      )
-    );
+const runTaskkill = Effect.fnUntraced(function* (np: NodeProcessApi, args: readonly string[]) {
+  const done = yield* Deferred.make<number | null, unknown>();
+  const taskkill = yield* Effect.try({
+    try: () => {
+      const spawned = np.spawn('taskkill', args, { stdio: 'ignore', windowsHide: true });
+      spawned.once('close', (code: number | null) =>
+        Deferred.doneUnsafe(done, Effect.succeed(code))
+      );
+      spawned.once('error', (error: Error) => Deferred.doneUnsafe(done, Effect.fail(error)));
+      return spawned;
+    },
+    catch: (cause) => cause,
   });
+  const deadline = yield* Effect.forkDetach(
+    Effect.interruptible(
+      Effect.andThen(
+        Effect.sleep(TASKKILL_DEADLINE),
+        Deferred.fail(
+          done,
+          new Error(`taskkill did not finish within ${Duration.format(TASKKILL_DEADLINE)}`)
+        )
+      )
+    )
+  );
+  return yield* Deferred.await(done).pipe(
+    Effect.ensuring(
+      Effect.andThen(
+        Fiber.interrupt(deadline),
+        Effect.sync(() => {
+          if (!hasExited(taskkill)) taskkill.kill();
+        })
+      )
+    )
+  );
+});
 
 /**
  * `taskkill /T` walks the tree from the root at call time. A descendant whose
@@ -453,40 +452,39 @@ export const waitUntilGone = (
  * SIGTERM, bounded grace, SIGKILL, bounded wait. Succeeds only once the whole
  * tree is proven gone; otherwise fails with `TerminationFailed`.
  */
-export const terminateTree = (
+export const terminateTree = Effect.fnUntraced(function* (
   tree: ProcessTree,
   policy: TerminationPolicy
-): Effect.Effect<void, TerminationFailed> =>
-  Effect.gen(function* () {
-    if (!(yield* tree.isAlive)) return;
+): Effect.fn.Return<void, TerminationFailed> {
+  if (!(yield* tree.isAlive)) return;
 
-    if (policy.graceMs > 0) {
-      const graceful = yield* Effect.result(tree.signal(policy.gracefulSignal ?? 'SIGTERM'));
-      if (Result.isSuccess(graceful)) {
-        if (graceful.success === 'gone') return;
-        if (yield* waitUntilGone(tree, Duration.millis(policy.graceMs))) return;
-        yield* Effect.logDebug(
-          `${tree.description} still running ${policy.graceMs}ms after SIGTERM; escalating to SIGKILL`
-        );
-      } else {
-        // A tree that cannot take SIGTERM (a Windows console app refusing a
-        // graceful taskkill) gains nothing from waiting out the grace period.
-        yield* Effect.logDebug(
-          `SIGTERM was not delivered to ${tree.description}; escalating to SIGKILL: ${graceful.failure.message}`
-        );
-      }
+  if (policy.graceMs > 0) {
+    const graceful = yield* Effect.result(tree.signal(policy.gracefulSignal ?? 'SIGTERM'));
+    if (Result.isSuccess(graceful)) {
+      if (graceful.success === 'gone') return;
+      if (yield* waitUntilGone(tree, Duration.millis(policy.graceMs))) return;
+      yield* Effect.logDebug(
+        `${tree.description} still running ${policy.graceMs}ms after SIGTERM; escalating to SIGKILL`
+      );
+    } else {
+      // A tree that cannot take SIGTERM (a Windows console app refusing a
+      // graceful taskkill) gains nothing from waiting out the grace period.
+      yield* Effect.logDebug(
+        `SIGTERM was not delivered to ${tree.description}; escalating to SIGKILL: ${graceful.failure.message}`
+      );
     }
+  }
 
-    if ((yield* tree.signal('SIGKILL')) === 'gone') return;
-    if (yield* waitUntilGone(tree, Duration.millis(policy.killWaitMs))) return;
-    yield* Effect.fail(
-      new TerminationFailed({
-        target: tree.description,
-        reason: 'still-alive',
-        message: `${tree.description} was still running ${policy.killWaitMs}ms after SIGKILL`,
-      })
-    );
-  });
+  if ((yield* tree.signal('SIGKILL')) === 'gone') return;
+  if (yield* waitUntilGone(tree, Duration.millis(policy.killWaitMs))) return;
+  yield* Effect.fail(
+    new TerminationFailed({
+      target: tree.description,
+      reason: 'still-alive',
+      message: `${tree.description} was still running ${policy.killWaitMs}ms after SIGKILL`,
+    })
+  );
+});
 
 // ---- managed-process ------------------------------------------
 
@@ -625,73 +623,74 @@ export const squashProcessFailure = <E>(cause: Cause.Cause<E>): unknown => {
 /**
  * Acquire the raw process for the scoped service and legacy manually owned entry point.
  */
-const acquireProcess = (spec: SpawnSpec): Effect.Effect<ManagedProcess, SpawnFailed, NodeProcess> =>
-  Effect.gen(function* () {
-    const np = yield* NodeProcess;
-    const processGroup = spec.processGroup && np.platform !== 'win32';
-    const exited = yield* Deferred.make<ProcessExit>();
-    const closed = yield* Deferred.make<ProcessExit>();
-    const started = yield* Deferred.make<number, SpawnFailed>();
-    const spawnFailed = (cause: unknown) =>
-      new SpawnFailed({
-        command: spec.command,
-        message: `Failed to spawn ${spec.command}: ${formatErrorMessage(cause)}`,
-        cause,
+const acquireProcess = Effect.fnUntraced(function* (
+  spec: SpawnSpec
+): Effect.fn.Return<ManagedProcess, SpawnFailed, NodeProcess> {
+  const np = yield* NodeProcess;
+  const processGroup = spec.processGroup && np.platform !== 'win32';
+  const exited = yield* Deferred.make<ProcessExit>();
+  const closed = yield* Deferred.make<ProcessExit>();
+  const started = yield* Deferred.make<number, SpawnFailed>();
+  const spawnFailed = (cause: unknown) =>
+    new SpawnFailed({
+      command: spec.command,
+      message: `Failed to spawn ${spec.command}: ${formatErrorMessage(cause)}`,
+      cause,
+    });
+  let setupFailure: SpawnFailed | undefined;
+  const child = yield* Effect.try({
+    try: () => {
+      const spawned = np.spawn(spec.command, spec.args, {
+        // The daemon runs without a console on Windows; without
+        // CREATE_NO_WINDOW every console child pops a window and steals focus.
+        windowsHide: true,
+        ...spec.options,
+        detached: np.platform === 'win32' ? spec.windowsDetached === true : processGroup,
       });
-    let setupFailure: SpawnFailed | undefined;
-    const child = yield* Effect.try({
-      try: () => {
-        const spawned = np.spawn(spec.command, spec.args, {
-          // The daemon runs without a console on Windows; without
-          // CREATE_NO_WINDOW every console child pops a window and steals focus.
-          windowsHide: true,
-          ...spec.options,
-          detached: np.platform === 'win32' ? spec.windowsDetached === true : processGroup,
-        });
-        // Subscribe before anything can yield: Node reports a failed spawn on
-        // the next tick, and a listener attached later would never hear it.
+      // Subscribe before anything can yield: Node reports a failed spawn on
+      // the next tick, and a listener attached later would never hear it.
+      if (typeof spawned.pid === 'number' && spawned.pid > 0) {
+        Deferred.doneUnsafe(started, Effect.succeed(spawned.pid));
+      }
+      spawned.once('spawn', () => {
         if (typeof spawned.pid === 'number' && spawned.pid > 0) {
           Deferred.doneUnsafe(started, Effect.succeed(spawned.pid));
         }
-        spawned.once('spawn', () => {
-          if (typeof spawned.pid === 'number' && spawned.pid > 0) {
-            Deferred.doneUnsafe(started, Effect.succeed(spawned.pid));
-          }
-        });
-        spawned.once('exit', (code, signal) => {
-          Deferred.doneUnsafe(exited, Effect.succeed({ code, signal }));
-        });
-        spawned.once('close', (code, signal) => {
-          Deferred.doneUnsafe(closed, Effect.succeed({ code, signal }));
-        });
-        spawned.once('error', (error) => {
-          // A spawn failure has no exit event; release anyone awaiting one.
-          if (typeof spawned.pid !== 'number') {
-            Deferred.doneUnsafe(started, Effect.fail(spawnFailed(error)));
-            Deferred.doneUnsafe(exited, Effect.succeed({ code: null, signal: null }));
-            Deferred.doneUnsafe(closed, Effect.succeed({ code: null, signal: null }));
-          }
-        });
-        try {
-          spec.onSpawned?.(spawned);
-        } catch (cause) {
-          setupFailure = spawnFailed(cause);
+      });
+      spawned.once('exit', (code, signal) => {
+        Deferred.doneUnsafe(exited, Effect.succeed({ code, signal }));
+      });
+      spawned.once('close', (code, signal) => {
+        Deferred.doneUnsafe(closed, Effect.succeed({ code, signal }));
+      });
+      spawned.once('error', (error) => {
+        // A spawn failure has no exit event; release anyone awaiting one.
+        if (typeof spawned.pid !== 'number') {
+          Deferred.doneUnsafe(started, Effect.fail(spawnFailed(error)));
+          Deferred.doneUnsafe(exited, Effect.succeed({ code: null, signal: null }));
+          Deferred.doneUnsafe(closed, Effect.succeed({ code: null, signal: null }));
         }
-        return spawned;
-      },
-      catch: spawnFailed,
-    });
-    const tree = yield* childProcessTree(child, { processGroup });
-    return {
-      child,
-      tree,
-      setupFailure,
-      started: Deferred.await(started),
-      exited: Deferred.await(exited),
-      closed: Deferred.await(closed),
-      terminate: (policy) => terminateTree(tree, policy),
-    } satisfies ManagedProcess;
+      });
+      try {
+        spec.onSpawned?.(spawned);
+      } catch (cause) {
+        setupFailure = spawnFailed(cause);
+      }
+      return spawned;
+    },
+    catch: spawnFailed,
   });
+  const tree = yield* childProcessTree(child, { processGroup });
+  return {
+    child,
+    tree,
+    setupFailure,
+    started: Deferred.await(started),
+    exited: Deferred.await(exited),
+    closed: Deferred.await(closed),
+    terminate: (policy) => terminateTree(tree, policy),
+  } satisfies ManagedProcess;
+});
 
 // The official service owns the scoped API and derives string/lines/stream helpers.
 // Lody's backend retains bounded tree termination, raw handles for ACP/IPC, and
@@ -720,195 +719,193 @@ const platformFailure = (method: string, cause: unknown) =>
   });
 
 const makeSpawner = (np: NodeProcessApi): ChildProcessSpawner.ChildProcessSpawner['Service'] => {
-  const spawnInScope = (
+  const spawnInScope = Effect.fnUntraced(function* (
     command: Command.Command
-  ): Effect.Effect<
+  ): Effect.fn.Return<
     ChildProcessSpawner.ChildProcessHandle,
     PlatformError.PlatformError,
     Scope.Scope
-  > =>
-    Effect.gen(function* () {
-      if (command._tag === 'PipedCommand') {
-        const left = yield* spawnCommand(command.left);
-        const source =
-          command.options.from === 'stderr'
-            ? left.stderr
-            : command.options.from === 'all'
-              ? left.all
-              : left.stdout;
-        if (
-          (command.options.to && command.options.to !== 'stdin') ||
-          command.options.from?.startsWith('fd')
-        ) {
-          return yield* Effect.fail(
-            PlatformError.badArgument({
-              module: 'ChildProcess',
-              method: 'pipe',
-              description:
-                'Additional file descriptor pipelines are not supported by the Lody backend',
-            })
-          );
-        }
-        if (command.right._tag !== 'StandardCommand') {
-          return yield* Effect.fail(
-            PlatformError.badArgument({
-              module: 'ChildProcess',
-              method: 'pipe',
-              description: 'Use a left-associated pipeline',
-            })
-          );
-        }
-        return yield* spawnCommand(
-          Command.make(command.right.command, command.right.args, {
-            ...command.right.options,
-            stdin: source,
-          })
-        );
-      }
-      const details = (command as ProcessCommand)[spawnDetails];
-      const options = command.options;
-      if (options.additionalFds && Object.keys(options.additionalFds).length > 0)
+  > {
+    if (command._tag === 'PipedCommand') {
+      const left = yield* spawnCommand(command.left);
+      const source =
+        command.options.from === 'stderr'
+          ? left.stderr
+          : command.options.from === 'all'
+            ? left.all
+            : left.stdout;
+      if (
+        (command.options.to && command.options.to !== 'stdin') ||
+        command.options.from?.startsWith('fd')
+      ) {
         return yield* Effect.fail(
           PlatformError.badArgument({
             module: 'ChildProcess',
-            method: 'spawn',
+            method: 'pipe',
             description:
-              'Additional file descriptors require the raw IPC compatibility entry point',
+              'Additional file descriptor pipelines are not supported by the Lody backend',
           })
-        );
-      const stdinConfig: Command.StdinConfig =
-        typeof options.stdin === 'object' && !Stream.isStream(options.stdin)
-          ? options.stdin
-          : { stream: options.stdin ?? 'pipe' };
-      const stdin = stdinConfig.stream;
-      const stdout =
-        typeof options.stdout === 'object' && !Sink.isSink(options.stdout)
-          ? options.stdout.stream
-          : options.stdout;
-      const stderr =
-        typeof options.stderr === 'object' && !Sink.isSink(options.stderr)
-          ? options.stderr.stream
-          : options.stderr;
-      const policy = details?.releasePolicy ?? {
-        gracefulSignal: options.killSignal as NodeJS.Signals | undefined,
-        graceMs:
-          options.killSignal === 'SIGKILL'
-            ? 0
-            : Duration.toMillis(Duration.fromInputUnsafe(options.forceKillAfter ?? '2 seconds')),
-        killWaitMs: 2_000,
-      };
-      const spec = details?.spec ?? {
-        command: command.command,
-        args: command.args,
-        options: {
-          cwd: options.cwd,
-          env: options.extendEnv ? { ...process.env, ...options.env } : options.env,
-          shell: options.shell,
-          windowsHide: options.windowsHide,
-          stdio: [
-            Stream.isStream(stdin) ? 'pipe' : (stdin ?? 'pipe'),
-            Sink.isSink(stdout) ? 'pipe' : (stdout ?? 'pipe'),
-            Sink.isSink(stderr) ? 'pipe' : (stderr ?? 'pipe'),
-          ],
-        },
-        processGroup: options.detached !== false,
-        windowsDetached: np.platform === 'win32' && options.detached === true,
-      };
-      let referenced = true;
-      const managed = yield* Effect.acquireRelease(
-        acquireProcess(spec).pipe(
-          Effect.provideService(NodeProcess, np),
-          Effect.mapError((error) => platformFailure('spawn', error))
-        ),
-        (resource, exit) =>
-          !referenced || (details?.preserveOnSuccess && Exit.isSuccess(exit))
-            ? Effect.void
-            : resource
-                .terminate(policy)
-                .pipe(
-                  Effect.catch((error) =>
-                    Effect.logWarning(
-                      `Scope release could not terminate ${error.target}: ${error.message}`
-                    ).pipe(
-                      Effect.ensuring(Effect.die(new ProcessReleaseFailed(resource, policy, error)))
-                    )
-                  )
-                )
-      );
-      // A start failure must release the acquired process before the caller sees it.
-      if (managed.setupFailure)
-        return yield* Effect.fail(platformFailure('spawn', managed.setupFailure));
-      const pid = yield* managed.started.pipe(
-        Effect.mapError((error) => platformFailure('spawn', error))
-      );
-      const read = (stream: NodeJS.ReadableStream | null) =>
-        stream
-          ? NodeStream.fromReadable<Uint8Array, PlatformError.PlatformError>({
-              evaluate: () => stream,
-              closeOnDone: false,
-              onError: (error) => platformFailure('read', error),
-            })
-          : Stream.empty;
-      const input = managed.child.stdin
-        ? NodeSink.fromWritable<PlatformError.PlatformError, Uint8Array>({
-            evaluate: () => managed.child.stdin!,
-            onError: (error) => platformFailure('write', error),
-            endOnDone: stdinConfig.endOnDone,
-            encoding: stdinConfig.encoding,
-          })
-        : Sink.drain;
-      const rawOut = read(managed.child.stdout);
-      const rawErr = read(managed.child.stderr);
-      const out = Sink.isSink(stdout) ? Stream.transduce(rawOut, stdout) : rawOut;
-      const err = Sink.isSink(stderr) ? Stream.transduce(rawErr, stderr) : rawErr;
-      const handle = ChildProcessSpawner.makeHandle({
-        pid: ChildProcessSpawner.ProcessId(pid),
-        stdin: input,
-        stdout: out,
-        stderr: err,
-        all: Stream.merge(out, err),
-        exitCode: Effect.flatMap(managed.exited, (exit) =>
-          exit.code !== null
-            ? Effect.succeed(ChildProcessSpawner.ExitCode(exit.code))
-            : Effect.fail(
-                platformFailure('exitCode', new Error(`Process exited with ${exit.signal}`))
-              )
-        ),
-        isRunning: managed.tree.isAlive.pipe(
-          Effect.mapError((error) => platformFailure('isRunning', error))
-        ),
-        kill: (killOptions) =>
-          managed
-            .terminate({
-              gracefulSignal: killOptions?.killSignal as NodeJS.Signals | undefined,
-              graceMs:
-                killOptions?.killSignal === 'SIGKILL'
-                  ? 0
-                  : Duration.toMillis(
-                      Duration.fromInputUnsafe(killOptions?.forceKillAfter ?? '2 seconds')
-                    ),
-              killWaitMs: 2_000,
-            })
-            .pipe(Effect.mapError((error) => platformFailure('kill', error))),
-        getInputFd: () => Sink.drain,
-        getOutputFd: () => Stream.empty,
-        unref: Effect.sync(() => {
-          managed.child.unref();
-          referenced = false;
-          return Effect.sync(() => {
-            managed.child.ref();
-            referenced = true;
-          });
-        }),
-      });
-      if (Stream.isStream(stdin)) {
-        yield* Stream.run(stdin, input).pipe(
-          Effect.catch(() => Effect.void),
-          Effect.forkScoped
         );
       }
-      return Object.assign(handle, { [processDetails]: managed });
+      if (command.right._tag !== 'StandardCommand') {
+        return yield* Effect.fail(
+          PlatformError.badArgument({
+            module: 'ChildProcess',
+            method: 'pipe',
+            description: 'Use a left-associated pipeline',
+          })
+        );
+      }
+      return yield* spawnCommand(
+        Command.make(command.right.command, command.right.args, {
+          ...command.right.options,
+          stdin: source,
+        })
+      );
+    }
+    const details = (command as ProcessCommand)[spawnDetails];
+    const options = command.options;
+    if (options.additionalFds && Object.keys(options.additionalFds).length > 0)
+      return yield* Effect.fail(
+        PlatformError.badArgument({
+          module: 'ChildProcess',
+          method: 'spawn',
+          description: 'Additional file descriptors require the raw IPC compatibility entry point',
+        })
+      );
+    const stdinConfig: Command.StdinConfig =
+      typeof options.stdin === 'object' && !Stream.isStream(options.stdin)
+        ? options.stdin
+        : { stream: options.stdin ?? 'pipe' };
+    const stdin = stdinConfig.stream;
+    const stdout =
+      typeof options.stdout === 'object' && !Sink.isSink(options.stdout)
+        ? options.stdout.stream
+        : options.stdout;
+    const stderr =
+      typeof options.stderr === 'object' && !Sink.isSink(options.stderr)
+        ? options.stderr.stream
+        : options.stderr;
+    const policy = details?.releasePolicy ?? {
+      gracefulSignal: options.killSignal as NodeJS.Signals | undefined,
+      graceMs:
+        options.killSignal === 'SIGKILL'
+          ? 0
+          : Duration.toMillis(Duration.fromInputUnsafe(options.forceKillAfter ?? '2 seconds')),
+      killWaitMs: 2_000,
+    };
+    const spec = details?.spec ?? {
+      command: command.command,
+      args: command.args,
+      options: {
+        cwd: options.cwd,
+        env: options.extendEnv ? { ...process.env, ...options.env } : options.env,
+        shell: options.shell,
+        windowsHide: options.windowsHide,
+        stdio: [
+          Stream.isStream(stdin) ? 'pipe' : (stdin ?? 'pipe'),
+          Sink.isSink(stdout) ? 'pipe' : (stdout ?? 'pipe'),
+          Sink.isSink(stderr) ? 'pipe' : (stderr ?? 'pipe'),
+        ],
+      },
+      processGroup: options.detached !== false,
+      windowsDetached: np.platform === 'win32' && options.detached === true,
+    };
+    let referenced = true;
+    const managed = yield* Effect.acquireRelease(
+      acquireProcess(spec).pipe(
+        Effect.provideService(NodeProcess, np),
+        Effect.mapError((error) => platformFailure('spawn', error))
+      ),
+      (resource, exit) =>
+        !referenced || (details?.preserveOnSuccess && Exit.isSuccess(exit))
+          ? Effect.void
+          : resource
+              .terminate(policy)
+              .pipe(
+                Effect.catch((error) =>
+                  Effect.logWarning(
+                    `Scope release could not terminate ${error.target}: ${error.message}`
+                  ).pipe(
+                    Effect.ensuring(Effect.die(new ProcessReleaseFailed(resource, policy, error)))
+                  )
+                )
+              )
+    );
+    // A start failure must release the acquired process before the caller sees it.
+    if (managed.setupFailure)
+      return yield* Effect.fail(platformFailure('spawn', managed.setupFailure));
+    const pid = yield* managed.started.pipe(
+      Effect.mapError((error) => platformFailure('spawn', error))
+    );
+    const read = (stream: NodeJS.ReadableStream | null) =>
+      stream
+        ? NodeStream.fromReadable<Uint8Array, PlatformError.PlatformError>({
+            evaluate: () => stream,
+            closeOnDone: false,
+            onError: (error) => platformFailure('read', error),
+          })
+        : Stream.empty;
+    const input = managed.child.stdin
+      ? NodeSink.fromWritable<PlatformError.PlatformError, Uint8Array>({
+          evaluate: () => managed.child.stdin!,
+          onError: (error) => platformFailure('write', error),
+          endOnDone: stdinConfig.endOnDone,
+          encoding: stdinConfig.encoding,
+        })
+      : Sink.drain;
+    const rawOut = read(managed.child.stdout);
+    const rawErr = read(managed.child.stderr);
+    const out = Sink.isSink(stdout) ? Stream.transduce(rawOut, stdout) : rawOut;
+    const err = Sink.isSink(stderr) ? Stream.transduce(rawErr, stderr) : rawErr;
+    const handle = ChildProcessSpawner.makeHandle({
+      pid: ChildProcessSpawner.ProcessId(pid),
+      stdin: input,
+      stdout: out,
+      stderr: err,
+      all: Stream.merge(out, err),
+      exitCode: Effect.flatMap(managed.exited, (exit) =>
+        exit.code !== null
+          ? Effect.succeed(ChildProcessSpawner.ExitCode(exit.code))
+          : Effect.fail(
+              platformFailure('exitCode', new Error(`Process exited with ${exit.signal}`))
+            )
+      ),
+      isRunning: managed.tree.isAlive.pipe(
+        Effect.mapError((error) => platformFailure('isRunning', error))
+      ),
+      kill: (killOptions) =>
+        managed
+          .terminate({
+            gracefulSignal: killOptions?.killSignal as NodeJS.Signals | undefined,
+            graceMs:
+              killOptions?.killSignal === 'SIGKILL'
+                ? 0
+                : Duration.toMillis(
+                    Duration.fromInputUnsafe(killOptions?.forceKillAfter ?? '2 seconds')
+                  ),
+            killWaitMs: 2_000,
+          })
+          .pipe(Effect.mapError((error) => platformFailure('kill', error))),
+      getInputFd: () => Sink.drain,
+      getOutputFd: () => Stream.empty,
+      unref: Effect.sync(() => {
+        managed.child.unref();
+        referenced = false;
+        return Effect.sync(() => {
+          managed.child.ref();
+          referenced = true;
+        });
+      }),
     });
+    if (Stream.isStream(stdin)) {
+      yield* Stream.run(stdin, input).pipe(
+        Effect.catch(() => Effect.void),
+        Effect.forkScoped
+      );
+    }
+    return Object.assign(handle, { [processDetails]: managed });
+  });
   const spawnCommand = (command: Command.Command) =>
     Effect.acquireUseRelease(
       Effect.flatMap(Effect.scope, Scope.fork),
@@ -960,41 +957,40 @@ const processCommand = (
 };
 
 /** A process always belongs to the caller's Scope; acquisition and release are atomic. */
-export const spawnProcess = (
+export const spawnProcess = Effect.fnUntraced(function* (
   spec: SpawnSpec,
   releasePolicy: TerminationPolicy = { graceMs: 2_000, killWaitMs: 2_000 }
-): Effect.Effect<
+): Effect.fn.Return<
   ManagedProcess,
   SpawnFailed,
   ChildProcessSpawner.ChildProcessSpawner | Scope.Scope
-> =>
-  Effect.gen(function* () {
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-    const handle = yield* spawner.spawn(processCommand(spec, releasePolicy)).pipe(
-      Effect.catchCause((cause) =>
-        Effect.failCause(
-          Cause.map(cause, (error) =>
-            error.cause instanceof SpawnFailed
-              ? error.cause
-              : new SpawnFailed({
-                  command: spec.command,
-                  message: error.message,
-                  cause: error.cause,
-                })
-          )
+> {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const handle = yield* spawner.spawn(processCommand(spec, releasePolicy)).pipe(
+    Effect.catchCause((cause) =>
+      Effect.failCause(
+        Cause.map(cause, (error) =>
+          error.cause instanceof SpawnFailed
+            ? error.cause
+            : new SpawnFailed({
+                command: spec.command,
+                message: error.message,
+                cause: error.cause,
+              })
         )
       )
+    )
+  );
+  if (!(processDetails in handle))
+    return yield* Effect.fail(
+      new SpawnFailed({
+        command: spec.command,
+        message: 'Raw process handles require the Lody process backend',
+        cause: null,
+      })
     );
-    if (!(processDetails in handle))
-      return yield* Effect.fail(
-        new SpawnFailed({
-          command: spec.command,
-          message: 'Raw process handles require the Lody process backend',
-          cause: null,
-        })
-      );
-    return (handle as ProcessHandleWithDetails)[processDetails];
-  });
+  return (handle as ProcessHandleWithDetails)[processDetails];
+});
 
 // ---- command --------------------------------------------------
 
@@ -1124,36 +1120,37 @@ export const runCommand = (
           )
         )
       );
-      const collect = (stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>) =>
-        Effect.gen(function* () {
-          let bytes = 0;
-          const chunks: Buffer[] = [];
-          yield* Stream.runForEach(stream, (chunk) =>
-            Effect.suspend(() => {
-              bytes += chunk.byteLength;
-              if (bytes > maxBytes)
-                return Effect.fail(
-                  new CommandOutputTooLarge({
-                    command: spec.command,
-                    message: `${describe(spec)} wrote more than ${maxBytes} bytes to one stream`,
-                  })
-                );
-              chunks.push(Buffer.from(chunk));
-              return Effect.void;
-            })
-          ).pipe(
-            Effect.mapError((error) =>
-              error instanceof CommandOutputTooLarge
-                ? error
-                : new CommandIoFailed({
-                    command: spec.command,
-                    message: error.message,
-                    cause: error,
-                  })
-            )
-          );
-          return Buffer.concat(chunks);
-        });
+      const collect = Effect.fnUntraced(function* (
+        stream: Stream.Stream<Uint8Array, PlatformError.PlatformError>
+      ) {
+        let bytes = 0;
+        const chunks: Buffer[] = [];
+        yield* Stream.runForEach(stream, (chunk) =>
+          Effect.suspend(() => {
+            bytes += chunk.byteLength;
+            if (bytes > maxBytes)
+              return Effect.fail(
+                new CommandOutputTooLarge({
+                  command: spec.command,
+                  message: `${describe(spec)} wrote more than ${maxBytes} bytes to one stream`,
+                })
+              );
+            chunks.push(Buffer.from(chunk));
+            return Effect.void;
+          })
+        ).pipe(
+          Effect.mapError((error) =>
+            error instanceof CommandOutputTooLarge
+              ? error
+              : new CommandIoFailed({
+                  command: spec.command,
+                  message: error.message,
+                  cause: error,
+                })
+          )
+        );
+        return Buffer.concat(chunks);
+      });
       if (spec.input !== undefined) {
         yield* Stream.run(
           Stream.make(Buffer.isBuffer(spec.input) ? spec.input : Buffer.from(spec.input)),
@@ -1230,55 +1227,54 @@ export const runCommandOk = (
  * daemon's event loop for the command's whole run, so it requires a timeout;
  * prefer `runCommand` wherever the caller can await.
  */
-export const runCommandSync = (
+export const runCommandSync = Effect.fnUntraced(function* (
   spec: CommandSpec & { readonly timeout: Duration.Input }
-): Effect.Effect<CommandOutput, RunCommandError, NodeProcess> =>
-  Effect.gen(function* () {
-    const np = yield* NodeProcess;
-    const timeoutMs = Duration.toMillis(Duration.fromInputUnsafe(spec.timeout));
-    const result = np.spawnSync(spec.command, spec.args, {
-      cwd: spec.cwd,
-      env: spec.env,
-      input: spec.input,
-      timeout: timeoutMs,
-      killSignal: 'SIGKILL',
-      maxBuffer: spec.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
-      windowsHide: true,
-      stdio: [spec.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
-    });
-    const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
-    if (errorCode === 'ETIMEDOUT') {
-      return yield* Effect.fail(
-        new CommandTimedOut({
-          command: spec.command,
-          message: `${describe(spec)} did not finish within ${timeoutMs}ms`,
-        })
-      );
-    }
-    if (errorCode === 'ENOBUFS') {
-      return yield* Effect.fail(
-        new CommandOutputTooLarge({
-          command: spec.command,
-          message: `${describe(spec)} wrote more than its output limit`,
-        })
-      );
-    }
-    if (result.error) {
-      return yield* Effect.fail(
-        new SpawnFailed({
-          command: spec.command,
-          message: `Failed to spawn ${spec.command}: ${formatErrorMessage(result.error)}`,
-          cause: result.error,
-        })
-      );
-    }
-    return {
-      code: result.status,
-      signal: result.signal,
-      stdout: result.stdout ?? Buffer.alloc(0),
-      stderr: result.stderr ?? Buffer.alloc(0),
-    };
+): Effect.fn.Return<CommandOutput, RunCommandError, NodeProcess> {
+  const np = yield* NodeProcess;
+  const timeoutMs = Duration.toMillis(Duration.fromInputUnsafe(spec.timeout));
+  const result = np.spawnSync(spec.command, spec.args, {
+    cwd: spec.cwd,
+    env: spec.env,
+    input: spec.input,
+    timeout: timeoutMs,
+    killSignal: 'SIGKILL',
+    maxBuffer: spec.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES,
+    windowsHide: true,
+    stdio: [spec.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
   });
+  const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code;
+  if (errorCode === 'ETIMEDOUT') {
+    return yield* Effect.fail(
+      new CommandTimedOut({
+        command: spec.command,
+        message: `${describe(spec)} did not finish within ${timeoutMs}ms`,
+      })
+    );
+  }
+  if (errorCode === 'ENOBUFS') {
+    return yield* Effect.fail(
+      new CommandOutputTooLarge({
+        command: spec.command,
+        message: `${describe(spec)} wrote more than its output limit`,
+      })
+    );
+  }
+  if (result.error) {
+    return yield* Effect.fail(
+      new SpawnFailed({
+        command: spec.command,
+        message: `Failed to spawn ${spec.command}: ${formatErrorMessage(result.error)}`,
+        cause: result.error,
+      })
+    );
+  }
+  return {
+    code: result.status,
+    signal: result.signal,
+    stdout: result.stdout ?? Buffer.alloc(0),
+    stderr: result.stderr ?? Buffer.alloc(0),
+  };
+});
 
 /** `runCommandSync`, failing with `CommandFailed` unless the command exits 0. */
 export const runCommandSyncOk = (

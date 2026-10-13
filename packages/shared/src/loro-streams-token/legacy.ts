@@ -85,12 +85,13 @@ export function createLoroStreamsTokenProviderLegacy(
   let closeReceipt: Promise<void> | undefined;
   let closing = false;
   const invalidations = new Set<Fiber.Fiber<void>>();
-  const program = <A, E>(operation: (tokens: LoroStreamsTokenProvider) => Effect.Effect<A, E>) =>
-    Effect.gen(function* () {
-      const tokens = yield* LoroStreamsTokens;
-      provider = tokens;
-      return yield* operation(tokens);
-    });
+  const program = Effect.fnUntraced(function* <A, E>(
+    operation: (tokens: LoroStreamsTokenProvider) => Effect.Effect<A, E>
+  ) {
+    const tokens = yield* LoroStreamsTokens;
+    provider = tokens;
+    return yield* operation(tokens);
+  });
   const run = <A, E>(
     operation: (tokens: LoroStreamsTokenProvider) => Effect.Effect<A, E>,
     signal?: AbortSignal

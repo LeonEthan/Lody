@@ -223,184 +223,183 @@ export class SessionActivePresence extends Context.Service<
   SessionActivePresenceService
 >()('lody/loro/SessionActivePresence') {}
 
-export const makeSessionActivePresence = (options: SessionActivePresenceOptions = {}) =>
-  Effect.gen(function* () {
-    const host = yield* SessionPresenceHost;
-    const clock = yield* Clock.Clock;
-    const parent = yield* Scope.Scope;
-    const active = new Map<SessionId, ActivePresenceState>();
-    let idle = yield* Deferred.make<void>();
-    yield* Deferred.succeed(idle, undefined);
-    let retired = false;
-    const now = () => clock.currentTimeMillisUnsafe();
+export const makeSessionActivePresence = Effect.fnUntraced(function* (
+  options: SessionActivePresenceOptions = {}
+) {
+  const host = yield* SessionPresenceHost;
+  const clock = yield* Clock.Clock;
+  const parent = yield* Scope.Scope;
+  const active = new Map<SessionId, ActivePresenceState>();
+  let idle = yield* Deferred.make<void>();
+  yield* Deferred.succeed(idle, undefined);
+  let retired = false;
+  const now = () => clock.currentTimeMillisUnsafe();
 
-    const tick = (sessionId: SessionId, state: ActivePresenceState): void => {
-      if (active.get(sessionId) !== state || state.closing || state.stallReported) return;
-      const status = phaseToStatus(state.phase, state.detail);
-      const nowMs = now();
-      const stage = initializingStageKey(status);
-      const budgetMs = stage
-        ? (options.stallBudgetsMs?.[stage] ?? DEFAULT_INITIALIZING_STALL_BUDGETS_MS[stage])
-        : 0;
-      const stalledMs = nowMs - state.lastProgressMs;
-      if (stage && stalledMs >= budgetMs) {
-        state.stallReported = true;
-        const stall = { stage, description: describeStage(status), stalledMs, budgetMs };
-        Deferred.doneUnsafe(state.stall, Effect.succeed(stall));
-        host.report({ kind: 'stall', sessionId, stall });
-        return;
+  const tick = (sessionId: SessionId, state: ActivePresenceState): void => {
+    if (active.get(sessionId) !== state || state.closing || state.stallReported) return;
+    const status = phaseToStatus(state.phase, state.detail);
+    const nowMs = now();
+    const stage = initializingStageKey(status);
+    const budgetMs = stage
+      ? (options.stallBudgetsMs?.[stage] ?? DEFAULT_INITIALIZING_STALL_BUDGETS_MS[stage])
+      : 0;
+    const stalledMs = nowMs - state.lastProgressMs;
+    if (stage && stalledMs >= budgetMs) {
+      state.stallReported = true;
+      const stall = { stage, description: describeStage(status), stalledMs, budgetMs };
+      Deferred.doneUnsafe(state.stall, Effect.succeed(stall));
+      host.report({ kind: 'stall', sessionId, stall });
+      return;
+    }
+    host.publish(sessionId, status);
+    if (state.lastPhase !== state.phase) {
+      state.lastPhase = state.phase;
+      state.stageStartMs = nowMs;
+    }
+    if (
+      status.type === 'running' &&
+      nowMs - state.lastActivePingAtMs >= ACTIVE_PING_MIN_INTERVAL_MS
+    ) {
+      state.lastActivePingAtMs = nowMs;
+      host.report({ kind: 'active-ping', sessionId });
+    }
+    if (status.type === 'initializing') {
+      const elapsedMs = nowMs - state.stageStartMs;
+      const thresholdMs = options.slowThresholdMs ?? DEFAULT_SLOW_THRESHOLD_MS;
+      const key = status.stage ?? 'unknown';
+      if (elapsedMs >= thresholdMs && !state.reportedSlowKeys.has(key)) {
+        state.reportedSlowKeys.add(key);
+        host.report({
+          kind: 'slow',
+          sessionId,
+          status,
+          elapsedMs,
+          thresholdMs,
+          message: `Pre-agent stage exceeded ${Math.round(thresholdMs / 1000)}s: ${describeStage(status)}`,
+        });
       }
-      host.publish(sessionId, status);
-      if (state.lastPhase !== state.phase) {
-        state.lastPhase = state.phase;
-        state.stageStartMs = nowMs;
-      }
-      if (
-        status.type === 'running' &&
-        nowMs - state.lastActivePingAtMs >= ACTIVE_PING_MIN_INTERVAL_MS
-      ) {
-        state.lastActivePingAtMs = nowMs;
-        host.report({ kind: 'active-ping', sessionId });
-      }
-      if (status.type === 'initializing') {
-        const elapsedMs = nowMs - state.stageStartMs;
-        const thresholdMs = options.slowThresholdMs ?? DEFAULT_SLOW_THRESHOLD_MS;
-        const key = status.stage ?? 'unknown';
-        if (elapsedMs >= thresholdMs && !state.reportedSlowKeys.has(key)) {
-          state.reportedSlowKeys.add(key);
-          host.report({
-            kind: 'slow',
-            sessionId,
-            status,
-            elapsedMs,
-            thresholdMs,
-            message: `Pre-agent stage exceeded ${Math.round(thresholdMs / 1000)}s: ${describeStage(status)}`,
-          });
-        }
-      }
-    };
+    }
+  };
 
-    const clear = (sessionId: SessionId, state: ActivePresenceState) =>
-      Effect.sync(() => {
-        if (active.get(sessionId) !== state) return;
-        host.clear(sessionId);
-        active.delete(sessionId);
-        if (active.size === 0) Deferred.doneUnsafe(idle, Effect.void);
-      });
+  const clear = (sessionId: SessionId, state: ActivePresenceState) =>
+    Effect.sync(() => {
+      if (active.get(sessionId) !== state) return;
+      host.clear(sessionId);
+      active.delete(sessionId);
+      if (active.size === 0) Deferred.doneUnsafe(idle, Effect.void);
+    });
 
-    const hold = Effect.fnUntraced(function* (
-      sessionId: SessionId,
-      phase: SessionActivePresencePhase | null = 'thinking',
-      detail?: string
-    ): Effect.fn.Return<SessionActivePresenceLease, SessionPresenceUnavailable, Scope.Scope> {
-      // Admission and finalizer registration share acquireRelease's interrupt mask.
-      const leaseState = yield* Effect.acquireRelease(
-        Effect.gen(function* () {
-          if (retired)
-            return yield* new SessionPresenceUnavailable({ sessionId, reason: 'closed' });
-          if (active.has(sessionId))
-            return yield* new SessionPresenceUnavailable({ sessionId, reason: 'already-held' });
-          const scope = yield* Scope.fork(parent);
-          const nowMs = now();
-          const state: ActivePresenceState = {
-            stall: yield* Deferred.make<SessionInitializationStall>(),
-            phase,
-            detail,
-            closing: false,
-            close: Effect.void,
-            reportedSlowKeys: new Set(),
-            lastPhase: undefined,
-            stageStartMs: nowMs,
-            lastActivePingAtMs: nowMs,
-            lastProgressMs: nowMs,
-            stallReported: false,
-          };
-          if (active.size === 0) idle = Deferred.makeUnsafe<void>();
-          active.set(sessionId, state);
-          yield* Scope.addFinalizer(
-            scope,
-            clear(sessionId, state).pipe(
-              Effect.catchCause((cause) => {
-                state.failure = cause;
-                return Effect.failCause(cause);
-              })
-            )
-          );
-          state.close = yield* Effect.cached(
-            Effect.gen(function* () {
-              state.closing = true;
-              yield* Scope.close(scope, Exit.void);
+  const hold = Effect.fnUntraced(function* (
+    sessionId: SessionId,
+    phase: SessionActivePresencePhase | null = 'thinking',
+    detail?: string
+  ): Effect.fn.Return<SessionActivePresenceLease, SessionPresenceUnavailable, Scope.Scope> {
+    // Admission and finalizer registration share acquireRelease's interrupt mask.
+    const leaseState = yield* Effect.acquireRelease(
+      Effect.gen(function* () {
+        if (retired) return yield* new SessionPresenceUnavailable({ sessionId, reason: 'closed' });
+        if (active.has(sessionId))
+          return yield* new SessionPresenceUnavailable({ sessionId, reason: 'already-held' });
+        const scope = yield* Scope.fork(parent);
+        const nowMs = now();
+        const state: ActivePresenceState = {
+          stall: yield* Deferred.make<SessionInitializationStall>(),
+          phase,
+          detail,
+          closing: false,
+          close: Effect.void,
+          reportedSlowKeys: new Set(),
+          lastPhase: undefined,
+          stageStartMs: nowMs,
+          lastActivePingAtMs: nowMs,
+          lastProgressMs: nowMs,
+          stallReported: false,
+        };
+        if (active.size === 0) idle = Deferred.makeUnsafe<void>();
+        active.set(sessionId, state);
+        yield* Scope.addFinalizer(
+          scope,
+          clear(sessionId, state).pipe(
+            Effect.catchCause((cause) => {
+              state.failure = cause;
+              return Effect.failCause(cause);
             })
-          );
-          // First publication is synchronous; subsequent ticks belong to the lease.
-          yield* Effect.forkIn(
-            Effect.sync(() => tick(sessionId, state)).pipe(
-              Effect.catchCause((cause) =>
-                Effect.sync(() => host.report({ kind: 'heartbeat-failed', sessionId, cause }))
-              ),
-              Effect.repeat({
-                schedule: Schedule.spaced(options.intervalMs ?? LODY_PRESENCE_HEARTBEAT_MS),
-                while: () => !state.stallReported && !state.closing,
-              }),
-              Effect.asVoid,
-              Effect.delay(options.intervalMs ?? LODY_PRESENCE_HEARTBEAT_MS)
-            ),
-            scope,
-            { startImmediately: true, uninterruptible: false }
-          );
-          return state;
-        }),
-        (acquired) => acquired.close
-      );
-      yield* Effect.sync(() => tick(sessionId, leaseState));
-      return { awaitInitializationStall: Deferred.await(leaseState.stall) };
-    });
-
-    yield* Effect.addFinalizer(() =>
-      Effect.sync(() => {
-        retired = true;
-      })
-    );
-    return SessionActivePresence.of({
-      hold,
-      setPhase: (sessionId, phase, detail) => {
-        const state = active.get(sessionId);
-        if (
-          !state ||
-          state.closing ||
-          state.stallReported ||
-          (state.phase === phase && state.detail === detail)
-        )
-          return;
-        state.phase = phase;
-        state.detail = detail;
-        state.lastProgressMs = now();
-        tick(sessionId, state);
-      },
-      has: (sessionId) => active.has(sessionId),
-      getStatus: (sessionId) => {
-        const state = active.get(sessionId);
-        return state ? phaseToStatus(state.phase, state.detail) : null;
-      },
-      activeSessionCount: () => active.size,
-      retire: () => {
-        retired = true;
-      },
-      retryRelease: (sessionId) =>
-        Effect.suspend(() => {
-          const state = active.get(sessionId);
-          return state?.failure ? clear(sessionId, state) : Effect.void;
-        }),
-      awaitIdle: (timeoutMs) =>
-        Effect.suspend(() => Deferred.await(idle)).pipe(
-          Effect.timeoutOrElse({
-            duration: timeoutMs,
-            orElse: () =>
-              Effect.fail(new SessionPresenceUnavailable({ reason: 'release-pending' })),
+          )
+        );
+        state.close = yield* Effect.cached(
+          Effect.gen(function* () {
+            state.closing = true;
+            yield* Scope.close(scope, Exit.void);
           })
-        ),
-    });
+        );
+        // First publication is synchronous; subsequent ticks belong to the lease.
+        yield* Effect.forkIn(
+          Effect.sync(() => tick(sessionId, state)).pipe(
+            Effect.catchCause((cause) =>
+              Effect.sync(() => host.report({ kind: 'heartbeat-failed', sessionId, cause }))
+            ),
+            Effect.repeat({
+              schedule: Schedule.spaced(options.intervalMs ?? LODY_PRESENCE_HEARTBEAT_MS),
+              while: () => !state.stallReported && !state.closing,
+            }),
+            Effect.asVoid,
+            Effect.delay(options.intervalMs ?? LODY_PRESENCE_HEARTBEAT_MS)
+          ),
+          scope,
+          { startImmediately: true, uninterruptible: false }
+        );
+        return state;
+      }),
+      (acquired) => acquired.close
+    );
+    yield* Effect.sync(() => tick(sessionId, leaseState));
+    return { awaitInitializationStall: Deferred.await(leaseState.stall) };
   });
+
+  yield* Effect.addFinalizer(() =>
+    Effect.sync(() => {
+      retired = true;
+    })
+  );
+  return SessionActivePresence.of({
+    hold,
+    setPhase: (sessionId, phase, detail) => {
+      const state = active.get(sessionId);
+      if (
+        !state ||
+        state.closing ||
+        state.stallReported ||
+        (state.phase === phase && state.detail === detail)
+      )
+        return;
+      state.phase = phase;
+      state.detail = detail;
+      state.lastProgressMs = now();
+      tick(sessionId, state);
+    },
+    has: (sessionId) => active.has(sessionId),
+    getStatus: (sessionId) => {
+      const state = active.get(sessionId);
+      return state ? phaseToStatus(state.phase, state.detail) : null;
+    },
+    activeSessionCount: () => active.size,
+    retire: () => {
+      retired = true;
+    },
+    retryRelease: (sessionId) =>
+      Effect.suspend(() => {
+        const state = active.get(sessionId);
+        return state?.failure ? clear(sessionId, state) : Effect.void;
+      }),
+    awaitIdle: (timeoutMs) =>
+      Effect.suspend(() => Deferred.await(idle)).pipe(
+        Effect.timeoutOrElse({
+          duration: timeoutMs,
+          orElse: () => Effect.fail(new SessionPresenceUnavailable({ reason: 'release-pending' })),
+        })
+      ),
+  });
+});
 
 export const SessionActivePresenceLive = (options?: SessionActivePresenceOptions) =>
   Layer.effect(SessionActivePresence, makeSessionActivePresence(options));

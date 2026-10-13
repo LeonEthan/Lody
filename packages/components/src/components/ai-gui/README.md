@@ -59,6 +59,18 @@ the reasoning behind those rules.
   Only a known source workspace supplies a missing ID; anonymous readers do not
   borrow the viewer's workspace.
 - `message-content-guards.ts` gates which shared `MessageContent` variants render.
+- The stream and `SessionChatInterface` derive the last completed assistant id
+  directly from the same `resolveLastAssistantTurnIds` index query. The parent
+  uses its existing conversation-version subscription; the stream does not copy
+  this derived value into parent state through an effect. The query retains the
+  empty-entry and duplicate-id rules and does not hydrate message bodies.
+  [Decision](../../../../../.agents/notes/implemented/simplification/2026-10-13-completed-assistant-derived-state.md).
+- The scroll engine also bounds synchronous unsettled commits across transaction
+  restarts. Budget exhaustion records `update-loop`, then reaches the existing
+  message-list fallback instead of continuing until React's nested-update limit.
+  The fallback preserves the composer and requires explicit retry. The reset
+  microtask is counter bookkeeping, not a layout retry or delay.
+  [Guard and scope](../../../../../.agents/notes/implemented/bug-fix/2026-10-13-scroll-update-loop-guard.md).
 - `markdown-file-image.tsx` binds live file Markdown to its owning provider. Local
   resources load automatically; remote file images show a one-line recessed slot
   (alt, file name, Load image) and load on click. Relative paths use the opened document; Blob URLs last only for the mounted

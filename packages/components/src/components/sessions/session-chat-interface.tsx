@@ -341,7 +341,11 @@ import {
   useConversationVersion,
   useTurn,
 } from '@/hooks/use-conversation-view';
-import { collectConversationConfigSources, countUserTurns } from '@/lib/conversation-view';
+import {
+  collectConversationConfigSources,
+  countUserTurns,
+  resolveLastAssistantTurnIds,
+} from '@/lib/conversation-view';
 import {
   latestGoalFromFacts,
   latestProposedPlanFromFacts,
@@ -3167,24 +3171,15 @@ export const SessionChatInterface = memo(
     const conversationIndexRows = useConversationIndexRows(conversationView, {
       includeSummary: false,
     });
-    const [lastCompletedAssistantTarget, setLastCompletedAssistantTarget] = useState<{
-      sessionId: SessionId;
-      messageId: string | null;
-    } | null>(null);
-    const lastCompletedAssistantMessageId =
-      lastCompletedAssistantTarget?.sessionId === session.id
-        ? lastCompletedAssistantTarget.messageId
-        : null;
-    const handleLastCompletedAssistantMessageIdChange = useCallback(
-      (messageId: string | null) => {
-        setLastCompletedAssistantTarget((current) => {
-          if (current?.sessionId === session.id && current.messageId === messageId) {
-            return current;
-          }
-          return { sessionId: session.id, messageId };
-        });
-      },
-      [session.id]
+    // Read the same index-only result as the stream; no child effect/state mirror.
+    const lastCompletedAssistantMessageId = useMemo(
+      () =>
+        conversationView
+          ? resolveLastAssistantTurnIds(conversationView).lastCompletedAssistantMessageId
+          : null,
+      // `conversationVersion` is the change signal for index facts, including completion.
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      [conversationView, conversationVersion]
     );
     const handleForkFromMenu = useCallback(
       (destination?: SessionForkDestination) => {
@@ -6560,7 +6555,7 @@ export const SessionChatInterface = memo(
 
     return (
       <PrLinkProvider prUrl={latestPr?.url} onOpenPrTab={prLinkHandler}>
-    <SessionLinkProvider enabled={!!onNavigateSession}>
+        <SessionLinkProvider enabled={!!onNavigateSession}>
           {isVisible &&
             !preparingWindow &&
             onOpenBrowser &&
@@ -6715,9 +6710,6 @@ export const SessionChatInterface = memo(
                                 capacityRetry={capacityRetry ?? undefined}
                                 forkingAssistantMessageId={forkingAssistantMessageId}
                                 onNavigateSession={onNavigateSession}
-                                onLastCompletedAssistantMessageIdChange={
-                                  handleLastCompletedAssistantMessageIdChange
-                                }
                                 conversationFontSize={conversationFontSize}
                                 suppressStickyAutoScrollRef={suppressStickyAutoScrollRef}
                                 outlineOverlayRoot={outlineOverlayRoot}

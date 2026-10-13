@@ -210,6 +210,7 @@ export function EngineConversationScroller({
         if (sync && !inLayoutEffect.current) flushSync(forceCommit);
         else forceCommit();
       },
+      scheduleMicrotask: (callback) => queueMicrotask(callback),
       isSuppressed: () => Boolean(latest.current.suppressAutoScrollRef?.current),
       prefersReducedMotion,
       requestFrame: (callback) => requestAnimationFrame(callback),
@@ -249,9 +250,13 @@ export function EngineConversationScroller({
     onDiagnostic: (diagnostic) => {
       recordScrollEngineDiagnostic(sessionId, diagnostic);
       scrollDebug('engine-cycle', { ...diagnostic });
-      if (!diagnostic.covered || diagnostic.pendingExternalMove) {
+      if (
+        diagnostic.reason === 'update-loop' ||
+        !diagnostic.covered ||
+        diagnostic.pendingExternalMove
+      ) {
         recordSessionRenderTrace(
-          `scroll-engine ${shortTraceId(sessionId)} ${diagnostic.reason} covered=${diagnostic.covered} pending=${diagnostic.pendingExternalMove} commits=${diagnostic.supplementaryCommits}`
+          `scroll-engine ${shortTraceId(sessionId)} ${diagnostic.reason} covered=${diagnostic.covered} pending=${diagnostic.pendingExternalMove} commits=${diagnostic.supplementaryCommits}${diagnostic.synchronousCommits === undefined ? '' : ` synchronous=${diagnostic.synchronousCommits} intent=${diagnostic.intent} target=${diagnostic.target} actual=${diagnostic.actual} anchor=${diagnostic.anchorKey} resolved=${diagnostic.resolvedKey}`}`
         );
       }
     },

@@ -26,43 +26,42 @@ const otherId = 'session-active-presence-2' as SessionId;
 const machineId = 'machine-active-presence-1' as MachineId;
 const logger = { debug: () => {}, warn: () => {} } as unknown as Logger;
 
-const harness = (options: SessionActivePresenceOptions = {}) =>
-  Effect.gen(function* () {
-    const entries = new Map<SessionId, SessionStatus>();
-    const writes: Array<{ id: SessionId; status: SessionStatus }> = [];
-    const events: SessionPresenceDiagnostic[] = [];
-    let clearError: unknown;
-    let publishError: unknown;
-    const host = SessionPresenceHost.of({
-      publish: (id, status) => {
-        if (publishError) throw publishError;
-        entries.set(id, status);
-        writes.push({ id, status });
-      },
-      clear: (id) => {
-        if (clearError) throw clearError;
-        entries.delete(id);
-      },
-      report: (event) => {
-        events.push(event);
-      },
-    });
-    const owner = yield* makeSessionActivePresence({ intervalMs: 1_000, ...options }).pipe(
-      Effect.provideService(SessionPresenceHost, host)
-    );
-    return {
-      owner,
-      entries,
-      writes,
-      events,
-      failClear: (error?: unknown) => {
-        clearError = error;
-      },
-      failPublish: (error?: unknown) => {
-        publishError = error;
-      },
-    };
+const harness = Effect.fnUntraced(function* (options: SessionActivePresenceOptions = {}) {
+  const entries = new Map<SessionId, SessionStatus>();
+  const writes: Array<{ id: SessionId; status: SessionStatus }> = [];
+  const events: SessionPresenceDiagnostic[] = [];
+  let clearError: unknown;
+  let publishError: unknown;
+  const host = SessionPresenceHost.of({
+    publish: (id, status) => {
+      if (publishError) throw publishError;
+      entries.set(id, status);
+      writes.push({ id, status });
+    },
+    clear: (id) => {
+      if (clearError) throw clearError;
+      entries.delete(id);
+    },
+    report: (event) => {
+      events.push(event);
+    },
   });
+  const owner = yield* makeSessionActivePresence({ intervalMs: 1_000, ...options }).pipe(
+    Effect.provideService(SessionPresenceHost, host)
+  );
+  return {
+    owner,
+    entries,
+    writes,
+    events,
+    failClear: (error?: unknown) => {
+      clearError = error;
+    },
+    failPublish: (error?: unknown) => {
+      publishError = error;
+    },
+  };
+});
 
 const close = (scope: Scope.Closeable) => Scope.close(scope, Exit.void);
 

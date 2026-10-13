@@ -21,6 +21,10 @@ Design, invariants I1–I8 and the coverage lemma:
   A React re-render that did not change the list must not start a new cycle (that
   layout-effect `onScroll` → setState loop is React #185). Never add timers, frame
   retries or a hidden/reveal gate; the viewport is never hidden.
+- The synchronous commit budget spans row changes and transaction restarts. Its
+  microtask only resets bookkeeping, never retries layout. Exhaustion records
+  `update-loop` and throws to the message-list boundary; only explicit retry
+  remounts the failed controller. [Decision](../../../../../.agents/notes/implemented/bug-fix/2026-10-13-scroll-update-loop-guard.md).
 - Keep the layout contract: viewport `overflow-anchor: none` and
   `scrollbar-gutter: stable`; rows container `overflow-y: clip`; no row may use
   `content-visibility: auto` or size itself from the container or its position. Rows

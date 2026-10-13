@@ -155,29 +155,26 @@ export const FileLocksLive = Layer.effect(
               : Effect.fail(new LockIoError({ path: lockPath, cause: error }))
           )
         );
-    const stale = (raw: string) =>
-      Effect.gen(function* () {
-        const info = parseLock(raw);
-        if (!info) return true;
-        const now = yield* Clock.currentTimeMillis;
-        if (now - info.timestamp > 30 * 60 * 1000) return true;
-        return (
-          (yield* probePid(info.pid).pipe(Effect.provideService(NodeProcess, nodeProcess))) !==
-          'ours'
-        );
-      });
-    const reclaim = (lockPath: string) =>
-      Effect.gen(function* () {
-        const raw = yield* read(lockPath);
-        if (raw === undefined) return true;
-        if (!(yield* stale(raw))) return false;
-        // Recheck the observed generation before removing a stale file.
-        const current = yield* read(lockPath);
-        if (current === undefined) return true;
-        if (current !== raw) return false;
-        yield* remove(lockPath);
-        return true;
-      });
+    const stale = Effect.fnUntraced(function* (raw: string) {
+      const info = parseLock(raw);
+      if (!info) return true;
+      const now = yield* Clock.currentTimeMillis;
+      if (now - info.timestamp > 30 * 60 * 1000) return true;
+      return (
+        (yield* probePid(info.pid).pipe(Effect.provideService(NodeProcess, nodeProcess))) !== 'ours'
+      );
+    });
+    const reclaim = Effect.fnUntraced(function* (lockPath: string) {
+      const raw = yield* read(lockPath);
+      if (raw === undefined) return true;
+      if (!(yield* stale(raw))) return false;
+      // Recheck the observed generation before removing a stale file.
+      const current = yield* read(lockPath);
+      if (current === undefined) return true;
+      if (current !== raw) return false;
+      yield* remove(lockPath);
+      return true;
+    });
     const stat = (file: string) =>
       fs
         .stat(file)
@@ -188,33 +185,30 @@ export const FileLocksLive = Layer.effect(
               : Effect.fail(new LockIoError({ path: file, cause: error }))
           )
         );
-    const reclaimScratch = (scratch: string) =>
-      Effect.gen(function* () {
-        const info = yield* stat(scratch);
-        if (info?.type !== 'Directory') return;
-        const owner = path.join(scratch, 'owner');
-        const raw = yield* read(owner);
-        if (raw !== undefined && parseLock(raw)) {
-          // A live candidate may be published or still preparing/waiting to link.
-          if (!(yield* stale(raw))) return;
-        } else {
-          // A crash can precede the first complete write. Do not collect a new
-          // directory while its owner is still preparing metadata.
-          const ownerInfo = yield* stat(owner);
-          if (Option.isNone(info.mtime)) return;
-          if (ownerInfo && Option.isNone(ownerInfo.mtime)) return;
-          const modified = Math.max(
-            info.mtime.value.getTime(),
-            ownerInfo && Option.isSome(ownerInfo.mtime)
-              ? ownerInfo.mtime.value.getTime()
-              : -Infinity
-          );
-          if ((yield* Clock.currentTimeMillis) - modified <= 30 * 60 * 1000) return;
-        }
-        // Retain a candidate that changed since the ownership/age check.
-        if ((yield* read(owner)) !== raw) return;
-        yield* remove(scratch, true);
-      });
+    const reclaimScratch = Effect.fnUntraced(function* (scratch: string) {
+      const info = yield* stat(scratch);
+      if (info?.type !== 'Directory') return;
+      const owner = path.join(scratch, 'owner');
+      const raw = yield* read(owner);
+      if (raw !== undefined && parseLock(raw)) {
+        // A live candidate may be published or still preparing/waiting to link.
+        if (!(yield* stale(raw))) return;
+      } else {
+        // A crash can precede the first complete write. Do not collect a new
+        // directory while its owner is still preparing metadata.
+        const ownerInfo = yield* stat(owner);
+        if (Option.isNone(info.mtime)) return;
+        if (ownerInfo && Option.isNone(ownerInfo.mtime)) return;
+        const modified = Math.max(
+          info.mtime.value.getTime(),
+          ownerInfo && Option.isSome(ownerInfo.mtime) ? ownerInfo.mtime.value.getTime() : -Infinity
+        );
+        if ((yield* Clock.currentTimeMillis) - modified <= 30 * 60 * 1000) return;
+      }
+      // Retain a candidate that changed since the ownership/age check.
+      if ((yield* read(owner)) !== raw) return;
+      yield* remove(scratch, true);
+    });
     const release = (lockPath: string, token: string) =>
       Effect.gen(function* () {
         const raw = yield* read(lockPath);
@@ -326,129 +320,124 @@ export const FileLocksLive = Layer.effect(
       )
     );
 
-    const withLock = <A, E, R>(
+    const withLock = Effect.fnUntraced(function* <A, E, R>(
       name: string,
       body: Effect.Effect<A, E, R>,
       options: LockOptions = {}
-    ): Effect.Effect<A, E | FileLockError, R> =>
-      Effect.gen(function* () {
-        const dir = directory(options);
-        const lockPath = path.join(dir, `${name.replace(/[^a-zA-Z0-9_-]/g, '_')}.lock`);
-        const held = yield* heldPaths;
-        if (held.has(lockPath)) return yield* Effect.fail(new LockReentrant({ lockName: name }));
-        const timeout = options.timeout ?? 30000;
-        const retryDelay = options.retryDelay ?? 100;
-        const maxRetryDelay = options.maxRetryDelay ?? 2000;
-        if (![timeout, retryDelay, maxRetryDelay].every((n) => Number.isFinite(n) && n >= 0)) {
-          return yield* Effect.fail(
-            new LockIoError({ path: lockPath, cause: 'lock delays must be finite and nonnegative' })
-          );
-        }
-        const checkout = Ref.modify(entries, (map) => {
-          const entry: QueueEntry = map.get(lockPath) ?? { waiters: [], cleanups: new Set() };
-          const ticket = Deferred.makeUnsafe<void>();
-          if (entry.waiters.length === 0) Deferred.doneUnsafe(ticket, Effect.void);
-          entry.waiters.push(ticket);
-          map.set(lockPath, entry);
-          return [{ entry, ticket }, map] as const;
-        });
-        return yield* Effect.acquireUseRelease(
-          checkout,
-          ({ entry, ticket }) =>
-            Effect.gen(function* () {
-              yield* Deferred.await(ticket);
-              // A failed release retains its owner. Retry it before admitting a replacement.
-              yield* recover(entry);
-              yield* fs
-                .makeDirectory(dir, { recursive: true })
-                .pipe(Effect.mapError((cause) => new LockIoError({ path: dir, cause })));
-              // Publish complete metadata atomically; wx + async write exposes an empty
-              // file that another process would wrongly reclaim as malformed/stale.
-              const candidate = fs
-                .makeTempDirectory({ directory: dir, prefix: '.lody-lock-' })
-                .pipe(
-                  Effect.mapError((cause) => new LockIoError({ path: dir, cause })),
-                  Effect.flatMap((scratch) =>
-                    makeCleanup(lockPath, entry, scratch, () => remove(scratch, true)).pipe(
-                      Effect.map((cleanup) => ({ scratch, cleanup }))
-                    )
-                  )
-                );
-              return yield* Effect.acquireUseRelease(
-                candidate,
-                ({ scratch }) =>
-                  Effect.uninterruptibleMask((restore) => {
-                    const token = path.join(scratch, 'owner');
-                    const acquire = Effect.gen(function* () {
-                      const start = yield* Clock.currentTimeMillis;
-                      const delay = yield* Ref.make(retryDelay);
-                      const step = yield* Schedule.toStepWithMetadata(
-                        Schedule.forever.pipe(
-                          Schedule.modifyDelay(() =>
-                            Ref.getAndUpdate(delay, (ms) => Math.min(ms * 1.5, maxRetryDelay))
-                          )
-                        )
-                      );
-                      const attempt: Effect.Effect<FileLockCleanupLease, FileLockError> =
-                        Effect.gen(function* () {
-                          const timestamp = yield* Clock.currentTimeMillis;
-                          yield* restore(
-                            fs
-                              .writeFileString(
-                                token,
-                                JSON.stringify({ pid: host.pid, timestamp, token })
-                              )
-                              .pipe(
-                                Effect.mapError((cause) => new LockIoError({ path: token, cause }))
-                              )
-                          );
-                          // Only publication and registering its release stay masked.
-                          const acquired = yield* fs.link(token, lockPath).pipe(
-                            Effect.as(true),
-                            Effect.catch((error) =>
-                              hasReason(error, 'AlreadyExists')
-                                ? Effect.succeed(false)
-                                : Effect.fail(new LockIoError({ path: lockPath, cause: error }))
-                            )
-                          );
-                          if (acquired)
-                            return yield* makeCleanup(lockPath, entry, lockPath, () =>
-                              release(lockPath, token)
-                            );
-                          if (yield* restore(reclaim(lockPath)))
-                            return yield* Effect.suspend(() => attempt);
-                          if ((yield* Clock.currentTimeMillis) - start > timeout)
-                            return yield* Effect.fail(new LockTimeout({ lockName: name, timeout }));
-                          yield* restore(step(undefined)).pipe(Effect.orDie);
-                          return yield* Effect.suspend(() => attempt);
-                        });
-                      return yield* attempt;
-                    });
-                    return Effect.acquireUseRelease(
-                      acquire,
-                      () =>
-                        restore(
-                          Effect.provideService(body, heldPaths, new Set([...held, lockPath]))
-                        ),
-                      (cleanup) => cleanup.retryCleanup
-                    );
-                  }),
-                ({ cleanup }) => cleanup.retryCleanup
-              );
-            }),
-          ({ entry, ticket }) =>
-            Ref.update(entries, (map) => {
-              // Remove cancelled tickets without waiting for their predecessor.
-              // Handoff reserves ownership synchronously before a newcomer can enqueue.
-              const index = entry.waiters.indexOf(ticket);
-              entry.waiters.splice(index, 1);
-              if (index === 0 && entry.waiters[0])
-                Deferred.doneUnsafe(entry.waiters[0], Effect.void);
-              if (entry.waiters.length === 0 && entry.cleanups.size === 0) map.delete(lockPath);
-              return map;
-            })
+    ): Effect.fn.Return<A, E | FileLockError, R> {
+      const dir = directory(options);
+      const lockPath = path.join(dir, `${name.replace(/[^a-zA-Z0-9_-]/g, '_')}.lock`);
+      const held = yield* heldPaths;
+      if (held.has(lockPath)) return yield* Effect.fail(new LockReentrant({ lockName: name }));
+      const timeout = options.timeout ?? 30000;
+      const retryDelay = options.retryDelay ?? 100;
+      const maxRetryDelay = options.maxRetryDelay ?? 2000;
+      if (![timeout, retryDelay, maxRetryDelay].every((n) => Number.isFinite(n) && n >= 0)) {
+        return yield* Effect.fail(
+          new LockIoError({ path: lockPath, cause: 'lock delays must be finite and nonnegative' })
         );
+      }
+      const checkout = Ref.modify(entries, (map) => {
+        const entry: QueueEntry = map.get(lockPath) ?? { waiters: [], cleanups: new Set() };
+        const ticket = Deferred.makeUnsafe<void>();
+        if (entry.waiters.length === 0) Deferred.doneUnsafe(ticket, Effect.void);
+        entry.waiters.push(ticket);
+        map.set(lockPath, entry);
+        return [{ entry, ticket }, map] as const;
       });
+      return yield* Effect.acquireUseRelease(
+        checkout,
+        ({ entry, ticket }) =>
+          Effect.gen(function* () {
+            yield* Deferred.await(ticket);
+            // A failed release retains its owner. Retry it before admitting a replacement.
+            yield* recover(entry);
+            yield* fs
+              .makeDirectory(dir, { recursive: true })
+              .pipe(Effect.mapError((cause) => new LockIoError({ path: dir, cause })));
+            // Publish complete metadata atomically; wx + async write exposes an empty
+            // file that another process would wrongly reclaim as malformed/stale.
+            const candidate = fs.makeTempDirectory({ directory: dir, prefix: '.lody-lock-' }).pipe(
+              Effect.mapError((cause) => new LockIoError({ path: dir, cause })),
+              Effect.flatMap((scratch) =>
+                makeCleanup(lockPath, entry, scratch, () => remove(scratch, true)).pipe(
+                  Effect.map((cleanup) => ({ scratch, cleanup }))
+                )
+              )
+            );
+            return yield* Effect.acquireUseRelease(
+              candidate,
+              ({ scratch }) =>
+                Effect.uninterruptibleMask((restore) => {
+                  const token = path.join(scratch, 'owner');
+                  const acquire = Effect.gen(function* () {
+                    const start = yield* Clock.currentTimeMillis;
+                    const delay = yield* Ref.make(retryDelay);
+                    const step = yield* Schedule.toStepWithMetadata(
+                      Schedule.forever.pipe(
+                        Schedule.modifyDelay(() =>
+                          Ref.getAndUpdate(delay, (ms) => Math.min(ms * 1.5, maxRetryDelay))
+                        )
+                      )
+                    );
+                    const attempt: Effect.Effect<FileLockCleanupLease, FileLockError> = Effect.gen(
+                      function* () {
+                        const timestamp = yield* Clock.currentTimeMillis;
+                        yield* restore(
+                          fs
+                            .writeFileString(
+                              token,
+                              JSON.stringify({ pid: host.pid, timestamp, token })
+                            )
+                            .pipe(
+                              Effect.mapError((cause) => new LockIoError({ path: token, cause }))
+                            )
+                        );
+                        // Only publication and registering its release stay masked.
+                        const acquired = yield* fs.link(token, lockPath).pipe(
+                          Effect.as(true),
+                          Effect.catch((error) =>
+                            hasReason(error, 'AlreadyExists')
+                              ? Effect.succeed(false)
+                              : Effect.fail(new LockIoError({ path: lockPath, cause: error }))
+                          )
+                        );
+                        if (acquired)
+                          return yield* makeCleanup(lockPath, entry, lockPath, () =>
+                            release(lockPath, token)
+                          );
+                        if (yield* restore(reclaim(lockPath)))
+                          return yield* Effect.suspend(() => attempt);
+                        if ((yield* Clock.currentTimeMillis) - start > timeout)
+                          return yield* Effect.fail(new LockTimeout({ lockName: name, timeout }));
+                        yield* restore(step(undefined)).pipe(Effect.orDie);
+                        return yield* Effect.suspend(() => attempt);
+                      }
+                    );
+                    return yield* attempt;
+                  });
+                  return Effect.acquireUseRelease(
+                    acquire,
+                    () =>
+                      restore(Effect.provideService(body, heldPaths, new Set([...held, lockPath]))),
+                    (cleanup) => cleanup.retryCleanup
+                  );
+                }),
+              ({ cleanup }) => cleanup.retryCleanup
+            );
+          }),
+        ({ entry, ticket }) =>
+          Ref.update(entries, (map) => {
+            // Remove cancelled tickets without waiting for their predecessor.
+            // Handoff reserves ownership synchronously before a newcomer can enqueue.
+            const index = entry.waiters.indexOf(ticket);
+            entry.waiters.splice(index, 1);
+            if (index === 0 && entry.waiters[0]) Deferred.doneUnsafe(entry.waiters[0], Effect.void);
+            if (entry.waiters.length === 0 && entry.cleanups.size === 0) map.delete(lockPath);
+            return map;
+          })
+      );
+    });
     return FileLocks.of({
       withLock,
       cleanupStale: (options = {}) =>
