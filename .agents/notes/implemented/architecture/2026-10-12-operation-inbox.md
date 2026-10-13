@@ -39,6 +39,8 @@ Stop request details now live in one replaceable `cancelRequest` control-documen
 
 The Stop-storage adjustment passed 159 CLI tests, 97 send/meta-cache tests and 16 Shared schema/compatibility tests; the final SQLite-plus-CRDT reopen fixture passed its 58-test owning suite. Types, lint, format and six static guards passed in the pinned source copy. Root check still fails on the unchanged Git transport `context_unreadable` case; it is not a full-green or independent baseline claim. Docs retain the same 82-error array. These scopes overlap the earlier evidence below.
 
+Integration with main `7b540b10f` preserves its presence child Scope: raw cancellation/drain precedes presence clear, which precedes Turn-slot release and automatic Inbox handoff. Presence cleanup failure retains the old execution owner. Daemon shutdown both aborts history-owned work and drains/recover-closes the Inbox. Both main's native presence/local-writer guards and the Inbox guard remain in the check scripts. The merged dependency pins, including Streams 0.17.0 and Effect 4.0.2, are used unchanged. Eight owning execution/presence/Inbox/daemon suites passed 422 tests; types, format and `check:quick` passed. Documentation retains the same 82-error array. The full check preceded the final test-only resolution and was not green, including the unchanged native-Git fixture failure; the final resolution is covered by the 422-test rerun, not another full-root pass.
+
 ## Verification and remaining limits
 
 Author validation used a separate source copy with pinned dependencies and matching changed-source bytes, not an independent base/head review. Counts overlap and must not be added.

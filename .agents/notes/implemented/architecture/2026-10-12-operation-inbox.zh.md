@@ -39,6 +39,8 @@ Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest
 
 本次 Stop 存储调整通过 CLI 159 项、发送／meta cache 97 项、Shared schema／兼容 16 项测试；最后加入 SQLite 与 CRDT 同时重开的 fixture 后，所属 58 项测试复跑通过。锁定依赖的源码副本中类型、lint、格式和六项静态 guard 通过。root check 仍在未修改的 Git transport `context_unreadable` 用例失败，不宣称全绿或独立基线验证。docs 的 82 项错误数组不变；这些测试与下方的前次证据有交集。
 
+与主分支 `7b540b10f` 合并后，保留它的 presence 子 Scope：先取消／排空原始请求，再清除 presence，最后释放 turn 槽位并允许 Inbox 自动移交。presence 清理失败仍保留旧执行所有者。daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。检查脚本保留主分支的原生 presence／local writer guard 和 Inbox guard。使用合并后的锁定依赖，包括 Streams 0.17.0、Effect 4.0.2，没有额外升级。执行／presence／Inbox／daemon 所属八个 suite 共 422 项通过；类型、格式及 `check:quick` 通过。文档错误数组仍是相同的 82 项。完整检查在最终测试断言调整前启动，未全绿，包含未修改的 native Git fixture 失败；最终调整由 422 项复跑覆盖，不宣称又一次完整 root 全绿。
+
 ## 验证与剩余边界
 
 作者验证使用锁定依赖的隔离源码副本，并核对改动源码字节一致；不是独立 base/head 审核。下面的测试范围有交集，不能累加。

@@ -181,7 +181,7 @@ Flock 新鲜度同步用 `timeout` + `orElse` 回落本地副本。约束：**�
 
 ### 连接恢复、presence 与机器存活（CLI）
 
-- 位置：`apps/cli/src/lib/loro/connection-recovery.ts`、`presence.ts`、`machine-monitor.ts`、
+- 位置：`apps/cli/src/lib/loro/connection-recovery.ts`、`workspace-presence.ts`、`machine-monitor.ts`、
   `session-active-presence.ts`。
 - 证据：#12、#673；开放 #399、#484、#1028。
 - 拆分：presence 与机器存活属于 Lody 自己的 L2（SessionPresence 与机器三态），可在临时
@@ -324,8 +324,13 @@ preview 代理、`packages/loro-streams-rpc`、PR poller、Electron updater：�
 | ACP 启动闸门内核                          | Clock、配置、日志                                     | 待迁移             | Promise 等待者/回调             | admission/等待者拥有者待完成            | 不天然依赖进程；启动回调是独立未完成工作                                                                                                                                                                         |
 | ACP transport 与领域操作                  | 进程、SDK 适配、原始请求跟踪                          | 待迁移             | Promise 请求                    | 连接/原始工作拥有者待完成               | 可独立于 worktree/install；保留 unknown steer 结果                                                                                                                                                               |
 | AgentSession 与池                         | Worktree/startup、install、shell、闸门、ACP、凭据叶子 | 部分               | Promise 编排                    | 完整实例/替换拥有者待完成               | 凭据/preparation 叶子原生，完整 Session 取消仍未完成                                                                                                                                                             |
+| 会话历史所属机器就绪                      | 第三方 Repo 订阅/快照、Clock                         | 原生               | MessageHandler 执行入口        | 单次请求 Stream Scope；关闭取消       | [就绪决定](2026-10-09-roost-native-runtime.zh.md#历史所属机器就绪检查)；所属机器/后端就绪前不打开正文，Repo 与文档生命周期仍待迁移                                                                                  |
+| 历史 RPC 前置拒绝结果持久化               | SQLite driver                                      | 原生               | MessageHandler RPC 回调        | 单次操作 Scope handle；FULL 拒绝事务 | [就绪决定](2026-10-09-roost-native-runtime.zh.md#历史所属机器就绪检查)；拒绝保持到原请求过期并跨重启；Promise RPC dispatch 生命周期仍待迁移 |
 | streams-crdt / loro-repo 生命周期         | Flock 持久化、发布/消费合同、各仓库规则               | 待迁移             | Promise 库 API                  | 库持久化/room/重连 Scope 待完成         | 开始前核对发布与源码；兼容仅使用单一内核                                                                                                                                                                         |
-| 文档、历史、presence                      | 原生 Loro 生命周期、既有历史 reducer                  | 待迁移 | 混合/Promise 编排               | 文档、writer、presence 租约待完成       | 既有孤岛未评估；保留 unload→invalidate 与既有写入/读取职责                                                                                                                                                                       |
+| workspace presence 与远程代次 | 正式 streams-crdt 0.17.0 / client 0.10.0、原生 token | 原生 | doc/bridge 经唯一 Legacy 入口 | CLI 根 registry、workspace 与代次 Scope | [P5 决定](../../implemented/architecture/2026-10-12-effect-workspace-presence.zh.md)；验证共享 token 和实际 SDK 释放；P6 会话租约及 relay 上层接线仍待迁移 |
+| 本地 presence 与物理 socket writer | 原生本地来源、真实 Flock SDK 导出、Node host turn/write/drain | 下层 writer 原生 | CLI doc/socket 与 room engine 经唯一 Legacy 入口 | 全进程 FIFO pacer、共享连接 lane；有界释放保留原 owner | [P7 writer 决定](../../implemented/architecture/2026-10-12-effect-local-presence-writer.zh.md)；room/LoroRepo 及应用接线仍待迁移 |
+| Streams token provider | 原生凭据端口、WebCrypto/fetch、Clock | 原生 | CLI 借用 Legacy；renderer/Machine RPC 自有 Legacy | CLI workspace Scope；其余应用拥有者待迁移 | durable/presence 共用一个 provider/cache；取消只释放自身租约，未结束 I/O 保留恢复拥有者 |
+| 文档、历史、presence                      | 原生 Loro 生命周期、既有历史 reducer                  | 部分：workspace presence 与本地 writer | 混合/Promise 编排               | 文档、会话 presence 租约待完成；下层 writer 原生       | 既有孤岛未评估；保留 unload→invalidate 与既有写入/读取职责                                                                                                                                                                       |
 | Turn、steer、stop、收尾                   | Session 与文档/历史/presence 拥有者                   | 待迁移             | Promise 编排                    | Turn 任务/presence 租约待完成           | 两条依赖链都就绪；保留类型化停止与 pending-input 行为                                                                                                                                                            |
 | dispatch、MessageHandler、daemon 集成     | Turn、投递、文档 flush                                | 待迁移             | Promise 编排                    | 已有 shell 根 runtime；其余所有权待完成 | 停会话→最终写入 flush→拆文档，报告外部释放失败                                                                                                                                                                   |
 | Renderer / Electron / supervisor 上层编排 | 各单元真实的平台与同步依赖                            | 待迁移    | 既有孤岛与进程调用方            | 上层资源/任务拥有者待完成               | 既有孤岛未评估；统一进程调用不代表上层 workflow 完成，交付前继续拆单元                                                                                                                                                           |
@@ -374,7 +379,7 @@ flowchart TD
 在包含刷新 main 的基础上组合 FileLocks 和 WorktreeGit，不代表变更、setup 或 GC 所有权完成。
 #1385 已合并，仅提供运行实例凭据租约和预热 TTL/控制；底层 ACP/worktree 启动及完整会话所有权仍未完成。
 有限[本地源准备单元](../../implemented/architecture/2026-10-10-effect-local-worktree-preparation.zh.md) 依赖文件系统/Git，借用既有变更租约。评审 base 包含观察单元，因为管理器边界共享；原生内核并不互相依赖。
-库侧前置核对：当前 lockfile 解析到 Flock WASM 0.4.3、streams-crdt 0.16.2 和 loro-repo 0.22.0。消费版本不证明 Effect 内核已完成；库侧迁移前仍须核实发布版本、上游仓库状态/规则与当前源码/检查点契约。此前 registry 观察不能作为当前发布保证。
+库侧前置核对：当前 lockfile 解析到 Flock WASM 0.4.3、streams-crdt 0.17.0 和 loro-repo 0.22.0。消费版本不证明 Effect 内核已完成；库侧迁移前仍须核实发布版本、上游仓库状态/规则与当前源码/检查点契约。此前 registry 观察不能作为当前发布保证。
 下文的七单元基础 stack 已于 2026-10-11 合入 main。Worktree 变更/setup/GC、runtime
 安装、ACP 和 Loro 内核仍未完成。
 

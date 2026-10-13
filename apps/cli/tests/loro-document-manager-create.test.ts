@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import fs from 'fs/promises';
 import os from 'os';
 import path from 'path';
@@ -6,12 +6,93 @@ import {
   LOCAL_LORO_DATA_PLANE_PROTOCOL_VERSION,
   type LocalLoroDataPlaneServerMessage,
 } from '@lody/shared/local-loro-data-plane';
-import { LocalLoroDataPlaneServer } from '@lody/shared/local-loro-data-plane-server';
+import { LocalLoroDataPlaneServerLegacy } from '@lody/shared/local-loro-data-plane-server';
 import type { WorkspaceId } from '@lody/shared';
 import { InMemoryRemoteCursorStore } from '@loro-dev/streams-crdt';
 import { RepoSyncError, RepoTransportError, type RepoSyncReport } from 'loro-repo';
 
+import { Effect, Layer } from 'effect';
+import {
+  makeLoroStreamsTokenProvider,
+  makeLoroStreamsTokenWebPorts,
+  LoroStreamsTokenPorts,
+  type LodyPresenceInstanceId,
+} from '@lody/shared';
+import { makeApplicationRuntime } from '@lody/shared/node/application-runtime';
+import {
+  PresenceHost,
+  PresenceTransport,
+  WorkspacePresenceOwnersLive,
+} from '../src/lib/loro/workspace-presence';
+import {
+  bindWorkspacePresenceApplicationLegacy,
+  recoverCliPresenceApplicationShutdown,
+  WorkspacePresenceLegacyFailure,
+  createCliPresenceRuntimeLegacy,
+} from '../src/lib/loro/presence-legacy';
+const testPresenceLayer = WorkspacePresenceOwnersLive.pipe(
+  Layer.provide(
+    Layer.merge(
+      Layer.succeed(PresenceHost, {
+        instanceId: () => 'synthetic-document-manager' as LodyPresenceInstanceId,
+        serverOffsetMs: () => 0,
+        report: () => {},
+      }),
+      Layer.succeed(PresenceTransport, {
+        isReleaseFailure: () => false,
+        create: () =>
+          Effect.succeed({
+            stats: {
+              status: 'joined',
+              pendingLocalCount: 0,
+              physicalEntries: 0,
+              queuedBytes: 0,
+              releasePending: 0,
+            },
+            join: ({ onStatusChange }) =>
+              Effect.sync(() => {
+                onStatusChange('joined');
+                return { syncBarrier: () => Effect.void };
+              }),
+            close: Effect.void,
+            rejoin: Effect.void,
+            retryRelease: Effect.void,
+          }),
+      })
+    )
+  )
+);
+let presenceApplication: ReturnType<typeof makeApplicationRuntime>;
+beforeEach(() => {
+  const app = makeApplicationRuntime(testPresenceLayer, {
+    recover: recoverCliPresenceApplicationShutdown,
+    project: (cause) => new WorkspacePresenceLegacyFailure(cause),
+  });
+  presenceApplication = app;
+  bindWorkspacePresenceApplicationLegacy(app);
+});
+afterEach(() => presenceApplication.closeLegacy());
+
 import type { Logger } from '../src/utils/logger';
+import * as logging from '../src/utils/logger';
+import { CliMachineMonitorRuntime } from '../src/lib/loro/machine-monitor';
+
+// The production interceptors install once for the whole module lifetime. Keep
+// these underlying delegates stable across tests, regardless of which test first
+// attaches Streams, and restore the real globals only when the suite finishes.
+const originalConsoleError = console.error;
+const originalFetch = globalThis.fetch;
+let diagnosticConsoleSink: typeof console.error | undefined;
+let diagnosticFetch: typeof fetch | undefined;
+beforeAll(() => {
+  console.error = (...args: unknown[]) =>
+    (diagnosticConsoleSink ?? originalConsoleError).apply(console, args);
+  globalThis.fetch = (input, init) => (diagnosticFetch ?? originalFetch)(input, init);
+});
+afterAll(() => {
+  console.error = originalConsoleError;
+  globalThis.fetch = originalFetch;
+});
 
 const mocks = vi.hoisted(() => ({
   repoCreate: vi.fn(),
@@ -27,20 +108,6 @@ const mocks = vi.hoisted(() => ({
   installCliHttpGlobalDispatcher: vi.fn(),
   streamsGatewayBaseUrl: 'https://streams.example.test',
 }));
-
-vi.mock('@lody/shared', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('@lody/shared')>();
-  return {
-    ...actual,
-    createLoroStreamsTokenProvider: vi.fn(() => ({
-      getToken: mocks.streamsGetToken,
-      getGatewayBaseUrl: () => mocks.streamsGatewayBaseUrl,
-      getShardHostSuffix: () => undefined,
-      invalidate: () => {},
-      createAuthCallback: () => async () => 'streams-jwt',
-    })),
-  };
-});
 
 vi.mock('loro-repo', async (importOriginal) => {
   const actual = await importOriginal<typeof import('loro-repo')>();
@@ -109,11 +176,33 @@ import { LoroDocumentManager } from '../src/lib/loro/doc';
 import { createCliSqliteRepoStore } from '../src/lib/loro/sqlite-repo-store';
 
 const testStreamsTokens = {
-  createTokenProvider: () => ({
+  createTokenProvider: () =>
+    makeLoroStreamsTokenProvider({
+      endpoint: 'https://synthetic.invalid/token',
+      workspaceId: 'workspace-test',
+    }).pipe(
+      Effect.provideService(
+        LoroStreamsTokenPorts,
+        makeLoroStreamsTokenWebPorts({
+          credential: Effect.succeed('synthetic-credential'),
+          fetchImpl: async () =>
+            new Response(
+              JSON.stringify({
+                token: await mocks.streamsGetToken(),
+                expiresIn: 900,
+                gatewayBaseUrl: mocks.streamsGatewayBaseUrl,
+              })
+            ),
+        })
+      )
+    ),
+  createTokenProviderLegacy: () => ({
     getToken: mocks.streamsGetToken,
     getGatewayBaseUrl: () => mocks.streamsGatewayBaseUrl,
     getShardHostSuffix: () => undefined,
     invalidate: () => {},
+    close: async () => {},
+    retryCleanup: async () => {},
     createAuthCallback: () => async () => 'streams-jwt',
   }),
 };
@@ -389,6 +478,115 @@ describe('LoroDocumentManager.create degraded startup behavior', () => {
     await manager.cleanUp({ fast: true });
   });
 
+  it('keeps process-wide Streams diagnostics out of workspace loggers and follows the root sink', async () => {
+    const records: Array<{ sink: string; level: string; message: unknown }> = [];
+    const captureLogger = (sink: string): Logger => ({
+      ...createSilentLogger(),
+      debug: (message) => records.push({ sink, level: 'debug', message }),
+      child: () => captureLogger(sink),
+    });
+    let root = captureLogger('process-before');
+    const rootGetter = vi.spyOn(logging, 'getLogger').mockImplementation(() => root);
+    // This case exercises diagnostics, not the independent live monitor room.
+    const monitorAttach = vi
+      .spyOn(CliMachineMonitorRuntime.prototype, 'attachStreams')
+      .mockResolvedValue(undefined);
+    const managers: LoroDocumentManager[] = [];
+    const consoleOutput: unknown[][] = [];
+    diagnosticConsoleSink = (...args) => consoleOutput.push(args);
+    const response = new Response('missing', { status: 404 });
+    const fetchInputs: Array<[Parameters<typeof fetch>[0], RequestInit | undefined]> = [];
+    diagnosticFetch = async (input, init) => {
+      fetchInputs.push([input, init]);
+      return response;
+    };
+    let installedConsole: typeof console.error | undefined;
+    let installedFetch: typeof fetch | undefined;
+
+    try {
+      for (const workspaceId of ['workspace-a', 'workspace-b']) {
+        mocks.repoCreate.mockResolvedValueOnce({
+          joinMetaRoom: vi.fn(async () => createMetaSubscription()),
+          destroy: vi.fn(async () => {}),
+          addTransport: mocks.repoAddTransport,
+          removeTransport: mocks.repoRemoveTransport,
+          transportRooms: mocks.repoTransportRooms,
+        });
+        managers.push(
+          await LoroDocumentManager.create(
+            workspaceId as WorkspaceId,
+            'user-1',
+            captureLogger(workspaceId),
+            { attachRemoteOnCreate: true, streamsTokens: testStreamsTokens }
+          )
+        );
+        installedConsole ??= console.error;
+        installedFetch ??= globalThis.fetch;
+        expect(console.error).toBe(installedConsole);
+        expect(globalThis.fetch).toBe(installedFetch);
+        // Both records concern A, including the one emitted after B attaches.
+        console.error('[streams-crdt] local append failed', {
+          streamUrl: 'https://streams.example.test/ds/workspace-a%3As%3Asession-1',
+        });
+      }
+
+      root = captureLogger('process-after');
+      console.error('[loro-repo] synthetic failure', 'detail');
+      const url = new URL(
+        'https://synthetic-user:synthetic-password@streams.example.test/ds/workspace-a?token=synthetic-secret'
+      );
+      const init = { method: 'POST' };
+      expect(await fetch(url, init)).toBe(response);
+      expect(fetchInputs).toEqual([[url, init]]);
+      expect(await response.text()).toBe('missing');
+
+      expect(
+        records.filter(
+          ({ message }) => typeof message === 'string' && message.startsWith('[loro-streams-diag]')
+        )
+      ).toEqual([
+        ...['process-before', 'process-before'].map((sink) => ({
+          sink,
+          level: 'debug',
+          message:
+            '[loro-streams-diag] [streams-crdt] local append failed {"streamUrl":"https://streams.example.test/ds/workspace-a%3As%3Asession-1"}',
+        })),
+        {
+          sink: 'process-after',
+          level: 'debug',
+          message: '[loro-streams-diag] [loro-repo] synthetic failure detail',
+        },
+        {
+          sink: 'process-after',
+          level: 'debug',
+          message:
+            '[loro-streams-diag] HTTP 404 from Streams API: POST https://streams.example.test/ds/workspace-a?token=REDACTED',
+        },
+      ]);
+
+      const count = records.length;
+      expect(await fetch('https://other.example.test/missing')).toBe(response);
+      const success = new Response('ok');
+      diagnosticFetch = async () => success;
+      expect(await fetch(url)).toBe(success);
+      const failure = new Error('synthetic fetch failure');
+      diagnosticFetch = async () => {
+        throw failure;
+      };
+      await expect(fetch(url)).rejects.toBe(failure);
+      expect(records).toHaveLength(count);
+      const unrelated = { message: 'ordinary error' };
+      console.error('other library', unrelated);
+      expect(consoleOutput).toEqual([['other library', unrelated]]);
+    } finally {
+      for (const manager of managers) await manager.cleanUp({ fast: true });
+      diagnosticConsoleSink = undefined;
+      diagnosticFetch = undefined;
+      monitorAttach.mockRestore();
+      rootGetter.mockRestore();
+    }
+  });
+
   it('installs the CLI HTTP global dispatcher at create without attaching Streams', async () => {
     const logger = createSilentLogger();
     mocks.repoCreate.mockResolvedValueOnce({
@@ -517,7 +715,9 @@ describe('LoroDocumentManager.create degraded startup behavior', () => {
     // resetBackoff:false) instead of early-returning, so a doc/flock room stuck
     // in 'error' behind a healthy transport+meta is rejoined without a daemon
     // restart. See connection-recovery.ts sweepRooms + connection-recovery.test.ts.
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     process.env.LODY_LORO_AUTO_RECONNECT_INTERVAL_MS = '10';
     const joinMetaRoom = vi.fn(async () => createMetaSubscription());
     const repoReconnect = vi.fn(async () => {});
@@ -842,6 +1042,9 @@ describe('LoroDocumentManager.create degraded startup behavior', () => {
     const manager = new LoroDocumentManager({
       repo,
       workspaceId: 'workspace-flock-replaced' as WorkspaceId,
+      presenceRuntime: await createCliPresenceRuntimeLegacy(
+        'workspace-flock-replaced' as WorkspaceId
+      ),
       userId: 'user-1',
       metaSub: null,
       logger: createSilentLogger(),
@@ -991,7 +1194,7 @@ describe('LoroDocumentManager.create degraded startup behavior', () => {
       commit: vi.fn(),
       subscribe: vi.fn(() => vi.fn()),
     };
-    const localServer = new LocalLoroDataPlaneServer({
+    const localServer = new LocalLoroDataPlaneServerLegacy({
       workspaceId,
       resolveDoc: async () => {
         throw new Error('unused');
@@ -1050,7 +1253,9 @@ describe('LoroDocumentManager.create degraded startup behavior', () => {
   });
 
   it('reconnects and notifies listeners after meta room disconnects', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     process.env.LODY_LORO_AUTO_RECONNECT_DELAY_MS = '1';
     process.env.LODY_LORO_AUTO_RECONNECT_INTERVAL_MS = '0';
 
@@ -1148,7 +1353,9 @@ describe('LoroDocumentManager.create degraded startup behavior', () => {
   });
 
   it('backs off automatic reconnects while the meta room remains disconnected', async () => {
-    vi.useFakeTimers();
+    vi.useFakeTimers({
+      toFake: ['Date', 'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'],
+    });
     process.env.LODY_LORO_AUTO_RECONNECT_DELAY_MS = '100';
     process.env.LODY_LORO_AUTO_RECONNECT_MAX_DELAY_MS = '1000';
     process.env.LODY_LORO_AUTO_RECONNECT_INTERVAL_MS = '0';

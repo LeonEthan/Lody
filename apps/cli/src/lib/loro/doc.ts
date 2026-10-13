@@ -73,8 +73,9 @@ import {
   BuiltinRuntimeOverridesSchema,
   CustomAcpLaunchSpecSchema,
 } from '@lody/shared';
-import { LocalLoroDataPlaneServer } from '@lody/shared/local-loro-data-plane-server';
-import { createLocalLoroDataPlaneScheduler } from '@lody/shared/local-loro-data-plane-scheduler';
+import { LocalLoroDataPlaneServerLegacy } from '@lody/shared/local-loro-data-plane-server';
+import { getProcessLocalLoroWriterLegacy } from '@lody/shared/local-loro-writer/legacy';
+import { LocalLoroWriterNodeTurn } from '@lody/shared/node/local-loro-writer';
 import { v4 as uuidv4 } from 'uuid';
 import { getLogger, type Logger } from '@/utils/logger';
 import { captureException } from '@/instrument';
@@ -92,7 +93,7 @@ import {
   type RepoRoomSubscription,
   type RepoTransportRoomStatus,
 } from 'loro-repo';
-import { CliPresenceRuntime } from './presence';
+import { createCliPresenceRuntimeLegacy, type CliPresenceRuntimeLegacy } from './presence-legacy';
 import { CliMachineMonitorRuntime } from './machine-monitor';
 import {
   attachAutoMarkLatestUserHistoryAsRead,
@@ -174,18 +175,13 @@ const isValidDaemonLaunchConfig = (
 type GlobalWithOptionalBun = typeof globalThis & { Bun?: unknown };
 type GlobalWithWebSocket = { WebSocket: typeof ProxiedWebSocket };
 
-const localLoroDataPlaneScheduler = createLocalLoroDataPlaneScheduler((work) => {
-  const handle = setImmediate(work);
-  return () => clearImmediate(handle);
-});
-
 const createLocalLoroDataPlaneServer = (
   repo: LoroRepo,
   workspaceId: WorkspaceId,
-  presenceRuntime: CliPresenceRuntime,
+  presenceRuntime: CliPresenceRuntimeLegacy,
   machineMonitorRuntime: CliMachineMonitorRuntime
-): LocalLoroDataPlaneServer =>
-  new LocalLoroDataPlaneServer({
+): LocalLoroDataPlaneServerLegacy =>
+  new LocalLoroDataPlaneServerLegacy({
     workspaceId,
     resolveDoc: async (docId) => (await repo.openPersistedDoc(docId)).doc,
     resolveFlockDoc: async (flockDocId) => (await repo.openFlockDoc(flockDocId)).flock,
@@ -206,9 +202,8 @@ const createLocalLoroDataPlaneServer = (
       encodeAll: () => machineMonitorRuntime.encodeLocalState(),
       subscribe: (listener) => machineMonitorRuntime.subscribeLocalState(listener),
     },
-    // All workspace engines share one fair scheduler: bulk work runs after the
-    // poll phase, one quantum at a time.
-    scheduler: localLoroDataPlaneScheduler,
+    // All workspace lanes share the physical socket writer and host-turn pacer.
+    writerLegacy: getProcessLocalLoroWriterLegacy(LocalLoroWriterNodeTurn),
   });
 
 /**
@@ -217,28 +212,25 @@ const createLocalLoroDataPlaneServer = (
  * (multiple workspaces) doesn't stack duplicate wrapper layers.
  */
 let streamsDiagnosticsInstalled = false;
-let streamsDiagLogger: Logger | null = null;
 
-function installStreamsDiagnostics(logger: Logger): void {
-  // Always update the logger so the most-recently-created workspace's logger
-  // is used for diagnostic output.
-  streamsDiagLogger = logger;
-
+function installStreamsDiagnostics(): void {
   if (streamsDiagnosticsInstalled) return;
   streamsDiagnosticsInstalled = true;
 
+  // These process-wide hooks cannot infer the emitting workspace. Resolve the
+  // current root sink at emission time instead of retaining a workspace logger.
   // Intercept console.error to capture [streams-crdt] / [loro-repo] internal
   // error messages that would otherwise be lost (not routed to the app logger).
   const origConsoleError = console.error;
   console.error = (...args: unknown[]) => {
     if (typeof args[0] === 'string' && args[0].startsWith('[streams-crdt]')) {
       const detail = args.length > 1 ? ` ${JSON.stringify(args[1])}` : '';
-      streamsDiagLogger?.debug(`[loro-streams-diag] ${args[0]}${detail}`);
+      getLogger().debug(`[loro-streams-diag] ${args[0]}${detail}`);
       return;
     }
     if (typeof args[0] === 'string' && args[0].startsWith('[loro-repo]')) {
       const detail = args.length > 1 ? ` ${args[1]}` : '';
-      streamsDiagLogger?.debug(`[loro-streams-diag] ${args[0]}${detail}`);
+      getLogger().debug(`[loro-streams-diag] ${args[0]}${detail}`);
       return;
     }
     origConsoleError.apply(console, args);
@@ -259,7 +251,7 @@ function installStreamsDiagnostics(logger: Logger): void {
             : (input as Request).url;
       if (url.includes('/ds/')) {
         const method = init?.method ?? (input instanceof Request ? input.method : 'GET');
-        streamsDiagLogger?.debug(
+        getLogger().debug(
           `[loro-streams-diag] HTTP 404 from Streams API: ${method} ${sanitizeUrlForLogging(url)}`
         );
       }
@@ -332,9 +324,9 @@ export interface LoroDocumentManagerOptions {
   initialTransportStatus?: TransportConnectionStatus;
   initialMetaSyncPromise?: Promise<boolean>;
   initialMetaSyncCompleted?: boolean;
-  presenceRuntime?: CliPresenceRuntime | null;
+  presenceRuntime?: CliPresenceRuntimeLegacy | null;
   machineMonitorRuntime?: CliMachineMonitorRuntime | null;
-  localLoroDataPlaneServer?: LocalLoroDataPlaneServer | null;
+  localLoroDataPlaneServer?: LocalLoroDataPlaneServerLegacy | null;
   sqliteRepoStore?: CliSqliteRepoStore | null;
   /** LoroDoc Streams cursors for this process; see `DocumentCursorScope`. */
   documentRemoteCursorStore?: RemoteCursorStore | null;
@@ -360,7 +352,7 @@ export class LoroDocumentManager {
   private readonly workspaceId: WorkspaceId;
   private readonly userId: string;
   private readonly logger: Logger;
-  private readonly localLoroDataPlaneServer: LocalLoroDataPlaneServer | null;
+  private readonly localLoroDataPlaneServer: LocalLoroDataPlaneServerLegacy | null;
   private readonly sqliteRepoStore: CliSqliteRepoStore | null;
   private readonly documentRemoteCursorStore: RemoteCursorStore | null;
   private remoteStreamsAttached: boolean;
@@ -376,8 +368,11 @@ export class LoroDocumentManager {
   private detachMachineFlockMetaRoomSyncedListener: (() => void) | null = null;
   private initialMetaSyncCompleted = false;
   private readonly initialMetaSyncPromise: Promise<boolean>;
-  private presenceRuntime: CliPresenceRuntime | null;
+  private presenceRuntime: CliPresenceRuntimeLegacy | null;
   private machineMonitorRuntime: CliMachineMonitorRuntime | null;
+  private remoteStreamsTokens: Awaited<
+    ReturnType<CliPresenceRuntimeLegacy['createStreamsTokens']>
+  > | null = null;
   private remoteStreamsStatusUnsubscribe: (() => void) | null = null;
   private remoteTransportOpQueue: Promise<unknown> = Promise.resolve();
   private readonly streamsTokens: CloudStreamsTokenPort | null;
@@ -425,6 +420,7 @@ export class LoroDocumentManager {
     );
 
     let repo: LoroRepo | null = null;
+    let presenceRuntime: CliPresenceRuntimeLegacy | null = null;
     let manager: LoroDocumentManager | null = null;
     try {
       const createRepoStartMs = Date.now();
@@ -448,7 +444,7 @@ export class LoroDocumentManager {
       // Presence is produced locally regardless of remote sync so local-first
       // renderers get machine/session liveness over the data plane; the cloud
       // Streams sink is attached later by the remote bridge.
-      const presenceRuntime = new CliPresenceRuntime({ workspaceId, logger });
+      presenceRuntime = await createCliPresenceRuntimeLegacy(workspaceId);
       const machineMonitorRuntime = new CliMachineMonitorRuntime({ workspaceId, logger });
       // No transport is registered at startup: rooms stay pending/detached
       // while offline, and renderer↔CLI document sync is served out-of-band by
@@ -497,6 +493,12 @@ export class LoroDocumentManager {
         sessionHistoryFactory: options.sessionHistoryFactory,
       });
     } catch (error) {
+      const failures: unknown[] = [error];
+      try {
+        await presenceRuntime?.stop();
+      } catch (cleanup) {
+        failures.push(cleanup);
+      }
       try {
         if (repo) {
           await repo.destroy();
@@ -509,6 +511,16 @@ export class LoroDocumentManager {
             closeError
           )}`
         );
+      }
+      if (failures.length > 1) {
+        const failure = new AggregateError(
+          failures,
+          'Loro initialization and presence cleanup failed',
+          {
+            cause: error,
+          }
+        );
+        throw failure;
       }
       throw error;
     }
@@ -633,6 +645,7 @@ export class LoroDocumentManager {
   }
 
   private async attachRemoteStreamsTransportInner(): Promise<void> {
+    if (this.cleaningUp) throw new Error('document_manager_closing');
     if (this.remoteStreamsAttached) {
       return;
     }
@@ -643,14 +656,40 @@ export class LoroDocumentManager {
       throw new Error('cloud_streams_port_unavailable');
     }
 
+    if (!this.presenceRuntime) throw new Error('presence_owner_unavailable');
+    await this.presenceRuntime.retryCleanup();
+    if (this.remoteStreamsTokens) {
+      await this.remoteStreamsTokens.legacy.retryCleanup();
+      await this.remoteStreamsTokens.legacy.close();
+      this.remoteStreamsTokens = null;
+    }
+    const streamsTokens = await this.presenceRuntime.createStreamsTokens(
+      this.streamsTokens.createTokenProvider({ workspaceId: this.workspaceId })
+    );
+    this.remoteStreamsTokens = streamsTokens;
     const streamsTransport = await createCliStreamsTransport({
       workspaceId: this.workspaceId,
-      tokenProvider: this.streamsTokens.createTokenProvider({ workspaceId: this.workspaceId }),
+      tokenProvider: streamsTokens.legacy,
       repo: this.repo,
       documentRemoteCursorStore: this.documentRemoteCursorStore,
       logger: this.logger,
+    }).catch(async (error: unknown) => {
+      try {
+        await streamsTokens.legacy.close();
+        this.remoteStreamsTokens = null;
+      } catch (cleanup) {
+        const failure = new AggregateError(
+          [error, cleanup],
+          'Streams preparation and token cleanup failed',
+          {
+            cause: error,
+          }
+        );
+        throw failure;
+      }
+      throw error;
     });
-    installStreamsDiagnostics(this.logger);
+    installStreamsDiagnostics();
     const detachStreamsTransportStatusListener = streamsTransport.adapter.onStatusChange(
       (status) => {
         this.logger.debug(`[${this.workspaceId}] Loro streams transport status: ${status}`);
@@ -666,9 +705,9 @@ export class LoroDocumentManager {
       // The presence runtime already exists (created at repo init and producing
       // presence locally); attaching the cloud Streams sink additionally mirrors
       // it to the cloud presence stream.
-      this.presenceRuntime?.attachStreams({
+      await this.presenceRuntime.attachStreams({
         streamsBaseUrl: streamsTransport.gatewayBaseUrl,
-        auth: streamsTransport.tokenProvider.createAuthCallback(),
+        auth: streamsTokens.native.createAuthCallback(),
         shardHostSuffix: streamsTransport.tokenProvider.getShardHostSuffix(),
       });
       this.machineMonitorRuntime?.attachStreams({
@@ -704,25 +743,31 @@ export class LoroDocumentManager {
       }
     } catch (error) {
       detachStreamsTransportStatusListener();
-      await Promise.all([
+      const failures: unknown[] = [error];
+      const detached = await Promise.allSettled([
         this.presenceRuntime?.detachStreams(),
         this.machineMonitorRuntime?.detachStreams(),
-      ]).catch(() => undefined);
-      // addTransport registers the transport before connecting, so a failure
-      // anywhere in this block can leave a broken 'streams' transport behind —
-      // remove it (close: true also closes the adapter) and close best-effort
-      // as backup.
-      await this.repo.removeTransport('streams', { close: true }).catch(() => undefined);
-      await streamsTransport.adapter.close().catch((closeError: unknown) => {
-        this.logger.debug(
-          `[${this.workspaceId}] Failed to close remote Streams transport after attach failure: ${formatErrorMessage(
-            closeError
-          )}`
-        );
-      });
+      ]);
+      for (const result of detached) if (result.status === 'rejected') failures.push(result.reason);
+      // Registration happens before connect, so remove and close both boundaries.
+      for (const cleanup of [
+        () => this.repo.removeTransport('streams', { close: true }),
+        () => streamsTransport.adapter.close(),
+        () => streamsTokens.legacy.close(),
+      ]) {
+        try {
+          await cleanup();
+        } catch (failure) {
+          failures.push(failure);
+        }
+      }
+      if (failures.length === 1) this.remoteStreamsTokens = null;
+      this.remoteStreamsStatusUnsubscribe = null;
       // Back to local-only, which is a healthy state (see create()).
       this.setTransportStatus('connected');
-      throw error;
+      throw failures.length === 1
+        ? error
+        : new AggregateError(failures, 'Streams attach and cleanup failed', { cause: error });
     }
   }
 
@@ -738,20 +783,32 @@ export class LoroDocumentManager {
     this.remoteStreamsGeneration += 1;
     this.remoteStreamsStatusUnsubscribe?.();
     this.remoteStreamsStatusUnsubscribe = null;
+    // Keep local production alive, but revoke both cloud sinks before their shared token owner.
+    const failures: unknown[] = [];
+    const detached = await Promise.allSettled([
+      this.presenceRuntime?.detachStreams(),
+      this.machineMonitorRuntime?.detachStreams(),
+    ]);
+    for (const result of detached) if (result.status === 'rejected') failures.push(result.reason);
     try {
-      // Keep local presence production alive for the data plane, but revoke all
-      // cloud ephemeral sinks together with the durable Streams transport.
-      await Promise.all([
-        this.presenceRuntime?.detachStreams(),
-        this.machineMonitorRuntime?.detachStreams(),
-      ]);
-    } finally {
       await this.repo.removeTransport('streams', { close: true });
-      // Deliberately offline (local-only) is a healthy state, matching the
-      // pre-attach startup status; rooms sit 'detached' without recovery.
-      this.setTransportStatus('connected');
-      this.logger.info(`[${this.workspaceId}] Remote Streams transport detached`);
+    } catch (error) {
+      failures.push(error);
     }
+    if (this.remoteStreamsTokens) {
+      try {
+        await this.remoteStreamsTokens.legacy.close();
+        this.remoteStreamsTokens = null;
+      } catch (error) {
+        failures.push(error);
+      }
+    }
+    this.setTransportStatus('connected');
+    if (failures.length)
+      throw failures.length === 1
+        ? failures[0]
+        : new AggregateError(failures, 'Streams detach cleanup failed');
+    this.logger.info(`[${this.workspaceId}] Remote Streams transport detached`);
   }
 
   /**
@@ -786,7 +843,7 @@ export class LoroDocumentManager {
    * The push-based data-plane engine that serves renderer↔CLI document sync for
    * this workspace. The CLI socket server routes client connections to it.
    */
-  getLocalLoroDataPlaneServer(): LocalLoroDataPlaneServer | null {
+  getLocalLoroDataPlaneServer(): LocalLoroDataPlaneServerLegacy | null {
     return this.localLoroDataPlaneServer;
   }
 
@@ -808,7 +865,7 @@ export class LoroDocumentManager {
    * updates lost in the window here are re-uploaded by the peer's next join
    * reconciliation.
    *
-   * Route every new unload through here. `tests/loro-doc-unload-invalidates-data-plane.test.ts`
+   * Route every new unload through here. `tests/loro-doc-unload-data-plane-integration.test.ts`
    * fails the build if another `repo.unloadDoc` call site appears.
    */
   async unloadDocRoom(docId: string): Promise<void> {
@@ -1694,11 +1751,12 @@ export class LoroDocumentManager {
 
   async cleanUp(options: { fast?: boolean; preserveSessionStatus?: boolean } = {}) {
     this.cleaningUp = true;
+    let presenceCleanupFailure: unknown;
     this.localDocRoomBridgeGeneration += 1;
     for (const docId of [...this.localDocRoomBridges.keys()]) {
       this.cancelLocalDocRoomBridge(docId);
     }
-    this.localLoroDataPlaneServer?.dispose();
+    await this.localLoroDataPlaneServer?.disposeLegacy();
     try {
       await this.machineMonitorRuntime?.stop();
     } catch (error) {
@@ -1706,9 +1764,21 @@ export class LoroDocumentManager {
         `[${this.workspaceId}] Failed to stop machine monitor runtime: ${formatErrorMessage(error)}`
       );
     }
+    if (this.remoteStreamsTokens) {
+      try {
+        await this.detachRemoteStreamsTransport();
+      } catch (error) {
+        presenceCleanupFailure = error;
+      }
+    }
     try {
       await this.presenceRuntime?.stop();
     } catch (error) {
+      presenceCleanupFailure = presenceCleanupFailure
+        ? new AggregateError([presenceCleanupFailure, error], 'Workspace cleanup failed', {
+            cause: error,
+          })
+        : error;
       this.logger.debug(
         `[${this.workspaceId}] Failed to stop Loro presence runtime: ${formatErrorMessage(error)}`
       );
@@ -1746,6 +1816,7 @@ export class LoroDocumentManager {
     this.remoteStreamsStatusUnsubscribe?.();
     this.remoteStreamsStatusUnsubscribe = null;
     await this.destroyRepo({ fast: options.fast });
+    if (presenceCleanupFailure) throw presenceCleanupFailure;
   }
 
   configureMachineMonitor(

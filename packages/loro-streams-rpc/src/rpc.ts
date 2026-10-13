@@ -183,6 +183,32 @@ export const LORO_STREAMS_RPC_ERROR_CODES = {
 export type LoroStreamsRpcErrorCode =
   (typeof LORO_STREAMS_RPC_ERROR_CODES)[keyof typeof LORO_STREAMS_RPC_ERROR_CODES];
 
+/** A handler rejection with a stable wire code and content-free, local-only context. */
+export class LoroStreamsRpcHandlerError extends Error {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly context?: Readonly<Record<string, string>>
+  ) {
+    super(message);
+    this.name = 'LoroStreamsRpcHandlerError';
+  }
+}
+
+/** Client-side provenance only. These fields are never added to a wire history result. */
+export type SessionHistoryRpcFailure = {
+  readonly source: 'transport' | 'remote' | 'protocol';
+  readonly code: string;
+  readonly requestId: string;
+  readonly machineId: string;
+};
+export type SessionHistoryRpcReadResponse = SessionHistoryReadResponse & {
+  readonly rpcFailure?: SessionHistoryRpcFailure;
+};
+export type SessionHistoryRpcWriteResponse = SessionHistoryWriteResponse & {
+  readonly rpcFailure?: SessionHistoryRpcFailure;
+};
+
 export const LORO_RPC_REQUEST_STREAM_SEGMENT = 'rpc:req';
 export const LORO_RPC_RESPONSE_STREAM_SEGMENT = 'rpc:res';
 
@@ -1592,6 +1618,27 @@ export type LoroMachineRpcResult =
   | LocalProjectGitStateRpcResponse
   | LocalProjectControlResponse;
 
+const historyRpcFailureResponse = (
+  method: 'session/history-read' | 'session/history-write',
+  context: { sessionId: string; operation?: SessionHistoryWriteOperation } | undefined,
+  error: LoroStreamsRpcError,
+  failure?: SessionHistoryRpcFailure
+): SessionHistoryRpcReadResponse | SessionHistoryRpcWriteResponse => {
+  const common = {
+    sessionId: (context?.sessionId ?? '') as SessionId,
+    success: false,
+    error: `${error.code}: ${error.message}`,
+    ...(failure ? { rpcFailure: failure } : {}),
+  };
+  return method === 'session/history-read'
+    ? { ...common, type: 'session/history-read_response' }
+    : {
+        ...common,
+        type: 'session/history-write_response',
+        operation: context?.operation ?? 'append',
+      };
+};
+
 const toLegacyRpcErrorResponse = (
   method: LoroStreamsRpcMethod,
   machineId: string,
@@ -1617,7 +1664,8 @@ const toLegacyRpcErrorResponse = (
   },
   dispatchContext?: { sessionId: string; userTurnId: string },
   preparationContext?: { preparationId: string; sessionId: string },
-  historyContext?: { sessionId: string; operation?: SessionHistoryWriteOperation }
+  historyContext?: { sessionId: string; operation?: SessionHistoryWriteOperation },
+  historyFailure?: SessionHistoryRpcFailure
 ): LoroMachineRpcResult => {
   if (method === 'machine/preview-control') {
     return {
@@ -1833,23 +1881,8 @@ const toLegacyRpcErrorResponse = (
     };
   }
 
-  if (method === 'session/history-read') {
-    return {
-      type: 'session/history-read_response',
-      sessionId: (historyContext?.sessionId ?? '') as SessionHistoryReadResponse['sessionId'],
-      success: false,
-      error: `${error.code}: ${error.message}`,
-    };
-  }
-
-  if (method === 'session/history-write') {
-    return {
-      type: 'session/history-write_response',
-      sessionId: (historyContext?.sessionId ?? '') as SessionHistoryWriteResponse['sessionId'],
-      operation: historyContext?.operation ?? 'append',
-      success: false,
-      error: `${error.code}: ${error.message}`,
-    };
+  if (method === 'session/history-read' || method === 'session/history-write') {
+    return historyRpcFailureResponse(method, historyContext, error, historyFailure);
   }
 
   if (method === 'file/preview') {
@@ -2260,7 +2293,30 @@ export class LoroStreamsRpcResponseDispatcher {
       // connection is open but not delivering appends; the transport-level
       // read looks perfectly healthy in that failure.
       this.noteLiveModeResponseTimeout();
-      pending?.resolve(null);
+      if (
+        pending?.historyContext &&
+        (registration.method === 'session/history-read' ||
+          registration.method === 'session/history-write')
+      ) {
+        pending.resolve(
+          historyRpcFailureResponse(
+            registration.method,
+            pending.historyContext,
+            {
+              code: 'response_timeout',
+              message: 'No history RPC response arrived before the request deadline.',
+            },
+            {
+              source: 'transport',
+              code: 'response_timeout',
+              requestId,
+              machineId: registration.machineId,
+            }
+          )
+        );
+      } else {
+        pending?.resolve(null);
+      }
     }, registration.timeoutMs);
   }
 
@@ -2507,7 +2563,13 @@ export class LoroStreamsRpcResponseDispatcher {
           finalPending.localProjectContext,
           finalPending.dispatchContext,
           finalPending.preparationContext,
-          finalPending.historyContext
+          finalPending.historyContext,
+          {
+            source: error === parsed.data.error ? 'remote' : 'protocol',
+            code: error.code,
+            requestId: parsed.data.id,
+            machineId: parsed.data.machineId,
+          }
         )
       );
       return;
@@ -2541,7 +2603,13 @@ export class LoroStreamsRpcResponseDispatcher {
           finalPending.localProjectContext,
           finalPending.dispatchContext,
           finalPending.preparationContext,
-          finalPending.historyContext
+          finalPending.historyContext,
+          {
+            source: 'protocol',
+            code: 'invalid_result',
+            requestId: parsed.data.id,
+            machineId: parsed.data.machineId,
+          }
         )
       );
       return;
@@ -3085,13 +3153,13 @@ export class LoroStreamsMachineRpcClient {
     query: SessionHistoryReadQuery;
     ownerSessionId?: string;
     timeoutMs?: number;
-  }): Promise<SessionHistoryReadResponse | null> {
+  }): Promise<SessionHistoryRpcReadResponse | null> {
     return (await this.sendRequest({
       method: 'session/history-read',
       timeoutMs: options.timeoutMs ?? 30_000,
       ownerSessionId: options.ownerSessionId ?? options.sessionId,
       params: { sessionId: options.sessionId, query: options.query },
-    })) as SessionHistoryReadResponse | null;
+    })) as SessionHistoryRpcReadResponse | null;
   }
 
   async requestSessionHistoryWrite(options: {
@@ -3100,7 +3168,7 @@ export class LoroStreamsMachineRpcClient {
     operation: SessionHistoryWriteOperation;
     payload: Record<string, unknown>;
     timeoutMs?: number;
-  }): Promise<SessionHistoryWriteResponse | null> {
+  }): Promise<SessionHistoryRpcWriteResponse | null> {
     return (await this.sendRequest({
       method: 'session/history-write',
       timeoutMs: options.timeoutMs ?? 30_000,
@@ -3110,7 +3178,7 @@ export class LoroStreamsMachineRpcClient {
         operation: options.operation,
         payload: options.payload,
       },
-    })) as SessionHistoryWriteResponse | null;
+    })) as SessionHistoryRpcWriteResponse | null;
   }
 
   async requestCodeCollabOpenText(
@@ -4137,7 +4205,13 @@ export class LoroStreamsMachineRpcClient {
         pending.localProjectContext,
         pending.dispatchContext,
         pending.preparationContext,
-        pending.historyContext
+        pending.historyContext,
+        {
+          source: 'transport',
+          code: isMissingRequestStream ? 'machine_rpc_unavailable' : 'request_failed',
+          requestId,
+          machineId: this.options.machineId,
+        }
       );
       pending.resolve(errorResponse);
       return errorResponse;

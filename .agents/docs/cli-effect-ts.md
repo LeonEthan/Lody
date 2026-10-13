@@ -92,13 +92,13 @@ For a lifecycle change, answer these questions briefly in the existing owning No
 before choosing primitives. Omit inapplicable questions and link existing contracts
 instead of creating a new checklist document for every edit.
 
-| Question | Observable contract |
-| --- | --- |
-| Trigger | Which input/state starts work, and what ordering or reentry is allowed? |
-| Owner | Who owns each resource/producer, and who may release it? |
-| Cancellation | Does cancellation end one wait, the producer, or raw external work? How is actual termination confirmed? |
-| Handoff | What observable release condition allows a successor or replacement to start? |
-| Failure recovery | Who retains unresolved resources and the complete failure, and who can retry cleanup? |
+| Question         | Observable contract                                                                                      |
+| ---------------- | -------------------------------------------------------------------------------------------------------- |
+| Trigger          | Which input/state starts work, and what ordering or reentry is allowed?                                  |
+| Owner            | Who owns each resource/producer, and who may release it?                                                 |
+| Cancellation     | Does cancellation end one wait, the producer, or raw external work? How is actual termination confirmed? |
+| Handoff          | What observable release condition allows a successor or replacement to start?                            |
+| Failure recovery | Who retains unresolved resources and the complete failure, and who can retry cleanup?                    |
 
 Map applicable answers to behavioral acceptance cases. A cancelled reader must not
 stop a shared producer needed by other readers; a cleanup timeout must not permit
@@ -206,8 +206,9 @@ leases. There is no Promise cache, cache timer or independent shell-probe runner
 
 CLI index and Electron startApplication each compose the application's first
 long-lived native service through makeApplicationRuntime. Concurrent disposal joins
-one receipt; failed disposal retains the original ownership Cause across failed
-recovery attempts. Replacement is allowed only after release is confirmed.
+one receipt; failed disposal retains the original ownership Cause and subsequent
+recovery Causes in its receipts. Recovery retries the original transferred owners.
+Replacement is allowed only after release is confirmed.
 CLI graceful/one-shot/fatal exits await that owner; failed graceful cleanup exits
 with a failure code. Electron stops it inside the existing quit barrier after
 renderer unload approval, and a later quit retries unresolved resources.
@@ -319,6 +320,60 @@ which executes in the existing `fileLocksLegacy` runtime, with no second lock co
 Delete it when the mutation owner receives native services. Synchronous manager
 path/existence methods, setup, GC and the daemon runtime still need migration. See
 [the decision](../notes/implemented/architecture/2026-10-10-effect-worktree-observations.md).
+
+## Streams token refresh
+
+`LoroStreamsTokens` / `LoroStreamsTokensLive` own native credential admission,
+shared refresh leases and encrypted-cache publication. Each provider has its own
+ports and Scope. Waiter deadlines retire only that waiter; last-lease release and
+replacement/close abort and join actual I/O. Failed joins retain raw/provider
+owners and the full Cause, and require explicit recovery before handoff.
+
+The official CLI cloud root supplies the native platform token port. Remaining
+renderer and Machine RPC callers use the sole
+`createLoroStreamsTokenProviderLegacy` facade and visible
+`createTokenProviderLegacy` port/type. Renderer teardown and CLI cloud-port
+shutdown await provider close. CLI durable transport and machine monitor borrow the
+workspace-native provider through `{provider, executor}` in that same facade,
+creating no extra runtime/cache. This is token ownership, not completion of upper
+Loro/daemon lifecycles. [API and decision](../../packages/shared/src/loro-streams-token/README.md).
+
+Native getToken/auth preserve terminal typed failure; only the explicit Legacy
+old-protocol callback projects a nonempty all-auth Cause to undefined. Mixed Causes
+retain non-auth reasons. Native `health` and `describeLoroStreamsTokenCause` expose
+safe state/counts and failure kinds without tokens, credentials or raw error payloads;
+keep the original Cause separately for recovery.
+
+## Workspace presence
+
+The CLI root provides `WorkspacePresenceOwners` alongside its shell cache. Product
+`doc.ts` and bridge readers use `createCliPresenceRuntimeLegacy`; its execution
+borrows that application runtime. `workspace-presence.ts` owns heartbeat and remote
+generation Scopes, while `presence-replica.ts` keeps CRDT state synchronous.
+`platform/presence.ts` supplies the published native SDK without a Promise transport
+coordinator. Delete the sole Legacy door when doc/Session/reader consumers directly
+compose the service. Full Causes and retained cleanup owners survive root disposal;
+explicit retry proves actual SDK and token cleanup before handoff. Session-active
+leases remain P6; the local relay's upper owners remain pending. See the
+[decision](../notes/implemented/architecture/2026-10-12-effect-workspace-presence.md).
+
+## Local presence and the shared connection writer
+
+`LocalLoroWriterLive` owns the application's FIFO pacer and shared physical socket
+writers. It requires `LocalLoroWriterTurn`; Node composition supplies a real host turn
+and the socket write/drain adapter. Native task/frame composition does not execute
+runtimes or wrap the former Promise pump. Presence encodes local-origin state at writer
+execution; CRDT/frontier/framing computation remains synchronous. Only the genuine
+Flock SDK export is a Promise adapter, retaining actual settlement without an abort
+contract. Close observers remain bounded inside finalizers; failed release retains
+complete Cause, the original producer/subscription and retry ownership.
+
+The one deprecated `local-loro-writer/legacy` executor serves the explicitly named
+`LocalLoroDataPlaneServerLegacy` and CLI doc/socket owners. Delete it when those
+application owners receive the native service. Room resolution/join/leave/import,
+LoroRepo and Fleet's wider cleanup remain under migration; this unit
+does not complete P7 or the Loro stack. Decision and acceptance evidence:
+[local presence writer](../notes/implemented/architecture/2026-10-12-effect-local-presence-writer.md).
 
 ## Temporary Promise facades
 

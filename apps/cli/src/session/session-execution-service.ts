@@ -79,7 +79,7 @@ import {
 import type { ContentBlock } from '@agentclientprotocol/sdk';
 import { createHash, randomUUID } from 'node:crypto';
 import type { ModelInfo } from '@lody/shared';
-import { Cause, Data, Effect, Exit, Fiber, type Scope } from 'effect';
+import { Cause, Data, Effect, Exit, Fiber, Scope } from 'effect';
 import {
   captureGitWorkingTreeDiffBaseline,
   getCurrentCommitHash,
@@ -4036,50 +4036,17 @@ export class SessionExecutionService {
     };
 
     const program = Effect.scoped(
-      Effect.acquireRelease(Effect.succeed(runtime), (turnRuntime, exit) =>
-        Effect.gen(function* () {
-          yield* self
-            .tryPromise(() =>
-              withTimeout(
-                turnRuntime.yieldedFinalization,
-                5_000,
-                'Turn finalization release timed out'
-              )
-            )
-            .pipe(
-              Effect.catchCause((cause) =>
-                Effect.sync(() => {
-                  turnRuntime.releaseFailure = cause;
-                }).pipe(Effect.andThen(Effect.failCause(cause)))
-              ),
-              Effect.orDie
-            );
-          const wasInterrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause);
-          const wasCancelled =
-            turnRuntime.cancelRequested ||
-            self.isTurnCancelled(sessionId, turnRuntime.turnId) ||
-            wasInterrupted;
-          if (turnRuntime.initializationStalled) {
-            yield* self.finalizeStalledInitializationEffect(turnRuntime);
-          } else if (wasCancelled) {
-            yield* self.finalizeCancelledTurnEffect({
-              sessionId,
-              sessionDoc,
-              turnId: turnRuntime.turnId,
-              userTurnId: turnRuntime.userTurnId,
-              session: turnRuntime.session,
-              pendingSession: turnRuntime.pendingSession,
-              terminateSession: turnRuntime.terminateSessionOnCancel,
-              reportTurnError: self.shouldReportCancelledTurnError(turnRuntime),
-            });
-          }
-          if (turnRuntime.disconnectedTransport && turnRuntime.session) {
+      Effect.acquireRelease(
+        Effect.flatMap(Scope.Scope, (scope) => Scope.fork(scope)),
+        (presenceScope, exit) =>
+          Effect.gen(function* () {
+            const turnRuntime = runtime;
             yield* self
               .tryPromise(() =>
                 withTimeout(
-                  turnRuntime.session!.terminate(true),
+                  turnRuntime.yieldedFinalization,
                   5_000,
-                  'Disconnected execution release timed out'
+                  'Turn finalization release timed out'
                 )
               )
               .pipe(
@@ -4090,12 +4057,56 @@ export class SessionExecutionService {
                 ),
                 Effect.orDie
               );
-          }
-          if (!turnRuntime.releaseFailure && !inboxInput)
-            self.releaseTurnRuntime(sessionId, turnRuntime.turnId);
-        })
+            const wasInterrupted = Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause);
+            const wasCancelled =
+              turnRuntime.cancelRequested ||
+              self.isTurnCancelled(sessionId, turnRuntime.turnId) ||
+              wasInterrupted;
+            if (turnRuntime.initializationStalled) {
+              yield* self.finalizeStalledInitializationEffect(turnRuntime);
+            } else if (wasCancelled) {
+              yield* self.finalizeCancelledTurnEffect({
+                sessionId,
+                sessionDoc,
+                turnId: turnRuntime.turnId,
+                userTurnId: turnRuntime.userTurnId,
+                session: turnRuntime.session,
+                pendingSession: turnRuntime.pendingSession,
+                terminateSession: turnRuntime.terminateSessionOnCancel,
+                reportTurnError: self.shouldReportCancelledTurnError(turnRuntime),
+              });
+            }
+            if (turnRuntime.disconnectedTransport && turnRuntime.session) {
+              yield* self
+                .tryPromise(() =>
+                  withTimeout(
+                    turnRuntime.session!.terminate(true),
+                    5_000,
+                    'Disconnected execution release timed out'
+                  )
+                )
+                .pipe(
+                  Effect.catchCause((cause) =>
+                    Effect.sync(() => {
+                      turnRuntime.releaseFailure = cause;
+                    }).pipe(Effect.andThen(Effect.failCause(cause)))
+                  ),
+                  Effect.orDie
+                );
+            }
+            // Raw work drains before presence clears; failed cleanup retains the Inbox owner.
+            yield* Scope.close(presenceScope, exit).pipe(
+              Effect.catchCause((cause) =>
+                Effect.sync(() => {
+                  turnRuntime.releaseFailure = cause;
+                }).pipe(Effect.andThen(Effect.failCause(cause)))
+              )
+            );
+            if (!turnRuntime.releaseFailure && !inboxInput)
+              self.releaseTurnRuntime(sessionId, turnRuntime.turnId);
+          })
       ).pipe(
-        Effect.flatMap(() =>
+        Effect.flatMap((presenceScope) =>
           Effect.gen(function* () {
             if (
               yield* self.tryPromise(() =>
@@ -4106,7 +4117,10 @@ export class SessionExecutionService {
               runtime.pendingInputOnCancel = 'preserve';
               return undefined;
             }
-            yield* self.acquireSessionActivePresence(sessionId, 'initializing');
+            yield* Scope.provide(
+              self.acquireSessionActivePresence(sessionId, 'initializing'),
+              presenceScope
+            );
 
             const setUnhandledErrorContext = (
               context: VisibleSessionTurnUnhandledErrorContext

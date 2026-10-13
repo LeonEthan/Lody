@@ -38,16 +38,15 @@ Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
   pointers in a consumer.
 - Stop data: control doc; meta: pointer. Never scan old docs for work or change active presence
   here (`../lib/loro/session-active-presence.ts`).
-- Keep bootstrap and live reconciliation bounded as README describes; add no per-trigger scan or
-  extra throttle.
+- Keep reconciliation bounded per README; no per-trigger scans or throttles.
 
 ## Turn execution
 
 - Gate LIST writes on user-entry sync (`turn-history-gate.ts`, 20s), never status/meta.
 - Goals obey [this contract](../../../../specs/session-goal-control.md).
-- Stop ends local steer waits, not the owner fiber. Drain raw prompt/steer/config work before
-  reuse. Follow [Inbox admission](../orchestration/AGENTS.md); execution IDs stay immutable.
-  `invocation` owns source/requester/config; steer replaces it before tools.
+- Stop ends steer waits, not the owner fiber. Drain raw ACP or confirm termination, then clear
+  presence before reuse. [Inbox admission](../orchestration/AGENTS.md); execution IDs stay fixed.
+  Assistant ids use `userTurnId`; `invocation` owns source/requester/config; steer replaces it.
 - Publish `latestUserMsgId` in the SAME write as the history append (`appendUserTurn`). Only
   dispatch producers publish it. Renderer and queue promotion retain the missing-history
   tombstone; CLI dispatch producers keep their own marker policy.
@@ -73,8 +72,8 @@ Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
 
 ## Lifecycle
 
-- Roost: [contract](README.md#roost-history-paging): app keys, no keyring/silent rotation.
-  Keep outcomes; causes local, RPC stage/code/ID.
+- Roost: [contract](README.md#roost-history-paging). Await owner/backend meta;
+  no keyring/rotation/fallback/replay. Causes local, RPC stage/code/ID.
 
 - `Session.createAgent` gates each ACP spawn; failed spawns reject JSON-RPC. Terminals spawn
   protocol argv (`sh -c` only for unsplit commands). Managed Codex reused-refresh startup
