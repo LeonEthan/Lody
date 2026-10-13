@@ -10,6 +10,7 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const files = [
   'apps/cli/src/lib/loro/workspace-presence.ts',
   'apps/cli/src/lib/loro/presence-replica.ts',
+  'apps/cli/src/lib/loro/session-active-presence.ts',
 ];
 const forbidden = new Set([
   'Promise',

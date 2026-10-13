@@ -357,6 +357,22 @@ explicit retry proves actual SDK and token cleanup before handoff. Session-activ
 leases remain P6; the local relay's upper owners remain pending. See the
 [decision](../notes/implemented/architecture/2026-10-12-effect-workspace-presence.md).
 
+## Session active presence leases
+
+`session-active-presence.ts` provides the native local-publication lease and heartbeat
+service. Visible Turns compose its `hold` into their existing presence child Scope;
+per-lease Deferred stalls replace the old callback waiter map. Clock/Schedule drive
+heartbeats, and raw ACP cleanup still precedes lease release and Turn handoff. A failed
+synchronous clear retains that lease/Cause until explicit `retryRelease`; recovery of
+an upper Turn finalizer remains the execution owner's responsibility.
+
+`SessionActivePresenceControllerLegacy` is the sole synchronous MessageHandler entry.
+It retains existing analytics flush Promises, preserves optional telemetry gates and
+waits for actual lease/monitoring release before document teardown. Delete this door
+when MessageHandler construction and analytics ownership become native. It introduces
+no transport queue, timer or nested ManagedRuntime. The presence boundary guard checks
+this kernel alongside the workspace kernel and replica.
+
 ## Local presence and the shared connection writer
 
 `LocalLoroWriterLive` owns the application's FIFO pacer and shared physical socket

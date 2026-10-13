@@ -208,7 +208,7 @@ export class LodyOperationCoordinator {
       this.abortTerminalCoordinators();
       void ready
         .then(({ activity }) => {
-          if (!this.started || this.nativeEpoch !== epoch) return;
+          if (!this.started || this.nativeEpoch !== epoch) return Promise.resolve();
           return runtime.runPromise(activity.arm('store', 10, 'operation-store'));
         })
         .catch((cause) => this.options.logger.warn(String(cause)));
@@ -302,7 +302,7 @@ export class LodyOperationCoordinator {
     const epoch = this.nativeEpoch;
     const runtime = this.nativeRuntime!;
     return this.nativeReady!.then(({ activity }) => {
-      if (!this.started || this.nativeEpoch !== epoch) return;
+      if (!this.started || this.nativeEpoch !== epoch) return Promise.resolve();
       return runtime.runPromise(activity.wake(reason));
     }).catch((cause) => this.options.logger.warn(String(cause)));
   }

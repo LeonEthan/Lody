@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushSync } from 'react-dom';
 import { createRoot, type Root } from 'react-dom/client';
 import type { AskUserQuestionPermissionMeta, AskUserQuestionAnswers } from '@lody/shared';
+import { parseAskUserQuestionElicitationRequest } from '@lody/shared';
 
 import { AskUserQuestionCard } from '../src/components/sessions/ask-user-question-card';
 import { Tooltip } from '@lody/ui/tooltip';
@@ -31,26 +32,31 @@ const meta: AskUserQuestionPermissionMeta = {
   ],
 };
 
-const metaWithInfo: AskUserQuestionPermissionMeta = {
-  source: 'codex',
-  version: 1,
-  allowCustomAnswer: false,
-  questions: [
-    {
-      header: 'Strategy',
-      question: 'Pick a strategy',
-      multiSelect: false,
-      options: [
-        {
-          label: 'Use a Map',
-          description: 'Best when keys are dynamic',
-          preview: 'const cache = new Map();',
-        },
-        { label: 'Use a plain object' },
-      ],
+// Core/Codex puts the question in the property description even for one field.
+const metaWithInfo = parseAskUserQuestionElicitationRequest({
+  mode: 'form',
+  message: 'Input requested',
+  _meta: { lody: { elicitation: { version: 1 } } },
+  requestedSchema: {
+    type: 'object',
+    properties: {
+      strategy: {
+        type: 'string',
+        title: 'Strategy',
+        description: 'Pick a strategy',
+        oneOf: [
+          {
+            const: 'Use a Map',
+            title: 'Use a Map',
+            description: 'Best when keys are dynamic',
+            _meta: { lody: { elicitation: { version: 1, preview: 'const cache = new Map();' } } },
+          },
+          { const: 'Use a plain object', title: 'Use a plain object' },
+        ],
+      },
     },
-  ],
-};
+  },
+})!.meta;
 
 function dispatchTouchPointer(
   target: EventTarget,
@@ -300,6 +306,8 @@ describe('AskUserQuestionCard info button keyboard a11y', () => {
 
   it('opens the info dialog (not the parent option) when Enter is pressed on the (i) button', () => {
     renderWithInfo();
+    expect(container!.textContent).toContain('Pick a strategy');
+    expect(container!.textContent).not.toContain('Input requested');
 
     const infoButton = container!.querySelector<HTMLButtonElement>(
       'button[aria-label="Show details"]'

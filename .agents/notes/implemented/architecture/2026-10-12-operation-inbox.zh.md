@@ -39,7 +39,7 @@ Effect 保持锁定 4.0.2。`inbox/service.ts`拥有存储、信号和 scoped fi
 
 Stop 请求详情改为 Session 控制文档内一个可覆盖的 `cancelRequest` 槽位，不再增加 metadata ID 字段。renderer 先持久保存详情，再写 `lastCanceledTurn = cancel-request:<id>`；RPC 保持立即发送，并使用同一 ID。Watcher 等待匹配的控制数据，通过独立取消链处理控制数据到达；旧版直接写 turn ID 的请求仍兼容。SQLite 负责持久去重，因此重开及迟到 RPC／兜底不会再次暂停新输入，新的点击仍有独立 ID。资源所有权、真实释放移交及暂停写盘失败恢复保持不变；本次 adapter 调整不扩展原生迁移。
 
-与主分支 `d76690b62` 合并后，保留原始 ACP 排空 → presence 清除 → turn／Inbox 移交的顺序。presence 清理失败仍保留旧执行所有者；daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。依赖维持合并后的锁定版本，包括 Streams 0.17.0、Effect 4.0.2。能力注册同时保留 Inbox v2 和主分支新增的 Magpie／DSH 能力，不互相覆盖。
+与主分支 `09407b3b7` 合并后，保留原始 ACP 排空 → presence 清除 → turn／Inbox 移交的顺序。presence 清理失败仍保留旧执行所有者；daemon 关闭同时取消历史所属任务，并排空／恢复关闭 Inbox。依赖维持合并后的锁定版本，包括 Streams 0.17.0、Effect 4.0.2。能力注册同时保留 Inbox v2 和主分支新增的 Magpie／DSH 能力，不互相覆盖。
 
 ## 原生编排单元的落实
 
@@ -53,11 +53,11 @@ ExecutionOwner 收拢输入、batch、资源和原始请求，负责提交、结
 
 | 范围 | 本轮实现证据 |
 | --- | --- |
-| 原生编排相关交集 | 6 suites，401 项通过；包含真实 Coordinator／Mirror、执行服务、Fleet 自动重试、SQLite 与 Inbox |
+| 原生编排相关交集 | 合并 main `09407b3b7` 后 7 suites，416 项通过；包含真实 Coordinator／Mirror、执行服务、Fleet 自动重试、SQLite、Inbox 与原生 presence |
 | 准入反证 | 两个确定性竞争位置：隔离副本移除提交锁均失败，恢复后均通过；保留未知提交禁止重发断言 |
 | SQLite／所有权 | 内存共享连接的完成事务、失败回滚、异步事务拒绝；磁盘重开、资源释放和共享关闭恢复沿用行为覆盖 |
 | 类型／静态／格式 | 全仓类型及 lint、format、check:quick 通过；新增 guard 禁止内核依赖具体 I/O 或自建 runtime |
-| pnpm check | 已执行但未全绿：沙盒中出现进程／端口相关失败，递归检查还被 e2ee-core 无测试文件终止；CLI 另在沙盒外重跑，不以本轮结果宣称全仓验收 |
+| pnpm check | 已执行但未全绿：沙盒中出现进程／端口相关失败，递归检查还被 e2ee-core 无测试文件终止；合并 main 前沙盒外 CLI 为 4087 通过、4 跳过、一项未修改 Git transport 的 context_unreadable／remote helper aborted；未独立验证基线，不宣称全仓验收 |
 | 文档 | 与既有错误数组相同的 82 项；无 Inbox 错误 |
 
 

@@ -39,7 +39,7 @@ Source provenance is separate from display snapshots. A retained current Operati
 
 Stop request details now live in one replaceable `cancelRequest` control-document slot, rather than an extra metadata ID field. The renderer persists the payload before publishing `lastCanceledTurn = cancel-request:<id>`; RPC remains an immediate fast path with the same ID. The watcher waits for matching control data and processes control arrivals on its separate cancellation chain. Legacy turn-ID markers remain supported. SQLite owns durable deduplication, so reopen and late RPC/fallback cannot pause fresh input again, while a new click has an independent ID. Resource ownership, actual-release handoff and failed-pause recovery are unchanged; this adapter adjustment does not extend the native migration.
 
-Integration with main `d76690b62` preserves raw ACP drain → presence clear → Turn/Inbox handoff. Presence cleanup failure retains the old execution owner. Daemon shutdown cancels history-owned work and drains/recover-closes Inbox. Merged dependency pins remain unchanged, including Streams 0.17.0 and Effect 4.0.2. Capability registration retains Inbox v2 alongside main’s new Magpie/DSH capabilities.
+Integration with main `09407b3b7` preserves raw ACP drain → presence clear → Turn/Inbox handoff. Presence cleanup failure retains the old execution owner. Daemon shutdown cancels history-owned work and drains/recover-closes Inbox. Merged dependency pins remain unchanged, including Streams 0.17.0 and Effect 4.0.2. Capability registration retains Inbox v2 alongside main’s new Magpie/DSH capabilities.
 
 ## Native orchestration unit
 
@@ -65,11 +65,11 @@ Author validation uses a separate source copy with pinned dependencies and match
 
 | Scope | Current implementation evidence |
 | --- | --- |
-| Native orchestration intersection | 6 suites, 401 passed: actual Coordinator/Mirror, execution service, Fleet automatic retry, SQLite and Inbox |
+| Native orchestration intersection | 7 suites, 416 passed after merging main `09407b3b7`: actual Coordinator/Mirror, execution service, Fleet automatic retry, SQLite, Inbox and native presence |
 | Admission ablation | Both deterministic competition positions fail when the submission lock is removed in the isolated copy, and pass when restored; unknown-submission non-replay assertions retained |
 | SQLite / ownership | Shared in-memory completion transaction, rollback and asynchronous-callback rejection; disk reopen, actual release and shared-close recovery behavior retained |
 | Types / static / format | Root types and lint, format and check:quick pass; extended guard forbids concrete I/O and nested runtime access in the native core |
-| pnpm check | Attempted, not green: sandbox process/port failures and recursive termination at e2ee-core with no test files. CLI is rerun outside the sandbox separately; no full-root acceptance claim |
+| pnpm check | Attempted, not green: sandbox process/port failures and recursive termination at e2ee-core with no test files. Before the main merge, unsandboxed CLI reports 4087 passed, 4 skipped and one failure in unchanged Git transport (`context_unreadable` / remote helper aborted); no independent baseline or full-root acceptance claim |
 | Documentation | Same pre-existing array of 82 errors; no Inbox errors |
 
 

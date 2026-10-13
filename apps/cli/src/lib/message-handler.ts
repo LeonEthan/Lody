@@ -1,3 +1,4 @@
+import type { SessionActivePresencePhase } from './loro/session-active-presence';
 import { fileLocksLegacy } from '@/utils/file-lock';
 import { Effect } from 'effect';
 import { awaitSessionHistoryOwner } from '@/session/session-history-owner';
@@ -262,10 +263,7 @@ import type { AcpAgentEditEvidence, AcpStandardDiffBlockEvidence } from '@/lib/a
 import { mergeAcpRuntimeConfigUpdates } from '@/lib/acp/runtime-config';
 import { generateTitleIsolated, sanitizeTitle } from '@/agent/title-generator';
 import type { AgentSessionWarning } from '@/agent/agent-client';
-import {
-  SessionActivePresenceController,
-  type SessionActivePresencePhase,
-} from './loro/session-active-presence';
+import { SessionActivePresenceControllerLegacy } from './loro/session-active-presence-legacy';
 import {
   resolveImageGenerationPresencePhase,
   shouldRestoreRunningAfterPermission,
@@ -693,7 +691,7 @@ export class MessageHandler {
   private pendingProcessLifecycleAction: MachineProcessLifecycleAction | null = null;
   private readonly store = new SessionTransientStore();
   private readonly historyOwnerAbort = new AbortController();
-  private sessionActivePresence!: SessionActivePresenceController;
+  private sessionActivePresence!: SessionActivePresenceControllerLegacy;
   private readonly titleGenerationInFlight = new Map<SessionId, Promise<string | null>>();
   // Note: titleGenerationInFlight, archiveInFlight are self-cleaning
   // and stay as independent tracking. All other per-session state lives in this.store.
@@ -2758,16 +2756,10 @@ export class MessageHandler {
     this.machineName = config.machineName;
     this.cliVersion = config.cliVersion;
     this.machineId = config.machineId as MachineId;
-    this.sessionActivePresence = new SessionActivePresenceController(
+    this.sessionActivePresence = new SessionActivePresenceControllerLegacy(
       this.workspaceDocument,
       this.machineId,
-      this.logger,
-      {
-        // Late-bound: the execution service is constructed further down this
-        // constructor, and the watchdog can only fire once a turn is running.
-        onInitializationStalled: (sessionId, stall) =>
-          this.executionService.notifyInitializationStalled(sessionId, stall),
-      }
+      this.logger
     );
     this.supportRegistryAgentTypes = config.supportRegistryAgentTypes ?? [];
     this.closeSessionTerminals = config.closeSessionTerminals;
@@ -2892,8 +2884,8 @@ export class MessageHandler {
       workspaceId: this.workspaceId,
       preferredBaseBranch: this.preferredBaseBranch,
       touchSession: (sessionId) => this.touchSession(sessionId),
-      startSessionActivePresence: (sessionId, phase) =>
-        this.startSessionActivePresence(sessionId, phase),
+      holdSessionActivePresence: (sessionId, phase) =>
+        this.sessionActivePresence.native.hold(sessionId, phase),
       clearSessionActivePresence: (sessionId) => this.clearSessionActivePresence(sessionId),
       setSessionActivePresencePhase: (sessionId, phase, detail) =>
         this.setSessionActivePresencePhase(sessionId, phase, detail),
@@ -5670,7 +5662,7 @@ export class MessageHandler {
   }
 
   private clearSessionActivePresence(sessionId: SessionId): void {
-    this.sessionActivePresence.clear(sessionId);
+    this.sessionActivePresence.clearUnleased(sessionId);
   }
 
   private createRuntimeDispatchContext(): MessageDispatchContext {
@@ -9783,6 +9775,7 @@ export class MessageHandler {
     await this.iosSimulatorService.closeAll();
     this.logger.debug('Cleaning up message handler resources');
     this.cleanedUp = true;
+    this.sessionActivePresence.native.retire();
     this.cancelAllCodeCollabTurnRetryTimers();
     if (this.machineRpcServerRetryTimer) {
       clearTimeout(this.machineRpcServerRetryTimer);
@@ -9805,12 +9798,14 @@ export class MessageHandler {
     this.detachWorktreeGcSyncListener = null;
     this.machineFlockCommandWatcher.stop();
     this.providerSetupManager.stop();
-    this.sessionActivePresence.clearAll();
     // Terminating sessions is the producer barrier: agent callbacks may still
     // enqueue their final ACP notifications while termination is in progress,
     // but none can arrive after this await. Keep the document manager open so
     // those callbacks can be flushed below.
     await this.sessionManager.cleanUp({ keepWorkspaceDocumentOpen: true });
+    // Turn finalizers can still write history/evidence after producers stop.
+    // Keep every store open until their leases and monitoring actually release.
+    await this.sessionActivePresence.close();
     await inboxShutdown;
     await this.flushAllACPUpdates();
     // Wait for any in-flight flushes to complete

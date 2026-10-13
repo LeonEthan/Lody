@@ -4,13 +4,13 @@
 
 ## Mirrors over synced docs tolerate unknown root keys
 
-Every synced Mirror must use `ignoreUnknownProperties: true`: otherwise an
-unknown root from a newer peer blocks writes on this client. Regression:
+Synced Mirrors use `ignoreUnknownProperties: true`; unknown newer roots must not
+block client writes. Regression:
 `packages/shared/tests/session-doc-forward-compat.test.ts`.
 
-SessionDocument's private Mirror is control-only. HistoryWriter owns writes;
-SessionData owns reads. CLI execution methods in `session-agent-writes.ts` reuse
-shared planners over that writer, not UI port methods or a second writer.
+SessionDocument's private Mirror is control-only. HistoryWriter writes; SessionData
+reads. `session-agent-writes.ts` reuses shared planners over that writer, never
+UI port methods or a second writer.
 Replacement rules: [shared](../../../../../packages/shared/AGENTS.md#session-history).
 
 ## Opening a doc pulls its stream
@@ -53,8 +53,7 @@ see [observe scopes](../../commands/session-observe-runtime.ts).
 
 ## Streams cursors are replica-bound
 
-Daemon and one-shot commands share `repo.sqlite3`, not replicas: Meta/Flock
-cursors come from `createRepoStreamsPersistence`, LoroDoc cursors from
+Daemon/commands share `repo.sqlite3`, not replicas: Meta/Flock cursors use `createRepoStreamsPersistence`, LoroDoc cursors from
 `createDocumentRemoteCursorStore` (shared rows: daemon only). No shared
 `remoteCursorStore` or schedule-only `onPersist*`. Test:
 `tests/cli-streams-replica-checkpoints.test.ts`.
@@ -82,12 +81,13 @@ lastRunningSeen; write meta timestamps only at status transitions. MachineMeta.l
 is retired even at registration. Online checks use presence; null from
 getOnlineMachineIds means unknown, never offline.
 
-`initializing` has a deadline per stage from the last phase/detail change. Expiry
-stops heartbeat and notifyInitializationStalled fails the turn:
+`session-active-presence.ts` owns native Turn leases, Clock heartbeats and latched
+stall signals. Only its lease release clears presence; incidental lifecycle clears
+cannot retire a Turn. Its Legacy entry owns execution/analytics. Intent:
 `specs/session-initialization-deadline.md`.
 
 `workspace-presence.ts` owns Scopes; `presence-replica.ts` is synchronous.
-Only presence-legacy executes in the app runtime. No kernel Promise/timers,
+Only Legacy entries execute. No kernel Promise/timers,
 extra runtime or POST/SSE queue. Failed release retains work/Cause/owner
 and fences replacement; close joins completion. Revoke preserves local
 production. CLI owns registry/token Scopes; durable/presence share one provider.
@@ -102,9 +102,8 @@ observer-lease driven; never start OS probes permanently or persist snapshots.
 
 ## Machine Flock writes for this machine are local-first
 
-After `repo.flush()`, call `LoroDocumentManager.markMachineFlockDocDirty(...)` (or pass
-the manager as the sync scheduler) instead of awaiting `handle.syncOnce()` in a
-user/RPC request path. `machine-flock-sync-coordinator.ts` owns the live room, dirty
+After `repo.flush()`, call `LoroDocumentManager.markMachineFlockDocDirty(...)` (or use
+the manager as sync scheduler); never await `handle.syncOnce()` in user/RPC paths. `machine-flock-sync-coordinator.ts` owns the live room, dirty
 state, and exponential retry; request-scoped `syncOnce()` failures must not make local
 project add/update flows fail after the local write is durable.
 

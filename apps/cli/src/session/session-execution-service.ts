@@ -29,6 +29,7 @@ import { resolveWorkspaceLocalProjectRootPathWithRetry } from '@/lib/local-proje
 import type { LoroDocumentManager, SessionDocument } from '@/lib/loro/doc';
 import { subscribeSessionChanges } from '@/lib/loro/doc';
 import type {
+  SessionActivePresenceLease,
   SessionActivePresencePhase,
   SessionInitializationStall,
 } from '@/lib/loro/session-active-presence';
@@ -551,10 +552,10 @@ export type SessionExecutionServiceDeps = {
   workspaceId: WorkspaceId;
   preferredBaseBranch: string;
   touchSession: (sessionId: SessionId) => void;
-  startSessionActivePresence: (
+  holdSessionActivePresence: (
     sessionId: SessionId,
     phase?: SessionActivePresencePhase | null
-  ) => void;
+  ) => Effect.Effect<SessionActivePresenceLease, unknown, Scope.Scope>;
   clearSessionActivePresence: (sessionId: SessionId) => void;
   setSessionActivePresencePhase: (
     sessionId: SessionId,
@@ -921,15 +922,6 @@ export class SessionExecutionService {
   private readonly canceledTurnBySession = new Map<SessionId, string>();
   private readonly currentTurnBySession = new Map<SessionId, string>();
   private readonly turnRuntimeBySession = new Map<SessionId, TurnRuntimeState>();
-  /**
-   * One waiter per session while a visible turn is initializing; see
-   * {@link awaitInitializationStall}. Registered for the whole turn because the
-   * watchdog only ever fires while the published status is `initializing`.
-   */
-  private readonly initializationStallWaiters = new Map<
-    SessionId,
-    (stall: SessionInitializationStall) => void
-  >();
   private readonly rewriteBarrierSessions = new Set<SessionId>();
   private readonly rewriteConflictLeaseSessions = new Set<SessionId>();
   private readonly turnReleaseWaiters = new Map<SessionId, Map<string, Set<() => void>>>();
@@ -2936,55 +2928,19 @@ export class SessionExecutionService {
     };
   }
 
-  /**
-   * Fail a visible turn whose initialization stopped making progress.
-   *
-   * Called by `SessionActivePresenceController`'s stall watchdog. Resolving the
-   * waiter makes {@link awaitInitializationStall} win its race against the turn
-   * body, which records a user-visible `session_init_failed` and closes the turn
-   * scope — releasing presence, the ACP replay suppression, and the runtime
-   * registration that would otherwise keep the session un-collectable forever.
-   */
-  notifyInitializationStalled(sessionId: SessionId, stall: SessionInitializationStall): void {
-    const runtime = this.turnRuntimeBySession.get(sessionId);
-    if (runtime) {
-      runtime.initializationStalled = true;
-    }
-    const waiter = this.initializationStallWaiters.get(sessionId);
-    if (!waiter) {
-      // Presence is only ever started inside a visible turn, so this means the
-      // turn settled between the watchdog tick and this call. Nothing to fail.
-      this.deps.logger.debug(
-        `[${sessionId}] Initialization stall reported with no owning turn; ignoring`
-      );
-      return;
-    }
-    waiter(stall);
-  }
-
-  /**
-   * Never completes unless the initialization stall watchdog fires, at which
-   * point it records the user-visible failure and halts the turn. Raced against
-   * the turn body so a dependency that never returns — the observed case was a
-   * cloud identity lookup that hung for 1h51m — cannot pin the turn open.
-   */
+  /** The lease latches its native stall signal before observers can subscribe. */
   private awaitInitializationStall(
     sessionId: SessionId,
     sessionDoc: SessionDocument,
-    runtime: TurnRuntimeState
+    runtime: TurnRuntimeState,
+    lease: SessionActivePresenceLease
   ): Effect.Effect<never, unknown, never> {
-    return Effect.callback<SessionInitializationStall, never>((resume) => {
-      const waiter = (stall: SessionInitializationStall): void => {
-        resume(Effect.succeed(stall));
-      };
-      this.initializationStallWaiters.set(sessionId, waiter);
-      return Effect.sync(() => {
-        // A newer turn may already own the slot; only retract our own waiter.
-        if (this.initializationStallWaiters.get(sessionId) === waiter) {
-          this.initializationStallWaiters.delete(sessionId);
-        }
-      });
-    }).pipe(
+    return lease.awaitInitializationStall.pipe(
+      Effect.tap(() =>
+        Effect.sync(() => {
+          runtime.initializationStalled = true;
+        })
+      ),
       Effect.flatMap((stall) =>
         this.recordKnownChatFailureAndHaltEffect({
           sessionId,
@@ -3000,16 +2956,8 @@ export class SessionExecutionService {
   private acquireSessionActivePresence(
     sessionId: SessionId,
     phase: SessionActivePresencePhase | null
-  ): Effect.Effect<void, unknown, Scope.Scope> {
-    return Effect.acquireRelease(
-      Effect.sync(() => {
-        this.deps.startSessionActivePresence(sessionId, phase);
-      }),
-      () =>
-        Effect.sync(() => {
-          this.deps.clearSessionActivePresence(sessionId);
-        })
-    );
+  ): Effect.Effect<SessionActivePresenceLease, unknown, Scope.Scope> {
+    return this.deps.holdSessionActivePresence(sessionId, phase);
   }
 
   private async finalizeCancelledTurn(options: TurnCancellationFinalizerOptions): Promise<void> {
@@ -4058,7 +4006,7 @@ export class SessionExecutionService {
               runtime.pendingInputOnCancel = 'preserve';
               return undefined;
             }
-            yield* Scope.provide(
+            const presenceLease = yield* Scope.provide(
               self.acquireSessionActivePresence(sessionId, 'initializing'),
               presenceScope
             );
@@ -4416,7 +4364,7 @@ export class SessionExecutionService {
                 openAssistantEntry,
                 prompt,
               }),
-              self.awaitInitializationStall(sessionId, sessionDoc, runtime)
+              self.awaitInitializationStall(sessionId, sessionDoc, runtime, presenceLease)
             );
             return undefined;
           })
@@ -5262,8 +5210,14 @@ export class SessionExecutionService {
           parentSessionId: meta?.parentSessionId,
           userName,
           userEmail,
-          onPresencePhase: (phase, detail) =>
-            self.deps.setSessionActivePresencePhase(sessionId, phase, detail),
+          onPresencePhase: (phase, detail) => {
+            if (
+              self.turnRuntimeBySession.get(sessionId) === ctx.runtime &&
+              !ctx.runtime.initializationStalled &&
+              !ctx.runtime.cancelRequested
+            )
+              self.deps.setSessionActivePresencePhase(sessionId, phase, detail);
+          },
         };
 
         const restoreAttempt = Effect.gen(function* () {
@@ -6114,8 +6068,6 @@ export class SessionExecutionService {
       parentSessionId: message.parentSessionId,
       userName: message.userName,
       userEmail: message.userEmail,
-      onPresencePhase: (phase, detail) =>
-        this.deps.setSessionActivePresencePhase(sessionId, phase, detail),
     };
 
     // Fold the dispatch-start meta fields into the status transition so the
@@ -6311,6 +6263,16 @@ export class SessionExecutionService {
             );
           };
 
+          // An abandoned startup may report after its successor has begun.
+          // Capture the exact Turn owner, not a session-id lookup at callback time.
+          sessionConfig.onPresencePhase = (phase, detail) => {
+            if (
+              self.turnRuntimeBySession.get(sessionId) === runtime &&
+              !runtime.initializationStalled &&
+              !runtime.cancelRequested
+            )
+              self.deps.setSessionActivePresencePhase(sessionId, phase, detail);
+          };
           sessionConfig.worktreeScriptHistoryInsertBeforeEntryId = turnId;
           const session = yield* trackPendingSession(
             () => self.deps.sessionManager.createSession(sessionConfig),

@@ -26,7 +26,10 @@ context/message-flow.md "Upstream".
   at `agentCapabilities._meta.lody`, session metadata at `_meta.lody`, and custom methods
   use the Core `_lody/...` names. Session initialization advertises Core answer notes
   alongside standard form elicitation; the shared Ask Question bridge retains the
-  selection and separately keyed note through durable permission history.
+  selection and separately keyed note through durable permission history. Core forms
+  use each property's `description` as the full question and `title` as its short
+  header, including single-question forms whose request message is generic. Legacy
+  Claude single-question forms retain their request-message prompt.
 - `acp-runner.ts` — process spawn/restart around the client. Spawn + initialize +
   `newSession`/`loadSession` share `acp-session-start-gate.ts`.
 - `acp-session-start-gate.ts` — process-wide start semaphore used by

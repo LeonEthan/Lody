@@ -136,3 +136,11 @@ provides LocalProjects. See the [decision](../../../../.agents/notes/implemented
   ([AGENTS.md](pr-poller/AGENTS.md)).
 - `analytics/`, `git/`, `notifications/`, `session-export/`, `usage/` — supporting
   services.
+
+### Session active presence
+
+`loro/session-active-presence.ts` owns scoped native Turn leases, heartbeat and
+initialization-stall signals. `loro/session-active-presence-legacy.ts` is the
+MessageHandler construction/analytics entry. Visible Turns acquire the native lease;
+other lifecycle callbacks may update phases but cannot release it. Shutdown awaits
+those leases before closing documents. See the [presence guide](../../../../.agents/docs/cli-lib-loro-presence.md).

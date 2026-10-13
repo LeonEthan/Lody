@@ -1471,7 +1471,7 @@ export class LoroDocumentManager {
     return sessionId;
   }
 
-  /** Low-level session presence publish. Call only from SessionActivePresenceController. */
+  /** Low-level session presence publish. Call only from the session-active-presence lease owner. */
   publishSessionPresence(sessionId: SessionId, machineId: MachineId, status: SessionStatus): void {
     this.presenceRuntime?.setSessionPresence({
       sessionId,
