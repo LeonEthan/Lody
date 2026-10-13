@@ -1,3 +1,4 @@
+import { readMessageAuthor } from '@lody/shared';
 import { type AcpLauncher, resolveAcpLauncher } from '@/agent/acp-analytics';
 import {
   AcpAuthenticationManager,
@@ -151,6 +152,8 @@ import {
 } from './worktree/git-process-error';
 
 type FinalizeTurnContext = {
+  /** Exact input owned by the completed logical invocation, including steer. */
+  inputTurnId?: string;
   sessionId: SessionId;
   session: ISession;
   sessionDoc: SessionDocument;
@@ -3783,6 +3786,19 @@ export class SessionExecutionService {
     }
 
     await this.runTurnFinalizationStage(sessionId, turnId, 'notifySessionCompleted', async () => {
+      if (ctx.inputTurnId) {
+        const input = await (
+          await createSessionBackend(sessionDoc)
+        ).history.readTurn(ctx.inputTurnId);
+        if (input.state === 'ready' && readMessageAuthor(input.turn.author)?.kind === 'agent') {
+          this.deps.logger.debug(
+            `[${sessionId}] Turn ${turnId} was Agent-initiated; skipping session completion notification`
+          );
+          return;
+        }
+      }
+      // Reading history can yield to a manual Stop during finalization.
+      if (isTurnCancelled() || ctx.abortSignal?.aborted) return;
       await this.deps.turnFinalization.notifySessionCompleted(sessionId, userId, turnId);
     });
   }
@@ -5678,6 +5694,7 @@ export class SessionExecutionService {
 
         const completedTurnId = runtime.turnId;
         const completedUserTurnId = runtime.userTurnId ?? executionUserTurnId;
+        const completedInputTurnId = runtime.invocation?.sourceTurnId ?? completedUserTurnId;
         const completedRequesterUserId = runtime.invocation?.requesterUserId ?? userId;
         // Read before finalization clears the turn's ACP update state.
         const producedOutput = self.turnProducedVisibleOutput(sessionId, completedTurnId);
@@ -5711,6 +5728,7 @@ export class SessionExecutionService {
                 session: activeSession,
                 sessionDoc,
                 turnId: completedTurnId,
+                inputTurnId: completedInputTurnId,
                 baseCommitHash,
                 turnStartWorkingTreeDiff,
                 userId: completedRequesterUserId,
@@ -6399,6 +6417,7 @@ export class SessionExecutionService {
 
           const completedTurnId = runtime.turnId;
           const completedUserTurnId = runtime.userTurnId ?? userTurnId;
+          const completedInputTurnId = runtime.invocation?.sourceTurnId ?? completedUserTurnId;
           const completedRequesterUserId =
             runtime.invocation?.requesterUserId ?? sessionConfig.requesterUserId;
           // Read before finalization clears the turn's ACP update state.
@@ -6433,6 +6452,7 @@ export class SessionExecutionService {
                   session,
                   sessionDoc,
                   turnId: completedTurnId,
+                  inputTurnId: completedInputTurnId,
                   baseCommitHash,
                   turnStartWorkingTreeDiff,
                   userId: completedRequesterUserId,

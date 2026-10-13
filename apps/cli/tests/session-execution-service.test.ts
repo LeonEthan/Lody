@@ -2539,6 +2539,8 @@ describe('SessionExecutionService', () => {
   // left the user with an unanswered message and no error anywhere.
   const runSilentPromptTurn = async (options: {
     sessionId: string;
+    inputAuthor?: SessionHistoryInput['author'];
+    earlierInputAuthor?: SessionHistoryInput['author'];
     attempts?: number;
     hasPromptOutputForTurn: boolean;
     dispatchSource?: 'rpc' | 'crdt' | 'queue' | 'goal';
@@ -2546,9 +2548,20 @@ describe('SessionExecutionService', () => {
     onTurnStarted?: () => Promise<boolean>;
   }) => {
     let history: Array<Record<string, unknown>> = [
+      ...(options.earlierInputAuthor
+        ? [
+            {
+              id: 'older-input',
+              role: 'user',
+              status: 'handled',
+              author: options.earlierInputAuthor,
+            },
+          ]
+        : []),
       {
         id: 'turn-user-1',
         role: 'user',
+        author: options.inputAuthor,
         status: 'pending',
         read: false,
       },
@@ -2705,6 +2718,37 @@ describe('SessionExecutionService', () => {
     expect(getHistory()[0]?.status).toBe('handled');
     expect(notifySessionCompleted).toHaveBeenCalledTimes(1);
   });
+
+  it.each(['agent', 'human'] as const)(
+    'uses the exact %s-authored input for completion notifications',
+    async (kind) => {
+      const agentAuthor = {
+        v: 1,
+        kind: 'agent',
+        sessionId: 'sender-session',
+        turnId: 'sender-turn',
+        name: 'Agent',
+      } as const;
+      const { deps, notifySessionCompleted, getHistory, getStatus, finalizationOwners } =
+        await runSilentPromptTurn({
+          sessionId: `session-notify-${kind}`,
+          hasPromptOutputForTurn: true,
+          inputAuthor: kind === 'agent' ? agentAuthor : { v: 1, kind: 'human', userId: 'user-1' },
+          earlierInputAuthor: kind === 'human' ? agentAuthor : undefined,
+        });
+      const completed = getHistory().find((entry) => entry.id === 'turn-user-1');
+      expect(completed?.status).toBe('handled');
+      expect(getHistory().find((entry) => entry.id === 'assistant:turn-user-1')?.finished).toBe(
+        true
+      );
+      expect(finalizationOwners).toEqual([true]);
+      expect(getStatus()).toEqual(SessionStatusFactory.idle());
+      expect(deps.recordChatFailure).not.toHaveBeenCalled();
+      expect(notifySessionCompleted.mock.calls).toEqual(
+        kind === 'agent' ? [] : [[`session-notify-${kind}`, 'user-1', 'assistant:turn-user-1']]
+      );
+    }
+  );
 
   it('rejects a chat turn before prompt when memory pressure persists', async () => {
     let history: Array<Record<string, unknown>> = [

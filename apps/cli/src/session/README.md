@@ -194,6 +194,11 @@ Foreground ACP configuration runs with the owner Effect's `AbortSignal`. Each mu
 that signal before the next mutation, so an old turn whose first configuration call finishes
 late cannot overwrite the configuration of the turn that started after Stop.
 
+Completion notifications use the exact completed invocation's input author, including
+steer handoffs. An Agent-authored input suppresses the user-facing completion notice;
+an earlier Agent input does not suppress a later human turn. Finalization, Operation
+results and Inbox scheduling still run. Cancellation is rechecked after the author read.
+
 ### Why resume reopens the assistant entry
 
 Teardown and cancel finalize (`message-handler.ts` `finalizeACPState`, no-turnId overload)

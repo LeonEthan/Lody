@@ -1,9 +1,8 @@
 # apps/cli/src/session
 
-`CLAUDE.md` is a symlink to this file. Edit `AGENTS.md` only.
+`CLAUDE.md` links here; edit this file.
 
-Module map and contracts: [README.md](README.md).
-Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
+[Module contracts](README.md); [worktree rules](worktree/AGENTS.md).
 
 ## Authorization and identity
 
@@ -14,8 +13,8 @@ Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
   identity.
 - Live status is a target-daemon Machine RPC read; durable metadata is not a live-presence
   substitute.
-- Freeze runtime human identity; require it. Trusted sends stamp `humanInputReceipts` before launch;
-  recover via receipts, never role/author. [Rules](../orchestration/AGENTS.md).
+- Require frozen human identity and pre-launch `humanInputReceipts`; recover via receipts,
+  never role/author. [Rules](../orchestration/AGENTS.md).
 - Machine/Provider credentials stay host-scoped. Attribution, authorization and commits
   use the frozen Turn identity; GitHub network auth uses the trusted conversation owner.
 - Git: owner uses local config, no profile query; others never read it.
@@ -64,9 +63,9 @@ Worktree rules: [worktree/AGENTS.md](worktree/AGENTS.md).
   `agent_disconnected`, Harness compression mismatch is `acp_session_storage_incompatible`.
 - User turns may restore stale ACP and retry once before output. Inbox batches never retry after
   submission; this includes human-plus-batch inputs.
-- A turn with no ACP updates takes `recordSilentTurnFailure`, not `setDispatchHandled`.
-  Read `turnProducedVisibleOutput` before `finalizeTurn` clears it; still finalize, advance
-  the pointer, and fail open.
+- Agent-input turns skip completion notices only. Use the completed invocation's exact input.
+- No ACP updates: `recordSilentTurnFailure`, not `setDispatchHandled`. Read
+  `turnProducedVisibleOutput` before `finalizeTurn` clears it; finalize, advance pointers, fail open.
 - Diff content comes only from the CLI-local ACP evidence store; GitHub `diffStats` use PR compare
   semantics, and `session-diff-stats-target.ts` skips rather than overwrites a good total.
 

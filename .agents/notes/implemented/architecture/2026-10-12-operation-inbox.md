@@ -59,6 +59,13 @@ retries settlement. Fleet startup failure and normal stop share a phased owner, 
 production automatic retry recovers that owner before replacement. Session/ACP/history
 remain registered temporary adapters; this does not complete their dependency chains.
 
+Agent-initiated turns suppress user-facing completion notices. Finalization reads the
+exact completed invocation's input author, including steer handoffs, rather than
+parent relationships or older input. Operation receipts, Inbox results, finalization
+and release retain their behavior. Stop is rechecked after the author read. The
+execution suite passes 256 tests, including Agent suppression, later human delivery
+and completed history/release in both cases.
+
 ## Verification and remaining limits
 
 Author validation uses a separate source copy with pinned dependencies and matching changed-source bytes, not an independent base/head review. These scopes overlap and must not be added; earlier complete matrices remain in Git history.
