@@ -103,3 +103,11 @@ CLI 默认编辑器项目现已收录源码与测试，让两者共享 `@/*` 别
 保留真实 SQLite 回滚、双连接认领、进程重开、真实释放和不重发覆盖；原释放时固定水位的断言改为认领时合批，认领后到达仍进入下一批。Coordinator 替身现在结算真实提交回执，不再只写模拟输出。作者工作树交集 4 suites／158 项通过，覆盖意图失败原子回滚、被动加可唤醒成员合批、认领后隔离、暂停／未释放重启、重复与未知提交不重发。直接 CLI 类型、根 check:quick、格式和 docs 通过；根 pnpm check 仍在已有 Claude 源码与已安装 SDK 不匹配处失败，不是全仓验收。Cloud 集成与桌面交互是单独的验证边界。
 
 Cloud 合成使用相同 PR 生产代码，加上已记录的本地 SDK／运行时 pin 对齐，没有上传远端运行时。Inbox／Coordinator／Session／dispatch／Fleet 五个 suite、417 项通过。Session 用例观察第九条空闲回执触发第三次 provider 输入，且不再包含已消费八项；走原生队列唤醒，不直接手工调用续跑。CLI／renderer 构建、打包 native smoke 和临时签名验证通过。这是本地 production-cloud 集成构建，不宣称根 CI 安装、交互登录或真实模型验收。
+
+## ce194f5a 的本地 CI 复现（2026-10-13）
+
+验证固定 PR 源码 `ce194f5a030e274846b001b2e32fb8476f2c1414` 和 base `567afa18d1f0d45ebbe78fca7dde2a5dde3a7536`；没有合并 main，也没有对齐依赖或运行时清单。冻结安装失败后使用现有已安装依赖。Components 在 Node 22.18.0 上通过 564 个文件／5194 项。使用已核对官方归档校验和的 Node 22.23.1，工作流的完整 rest 组通过，其中 Shared 1477 项、Electron 219 项；两个对话浏览器 spec 的 18 项全部通过。CLI 执行的 3276 项通过、3 项跳过，但 48 个 suite 因 Codex 清单 0.159.2 与 adapter 0.160.1 不一致无法导入。Inbox 的 55 项在完整 CLI 执行中通过。跳过 adapter 预构建后的各包类型检查、check:quick、format:check、文档检查、贡献策略测试和桌面 suite 契约均通过。
+
+冻结安装仍报告 Claude importer 与锁文件有九项依赖不一致。根 pnpm check 与 OSS 桌面构建均在使用旧已安装 SDK 编译 Claude adapter 时失败，桌面 smoke 因此未启动。相关 ACP gitlink 与 Codex 清单和固定 base 完全一致。这些结果不证明干净安装、Linux CI、PR 合并树或桌面验收通过。
+
+首轮环境差异单独保留：继承的 GIT_EXEC_PATH 使 Git 指向当前会话凭据包装器；仅移除该变量后，原生 Git 的 18 项全部通过，完整 CLI 复跑也通过。Node 22.18.0 缺少一个 Shared suite 所需的 WASM 加载行为，22.23.1 通过。首轮 Node 24 并行运行有两项人工恢复测试失败，随后两次 Node 22 完整执行与 Node 24 单独复跑均通过；不抹掉首轮失败，也不声称已证明其根因。人工恢复 adapter 会拒绝进程快照的任何警告，包括可选 macOS 内存探针警告。没有放宽生产恢复检查。

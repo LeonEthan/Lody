@@ -186,3 +186,33 @@ Human testing found that A delegates to B and finishes before B: the prior passi
 Tests retain real SQLite rollback, dual-connection claims, process reopen, physical release and no-replay coverage. Prior fixed-release-watermark expectations are replaced by claim-time coalescing; post-claim arrivals still form a separate batch. Coordinator fixtures now settle the real submission receipt rather than merely append mock output. The changed intersection passes 4 suites / 158 cases in the author worktree, including atomic intent failure, passive-plus-wakeable batching, post-claim isolation, paused/unreleased restart, and duplicate/unknown non-replay. Direct CLI types, root check:quick, format and docs pass. Root pnpm check stops at the existing Claude source/installed SDK mismatch; this is not full-root acceptance. Cloud integration and interactive desktop behavior remain separate validation boundaries.
 
 Cloud composition validation uses the same PR production code with documented local SDK/runtime pin alignment (no remote runtime uploads). Five Inbox/Coordinator/Session/dispatch/Fleet suites pass 417 cases. The Session test observes a third provider input after the ninth idle receipt and excludes the already consumed eight; it follows a real native queue wake, not a direct manual continuation. CLI/renderer build, packaged native smoke and ad-hoc signature verification pass. This is a local production-cloud integration build, not a successful root CI installation or interactive login/model acceptance claim.
+
+## Local CI reproduction at ce194f5a (2026-10-13)
+
+Validation pins PR source `ce194f5a030e274846b001b2e32fb8476f2c1414` and base
+`567afa18d1f0d45ebbe78fca7dde2a5dde3a7536`; no merge or dependency/runtime
+alignment was applied. Existing installed dependencies are used after frozen
+installation fails. Components pass 564 files / 5194 tests on Node 22.18.0.
+With checksum-verified official Node 22.23.1, the workflow's full rest group
+passes, including Shared's 1477 tests and Electron's 219 tests; both conversation
+browser specs pass all 18 cases. CLI passes 3276 tests with 3 skipped, but 48
+suites cannot import because Codex manifest 0.159.2 disagrees with adapter 0.160.1.
+Inbox's 55 cases pass in that full CLI run. Package typechecks without the adapter
+preparation step, check:quick, format:check, document checks, contribution-policy
+tests and the desktop suite contract pass.
+
+Frozen installation still reports nine Claude importer/lockfile mismatches.
+Root pnpm check and OSS desktop build fail in Claude adapter compilation against
+the old installed SDK; desktop smoke therefore cannot start. The relevant ACP
+gitlinks and Codex manifest are byte-identical to the pinned base. These results
+do not establish clean-install, Linux CI, PR merge-tree or desktop acceptance.
+
+Initial environment-specific failures remain recorded separately: inherited
+GIT_EXEC_PATH resolves Git to the current session's credential wrapper; removing
+only that variable makes all 18 native Git tests pass, including the full CLI
+rerun. Node 22.18.0 lacks the WASM loading behavior needed by one Shared suite;
+22.23.1 passes. Two operator-recovery tests fail during the initial concurrent
+Node 24 run, then pass in both Node 22 full runs and a focused Node 24 rerun.
+That first failure is not erased or attributed to a proven cause; the operator
+adapter's process snapshot rejects any warning, including optional macOS memory
+probe warnings. No production recovery check was weakened.
